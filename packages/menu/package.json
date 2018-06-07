@@ -1,0 +1,26 @@
+
+{
+  "name": "@insum/menu",
+  "version": "0.0.0",
+  "description": "side menu for page",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inscriptum/insum.git"
+  },
+  "keywords": [
+    "menu"
+  ],
+  "author": "@inscriptum",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/inscriptum/insum/issues"
+  },
+  "homepage": "https://github.com/inscriptum/insum#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}

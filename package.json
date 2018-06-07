@@ -1,0 +1,26 @@
+{
+  "name": "insum",
+  "version": "0.0.0",
+  "description": "The web components repository",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inscriptum/insum.git"
+  },
+  "keywords": [
+    "insum",
+    "web-components"
+  ],
+  "author": "inscriptum",
+  "license": "Apache License 2.0",
+  "bugs": {
+    "url": "https://github.com/inscriptum/insum/issues"
+  },
+  "homepage": "https://github.com/inscriptum/insum#readme",
+  "devDependencies": {
+    "lerna": "^2.11.0"
+  }
+}
