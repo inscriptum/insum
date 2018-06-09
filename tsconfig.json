@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    // do not transpile stuff like classes, async/await, ...
+    "target": "esnext",
+    // leave imports as they are
+    "module": "esnext",
+    // resolve modules as you would expect
+    "moduleResolution": "node",
+    // produce a source map
+    "sourceMap": true,
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "es2015"
+    ],
+    "isolatedModules": false,
+    "experimentalDecorators": true,
+    "noImplicitAny": false,
+    "noImplicitThis": false,
+    "strictNullChecks": false,
+    "removeComments": true,
+    "suppressImplicitAnyIndexErrors": true,
+    "allowSyntheticDefaultImports": true,
+    "allowJs": true,
+    "rootDir": "./",
+    "baseUrl": "./src"
+  },
+  "compileOnSave": false
+}

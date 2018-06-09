@@ -1,0 +1,20 @@
+{
+  // "presets": ["env"]
+  "presets": [
+    ["env",
+      {
+        // leave imports as they are
+        "modules": false,
+        "targets": {
+          "browsers": ["ie >= 11", "last 2 versions"]
+        },
+        "useBuiltIns": true
+        // "debug": true
+      }
+    ]
+  ],
+  "plugins": [
+    // support dynamic import syntax, but leave it unchanged
+    "babel-plugin-syntax-dynamic-import"
+  ]
+}
