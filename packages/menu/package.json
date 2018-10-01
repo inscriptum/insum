@@ -4,8 +4,8 @@
   "description": "side menu for page",
   "main": "index.js",
   "scripts": {
-    "build": "cross-env NODE_ENV=production ../../node_modules/.bin/webpack --progress --verbose --hide-modules",
-    "dev": "cross-env NODE_ENV=development ../../node_modules/.bin/webpack-dev-server",
+    "build": "cross-env NODE_ENV=production webpack --progress --verbose --hide-modules",
+    "dev": "cross-env NODE_ENV=development webpack-dev-server",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -25,34 +25,18 @@
     "access": "public"
   },
   "devDependencies": {
+    "@insum/config": "^1.0.0-alpha.6",
     "@types/node": "^10.3.2",
-    "babel-core": "^6.26.3",
-    "babel-loader": "^7.1.4",
-    "babel-plugin-syntax-dynamic-import": "^6.18.0",
     "babel-preset-env": "^1.7.0",
     "clean-webpack-plugin": "^0.1.19",
     "copy-webpack-plugin": "^4.5.1",
     "cross-env": "^5.1.6",
-    "css-loader": "^0.28.11",
     "es6-templates": "^0.2.3",
-    "extract-text-webpack-plugin": "^3.0.2",
-    "file-loader": "^1.1.11",
-    "html-loader": "^0.5.5",
     "html-webpack-plugin": "^3.2.0",
-    "node-sass": "^4.9.2",
-    "postcss-css-variables": "^0.8.1",
-    "postcss-custom-properties": "^7.0.0",
-    "postcss-loader": "^2.1.5",
-    "raw-loader": "^0.5.1",
     "sass-loader": "^7.0.3",
-    "style-loader": "^0.21.0",
-    "ts-loader": "^4.4.1",
     "typescript": "^2.9.1",
     "webpack-merge": "^4.1.2"
   },
-  "dependencies": {
-    "webpack": "^4.20.2",
-    "webpack-cli": "^3.1.2",
-    "webpack-dev-server": "^3.1.9"
-  }
+  "dependencies": {},
+  "gitHead": "19f93f5ec67cec6e5f98d38bea66ee4d29290b07"
 }

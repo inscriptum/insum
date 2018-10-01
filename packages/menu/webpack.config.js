@@ -3,9 +3,9 @@ const merge = require('webpack-merge');
 const CleanPlugin = require('clean-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 
-const webpackConfigCommon = require('../../config/webpack/webpack.config.common.js');
-const webpackConfigDev = require('../../config/webpack/webpack.config.dev.js');
-const webpackConfigProd = require('../../config/webpack/webpack.config.prod.js');
+const webpackConfigCommon = require('@insum/config/webpack/webpack.config.common.js');
+const webpackConfigDev = require('@insum/config/webpack/webpack.config.dev.js');
+const webpackConfigProd = require('@insum/config/webpack/webpack.config.prod.js');
 
 
 let helper = {
