@@ -1,6 +1,6 @@
 {
   "name": "@insum/config",
-  "version": "1.0.1-alpha.1",
+  "version": "1.0.1-alpha.2",
   "description": "service config for insum project",
   "main": "index.js",
   "scripts": {
