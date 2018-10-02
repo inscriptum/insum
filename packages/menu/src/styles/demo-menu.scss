@@ -1,0 +1,40 @@
+@keyframes moveout {
+  from {
+    transform: translateX(0px);
+
+    opacity: 1;
+  }
+  to {
+    transform: translateX(-50px);
+
+    opacity: 0;
+  }
+}
+
+@keyframes movein {
+  from {
+    transform: translateX(-50px);
+
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0px);
+
+    opacity: 1;
+  }
+}
+
+@keyframes hide {
+  to,
+  from {
+    max-height: 0px;
+
+    transform: translateX(-50px);
+
+    opacity: 0;
+  }
+}
+
+@import "./demo-menu/_demo-menu.scss";
+@import "./demo-menu-search/_demo-menu-search.scss";
+@import "./demo-menu-category/_demo-menu-category.scss";

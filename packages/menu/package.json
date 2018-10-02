@@ -1,9 +1,11 @@
 {
   "name": "@insum/menu",
-  "version": "0.0.1",
+  "version": "0.0.2-alpha.2",
   "description": "side menu for page",
   "main": "index.js",
   "scripts": {
+    "build": "cross-env NODE_ENV=production webpack --progress --verbose --hide-modules",
+    "dev": "cross-env NODE_ENV=development webpack-dev-server",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -21,5 +23,20 @@
   "homepage": "https://github.com/inscriptum/insum#readme",
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "devDependencies": {
+    "@insum/config": "^1.0.0-alpha.6",
+    "@types/node": "^10.3.2",
+    "babel-preset-env": "^1.7.0",
+    "clean-webpack-plugin": "^0.1.19",
+    "copy-webpack-plugin": "^4.5.1",
+    "cross-env": "^5.1.6",
+    "es6-templates": "^0.2.3",
+    "html-webpack-plugin": "^3.2.0",
+    "sass-loader": "^7.0.3",
+    "typescript": "^2.9.1",
+    "webpack-merge": "^4.1.2"
+  },
+  "dependencies": {},
+  "gitHead": "19f93f5ec67cec6e5f98d38bea66ee4d29290b07"
 }
