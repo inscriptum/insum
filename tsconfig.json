@@ -11,7 +11,7 @@
     "lib": [
       "dom",
       "dom.iterable",
-      "es2015"
+      "esnext"
     ],
     "isolatedModules": false,
     "experimentalDecorators": true,
@@ -23,7 +23,13 @@
     "allowSyntheticDefaultImports": true,
     "allowJs": true,
     "rootDir": "./",
-    "baseUrl": "./src"
+    "baseUrl": "./src",
+    "outDir": "./dist",
   },
+  "exclude": [
+    "node_modules",
+    "packages/config",
+    "./dist/**/*"
+  ],
   "compileOnSave": false
 }
