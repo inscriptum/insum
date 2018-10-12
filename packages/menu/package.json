@@ -37,6 +37,9 @@
     "typescript": "^2.9.1",
     "webpack-merge": "^4.1.2"
   },
-  "dependencies": {},
+  "dependencies": {
+    "abstract-element": "^4.2.0",
+    "lit-html": "^0.12.0"
+  },
   "gitHead": "19f93f5ec67cec6e5f98d38bea66ee4d29290b07"
 }
