@@ -1,0 +1,16 @@
+.insum-menu-category {
+  transition: all 0.4s;
+  input {
+    display: none;
+  }
+  // input:checked {
+  //   ~.insum-menu-category__link {
+  //     animation: moveout 0.4s, hide 0s infinite;
+  //     animation-delay: 0s, 0.4s
+  //   }
+  // }
+}
+
+@import "__title/_insum-menu-category__title";
+@import "__link/_insum-menu-category__link";
+@import "_hide/_insum-menu-category_hide";
