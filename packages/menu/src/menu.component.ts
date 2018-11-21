@@ -1,7 +1,7 @@
 import { Define, AbstractElement, state } from 'abstract-element';
 import litRender from 'abstract-element/render/lit';
 import * as litHtml from 'lit-html';
-import style from './styles/demo-menu.scss';
+import style from './styles/insum-menu.scss';
 
 
 
@@ -57,7 +57,7 @@ export class MenuComponent extends AbstractElement {
   connectedCallback(): void {
     super.connectedCallback();
 
-    (<HTMLElement>this.querySelectorAll('.demo-menu__sidenav .demo-menu-search input')[0]).focus();
+    (<HTMLElement>this.querySelectorAll('.insum-menu__sidenav .insum-menu-search input')[0]).focus();
   }
 
 
@@ -68,9 +68,9 @@ export class MenuComponent extends AbstractElement {
     const demoMenuCategories = this.data.map(menuItem => {
       let itemCountInside = 0;
       const linkElement = menuItem.links.map(link => {
-        let cssClass = 'demo-menu-category__link';
+        let cssClass = 'insum-menu-category__link';
         if (this._hideMenuItems.includes(link.id)) {
-          cssClass += ' demo-menu-category__link_hide';
+          cssClass += ' insum-menu-category__link_hide';
         } else {
           itemCountInside++;
         }
@@ -78,11 +78,11 @@ export class MenuComponent extends AbstractElement {
       }
       );
 
-      const hideClass = itemCountInside === 0 ? ' demo-menu-category_hide' : '';
+      const hideClass = itemCountInside === 0 ? ' insum-menu-category_hide' : '';
 
       return this.html`
-      <div class="${'demo-menu-category' + hideClass}">
-        <label class="demo-menu-category__title" for="catid_${menuItem.title}">${menuItem.title}</label>
+      <div class="${'insum-menu-category' + hideClass}">
+        <label class="insum-menu-category__title" for="catid_${menuItem.title}">${menuItem.title}</label>
         <input type="checkbox" id="catid_${menuItem.title}"> ${linkElement}
       </div>`
     }
@@ -92,8 +92,8 @@ export class MenuComponent extends AbstractElement {
      <style>
       ${style}
      </style>
-      <div class="demo-menu__sidenav">
-        <div class="demo-menu-search">
+      <div class="insum-menu__sidenav">
+        <div class="insum-menu-search">
           <i class="material-icons">search</i>
           <input @keyup="${this.handleSearchKeyup.bind(this)}" type="text" placeholder="Поиск" />
         </div>
@@ -130,7 +130,7 @@ export class MenuComponent extends AbstractElement {
    * Filter menu items by text inside search field
    * @param searchfor - text from search field
    */
-  search(searchfor) {
+  search(searchfor: string) {
     this._hideMenuItems.length = 0;
 
     for (const category of this.data) {
