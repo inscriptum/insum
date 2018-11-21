@@ -1,50 +1,40 @@
-import { DemoMenu } from './demo-menu';
-
-window.customElements.define('demo-menu', DemoMenu);
+import { MenuComponent } from './menu.component';
 
 
+// create MenuComponent
+MenuComponent;
+const _demoMenu: MenuComponent = document.querySelector('insum-menu');
 
 
-
-const _$demoMenu: any = document.querySelector('demo-menu');
-
-
-
-
-_$demoMenu.data = [
+// add data obj to the menu component
+_demoMenu.data = [
   {
     title: 'Стили',
     hide: false,
     links: [
       {
         id: 'grid',
-        title: 'Grid',
-        state: 'showin',
+        title: 'Grid'
       },
       {
         id: 'headers',
-        title: 'Headers',
-        state: 'showin',
+        title: 'Headers'
       },
       {
         id: 'input',
-        title: 'Input',
-        state: 'showin',
+        title: 'Input'
       },
       {
         id: 'input-group',
-        title: 'Input Group',
-        state: 'showin',
+        title: 'Input Group'
       },
       {
         id: 'layout-form',
-        title: 'Layout Form',
-        state: 'showin',
+        title: 'Layout Form'
       },
       {
         id: 'button-group',
-        title: 'Button Group',
-        state: 'showin',
+        title: 'Button Group'
       },
 
     ],
@@ -54,13 +44,11 @@ _$demoMenu.data = [
     links: [
       {
         id: 'spinner',
-        title: 'Spinner',
-        state: 'showin',
+        title: 'Spinner'
       },
       {
         id: 'slider',
-        title: 'Slider',
-        state: 'showin',
+        title: 'Slider'
       },
     ],
   },
