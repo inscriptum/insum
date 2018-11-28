@@ -1,5 +1,5 @@
 module.exports = function (api) {
-
+  // cache if funciton result didn't change
   api.cache(() => process.env.NODE_ENV);
 
   const presets = [
@@ -11,8 +11,8 @@ module.exports = function (api) {
         "targets": {
           "esmodules": true
         },
+        // adds specific imports for polyfills when they are used in each file
         "useBuiltIns": 'usage',
-        "debug": true
       }
     ]
   ];
