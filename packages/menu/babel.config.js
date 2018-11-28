@@ -1,0 +1,1 @@
+module.exports = require('@insum/config/babel.config.js');
