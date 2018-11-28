@@ -19,9 +19,21 @@ module.exports = function (helper) {
             loader: "babel-loader",
             options: process.env.NODE_ENV === 'production'
               ? {
-                presets: ['@babel/preset-env'],
-                // support dynamic import syntax, but leave it unchanged
-                plugins: [require('@babel/plugin-syntax-dynamic-import')]
+                presets: [
+                  [
+                    "@babel/preset-env",
+                    {
+                      "targets": {
+                        "esmodules": true
+                      },
+                      "modules": false
+                    }
+                  ]
+                ],
+                plugins: [
+                  // support dynamic import syntax, but leave it unchanged
+                  '@babel/plugin-syntax-dynamic-import'
+                ]
               }
               : {}
           },
