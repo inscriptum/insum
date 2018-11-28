@@ -37,9 +37,14 @@ let PREBUILD_CFG = {
 
 
 if (process.env.NODE_ENV === 'production') {
-  module.exports = [merge(PREBUILD_CFG, webpackConfigCommon(helper), webpackConfigProd(helper))];
+  module.exports = [
+    merge(
+      PREBUILD_CFG,
+      webpackConfigCommon(helper),
+      webpackConfigProd(helper)
+    )
+  ];
 } else {
-
   module.exports = [
     merge(
       PREBUILD_CFG,
