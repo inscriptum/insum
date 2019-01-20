@@ -25,7 +25,7 @@
     "access": "public"
   },
   "devDependencies": {
-    "@insum/config": "^1.0.0-alpha.9.0",
+    "@insum/config": "^1.0.0-alpha.10.0",
     "@types/node": "^10.3.2",
     "clean-webpack-plugin": "^0.1.19",
     "copy-webpack-plugin": "^4.5.1",
