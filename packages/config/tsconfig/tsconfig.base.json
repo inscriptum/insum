@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    // resolve modules as you would expect
+    "moduleResolution": "node",
+    // produce a source map
+    "sourceMap": true,
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "isolatedModules": false,
+    "experimentalDecorators": true,
+    "noImplicitAny": false,
+    "noImplicitThis": false,
+    "strictNullChecks": false,
+    "removeComments": true,
+    "suppressImplicitAnyIndexErrors": true,
+    "allowSyntheticDefaultImports": true,
+    "allowJs": true
+  },
+  "compileOnSave": false
+}
