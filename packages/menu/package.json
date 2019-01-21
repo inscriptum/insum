@@ -1,6 +1,6 @@
 {
   "name": "@insum/menu",
-  "version": "0.0.2-alpha.4.1",
+  "version": "0.0.2-alpha.4.2",
   "description": "side menu for page",
   "main": "index.js",
   "scripts": {
@@ -25,7 +25,7 @@
     "access": "public"
   },
   "devDependencies": {
-    "@insum/config": "^1.0.0-alpha.10.1",
+    "@insum/config": "^1.0.0-alpha.10.2",
     "@types/node": "^10.3.2",
     "clean-webpack-plugin": "^0.1.19",
     "copy-webpack-plugin": "^4.5.1",
