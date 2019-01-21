@@ -15,7 +15,7 @@ module.exports = {
     javascript: {
       test: /\.js$/,
       loader: 'babel-loader',
-      exclude: [helper.PATHS.node_modules]
+      exclude: /node_modules/
     },
     image: {
       test: /\.(png|jpg|jpeg|gif|svg)(\?v=\d+\.\d+\.\d+)?$/,
