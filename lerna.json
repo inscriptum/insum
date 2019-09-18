@@ -1,6 +1,21 @@
 {
   "packages": [
-    "packages/*"
+    "packages/components/*",
+    "packages/configs/*"
+  ],
+  "command": {
+    "version": {
+      "allowBranch": ["master", "feature/*", "bug/*", "patch/*"],
+      "conventionalCommits": true,
+      "exact": true,
+      "gitRemote": "origin",
+      "message": "chore(release): publish"
+    }
+  },
+  "ignoreChanges": [
+    "**/__fixtures__/**",
+    "**/__tests__/**",
+    "**/*.md"
   ],
   "version": "independent"
 }
