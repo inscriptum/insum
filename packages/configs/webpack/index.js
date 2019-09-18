@@ -3,26 +3,26 @@ module.exports = {
     typescript: {
       test: /\.ts$/,
       use: () => {
-        let loaders = [];
+        const loaders = [];
         if (process.env.NODE_ENV === 'production') {
-          loaders.push("babel-loader");
+          loaders.push('babel-loader');
         }
-        loaders.push("ts-loader");
-        return loaders
+        loaders.push('ts-loader');
+        return loaders;
       },
-      exclude: /node_modules/
+      exclude: /node_modules/,
     },
     javascript: {
       test: /\.js$/,
       loader: 'babel-loader',
-      exclude: /node_modules/
+      exclude: /node_modules/,
     },
     image: {
       test: /\.(png|jpg|jpeg|gif|svg)(\?v=\d+\.\d+\.\d+)?$/,
       loader: 'file-loader',
       options: {
-        name: '[folder]/[name].[ext]?[hash]'
-      }
+        name: '[folder]/[name].[ext]?[hash]',
+      },
     },
     font: {
       test: /\.(eot|woff|woff2|ttf)(\?v=\d+\.\d+\.\d+)?$/,
@@ -30,26 +30,29 @@ module.exports = {
     },
     scss_raw: {
       test: /\.scss$/,
-      use: [{
-        loader: "raw-loader"
-      },
-      {
-        loader: 'postcss-loader',
-      },
-      {
-        loader: "sass-loader"
-      }
+      use: [
+        {
+          loader: 'raw-loader',
+        },
+        {
+          loader: 'postcss-loader',
+        },
+        {
+          loader: 'sass-loader',
+        },
       ],
     },
     css_raw: {
       test: /\.css$/,
-      use: [{
-        loader: 'raw-loader'
-      },],
+      use: [
+        {
+          loader: 'raw-loader',
+        },
+      ],
     },
     html: {
       test: /\.html$/,
       use: ['html-loader'],
-    }
-  }
-}
+    },
+  },
+};

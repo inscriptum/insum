@@ -1,4 +1,4 @@
-module.exports = function (helper) {
+module.exports = function(helper) {
   return {
     mode: process.env.NODE_ENV,
     output: {
@@ -11,26 +11,26 @@ module.exports = function (helper) {
         {
           test: /\.ts$/,
           use: () => {
-            let loaders = [];
+            const loaders = [];
             if (process.env.NODE_ENV === 'production') {
-              loaders.push("babel-loader");
+              loaders.push('babel-loader');
             }
-            loaders.push("ts-loader");
-            return loaders
+            loaders.push('ts-loader');
+            return loaders;
           },
-          exclude: /node_modules/
+          exclude: /node_modules/,
         },
         {
           test: /\.js$/,
           loader: 'babel-loader',
-          exclude: [helper.PATHS.node_modules]
+          exclude: [helper.PATHS.node_modules],
         },
         {
           test: /\.(png|jpg|jpeg|gif|svg)(\?v=\d+\.\d+\.\d+)?$/,
           loader: 'file-loader',
           options: {
-            name: '[folder]/[name].[ext]?[hash]'
-          }
+            name: '[folder]/[name].[ext]?[hash]',
+          },
         },
         {
           test: /\.(eot|woff|woff2|ttf)(\?v=\d+\.\d+\.\d+)?$/,
@@ -38,32 +38,35 @@ module.exports = function (helper) {
         },
         {
           test: /\.scss$/,
-          use: [{
-            loader: "raw-loader"
-          },
-          {
-            loader: 'postcss-loader',
-          },
-          {
-            loader: "sass-loader"
-          }
+          use: [
+            {
+              loader: 'raw-loader',
+            },
+            {
+              loader: 'postcss-loader',
+            },
+            {
+              loader: 'sass-loader',
+            },
           ],
         },
         {
           test: /\.css$/,
-          use: [{
-            loader: 'raw-loader'
-          },],
+          use: [
+            {
+              loader: 'raw-loader',
+            },
+          ],
         },
         {
           test: /\.html$/,
           use: ['html-loader'],
-        }
-      ]
+        },
+      ],
     },
     resolve: {
       modules: [helper.PATHS.src, helper.PATHS.node_modules],
-      extensions: ['.ts', '.js', '.json']
-    }
-  }
-}
+      extensions: ['.ts', '.js', '.json'],
+    },
+  };
+};
