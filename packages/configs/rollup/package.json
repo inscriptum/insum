@@ -1,0 +1,22 @@
+{
+  "name": "@insum/rollup.config",
+  "version": "0.0.0",
+  "description": "Rollup config",
+  "main": "rollup.config.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "rollup-plugin-minify-html-literals": "^1.2.2",
+    "rollup-plugin-node-resolve": "^5.0.1",
+    "rollup-plugin-terser": "^5.0.0"
+  },
+  "peerDependencies": {
+    "rollup": "1.x"
+  }
+}
