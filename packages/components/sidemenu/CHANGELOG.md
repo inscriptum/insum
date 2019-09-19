@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0-alpha.2](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.1...@insum/sidemenu@1.0.0-alpha.2) (2019-09-19)
+
+
+### Features
+
+* **sidemenu:** 🌟 add attribute search-placeholder for placeholder text ([c5b9e78](https://github.com/inscriptum/insum/commit/c5b9e78))
+* **sidemenu:** 🌟 add css variables for background-color and font-family ([0697450](https://github.com/inscriptum/insum/commit/0697450))
+* **sidemenu:** 🌟 create search-icon ([19950b1](https://github.com/inscriptum/insum/commit/19950b1))
+
+
+
+
+
 # [1.0.0-alpha.1](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.0...@insum/sidemenu@1.0.0-alpha.1) (2019-09-19)
 
 
