@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0-alpha.3](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.2...@insum/sidemenu@1.0.0-alpha.3) (2019-09-19)
+
+
+### Features
+
+* **sidemenu:** 🌟 add css variables for main and accent text color ([b34a55b](https://github.com/inscriptum/insum/commit/b34a55b))
+
+
+
+
+
 # [1.0.0-alpha.2](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.1...@insum/sidemenu@1.0.0-alpha.2) (2019-09-19)
 
 
