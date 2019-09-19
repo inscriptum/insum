@@ -1,9 +1,13 @@
+$insum-sidemenu__background-color: #222222;
+$insum-sidemenu__font-family: "Ubuntu", sans-serif;
+
 @keyframes moveout {
   from {
-    transform: translateX(0px);
+    transform: translateX(0);
 
     opacity: 1;
   }
+
   to {
     transform: translateX(-50px);
 
@@ -17,8 +21,9 @@
 
     opacity: 0;
   }
+
   to {
-    transform: translateX(0px);
+    transform: translateX(0);
 
     opacity: 1;
   }
@@ -27,7 +32,7 @@
 @keyframes hide {
   to,
   from {
-    max-height: 0px;
+    max-height: 0;
 
     transform: translateX(-50px);
 
