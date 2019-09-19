@@ -20,7 +20,7 @@
 
     transition: 0.2s all;
 
-    color: #ffffff;
+    color: var(--insum-sidemenu__font-accent-color, $insum-sidemenu__font-accent-color);
     border: none;
     outline: none;
     background: transparent;
@@ -28,7 +28,7 @@
     font-size: 14px;
 
     &:focus {
-      border-bottom: 2px solid white;
+      border-bottom: 2px solid var(--insum-sidemenu__font-accent-color, $insum-sidemenu__font-accent-color);
     }
   }
 }
