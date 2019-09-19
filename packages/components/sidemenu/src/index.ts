@@ -1,6 +1,9 @@
-import { Define, AbstractElement, state } from 'abstract-element';
+import { Define, AbstractElement, state, attr } from 'abstract-element';
 import litRender from 'abstract-element/render/lit';
 import { html } from 'lit-html';
+
+import './search-icon';
+
 import style from './styles/insum-menu.scss';
 
 /**
@@ -22,6 +25,10 @@ interface SideMenuItem {
 export class SideMenu extends AbstractElement {
   /** list of hided menu items (after filter) */
   private _hideMenuItems: string[] = [];
+
+  /** placeholder text for search input */
+  @attr('search-placeholder')
+  searchPlaceholder = '';
 
   /** menu data */
   @state()
@@ -80,8 +87,8 @@ export class SideMenu extends AbstractElement {
       </style>
       <div class="insum-menu__sidenav">
         <div class="insum-menu-search">
-          <i class="material-icons">search</i>
-          <input @keyup="${this.handleSearchKeyup.bind(this)}" type="text" placeholder="Поиск" />
+          <insum-search-icon class="insum-menu-search__icon"></insum-search-icon>
+          <input @keyup=${this.handleSearchKeyup.bind(this)} type="text" placeholder=${this.searchPlaceholder} />
         </div>
         ${demoMenuCategories}
       </div>
