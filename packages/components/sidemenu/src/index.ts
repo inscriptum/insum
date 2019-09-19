@@ -96,9 +96,8 @@ export class SideMenu extends AbstractElement {
   handleMenuLinkClick(event: MouseEvent, menuItemId: string) {
     event.preventDefault();
     this.activeMenuItem = menuItemId;
-    const click = new Event('change-menu-item');
+    const click = new Event('change-active');
     this.dispatchEvent(click);
-    // document.querySelector('#content').textContent = menuItemTitle;
   }
 
   /**

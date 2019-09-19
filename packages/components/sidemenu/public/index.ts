@@ -1,16 +1,25 @@
-// import PluginImunifyAvWidget from "../src";
-
-// customElements.define('plugin-imunifyav-widget', PluginImunifyAvWidget);
-
 import { SideMenu } from '../src';
 
-// create MenuComponent
+// create a component
 SideMenu;
 const demoMenu: SideMenu = document.querySelector('insum-sidemenu');
 
-demoMenu.addEventListener('change-menu-item', e => {
-  console.log(e);
+const content = document.querySelector('#content');
+
+demoMenu.addEventListener('change-active', () => {
   console.log(demoMenu.activeMenuItem);
+  switch (demoMenu.activeMenuItem) {
+    case 'grid':
+      content.innerHTML = '<p>grid start</p><p>----content----</p><p>grid stop</p>';
+      break;
+    case 'headers':
+      content.innerHTML = '<p>headers start</p><p>----content----</p><p>headers stop</p>';
+      break;
+
+    default:
+      content.innerHTML = '';
+      break;
+  }
 });
 
 // add data obj to the menu component
