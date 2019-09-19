@@ -97,14 +97,19 @@ export class SideMenu extends AbstractElement {
 
   /**
    * Handler for click by menu item
+   *
    * @param event - click event
-   * @param menuItemId - item title
+   * @param itemId - item ID
    */
-  handleMenuLinkClick(event: MouseEvent, menuItemId: string) {
+  handleMenuLinkClick(event: MouseEvent, itemId: string): void {
     event.preventDefault();
-    this.activeMenuItem = menuItemId;
-    const click = new Event('change-active');
-    this.dispatchEvent(click);
+    this.activeMenuItem = itemId;
+    const changeActiveEvent = new CustomEvent('changeActive', {
+      detail: {
+        itemId,
+      },
+    });
+    this.dispatchEvent(changeActiveEvent);
   }
 
   /**
