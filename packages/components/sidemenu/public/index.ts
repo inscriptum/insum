@@ -6,14 +6,14 @@ const demoMenu: SideMenu = document.querySelector('insum-sidemenu');
 
 const content = document.querySelector('#content');
 
-demoMenu.addEventListener('change-active', () => {
+demoMenu.addEventListener('changeActive', () => {
   console.log(demoMenu.activeMenuItem);
   switch (demoMenu.activeMenuItem) {
     case 'grid':
       content.innerHTML = '<p>grid start</p><p>----content----</p><p>grid stop</p>';
       break;
-    case 'headers':
-      content.innerHTML = '<p>headers start</p><p>----content----</p><p>headers stop</p>';
+    case 'style':
+      content.innerHTML = '<p>style start</p><p>----content----</p><p>headers style</p>';
       break;
 
     default:
@@ -23,49 +23,38 @@ demoMenu.addEventListener('change-active', () => {
 });
 
 // add data obj to the menu component
-demoMenu.data = [
-  {
-    title: 'Стили',
-    hide: false,
-    links: [
-      {
-        id: 'grid',
-        title: 'Grid',
-      },
-      {
-        id: 'headers',
-        title: 'Headers',
-      },
-      {
-        id: 'input',
-        title: 'Input',
-      },
-      {
-        id: 'input-group',
-        title: 'Input Group',
-      },
-      {
-        id: 'layout-form',
-        title: 'Layout Form',
-      },
-      {
-        id: 'button-group',
-        title: 'Button Group',
-      },
-    ],
+demoMenu.data = {
+  component: {
+    label: 'Компонент',
+    category: true,
   },
-  {
-    title: 'Веб-компоненты',
-    hide: true,
-    links: [
-      {
-        id: 'spinner',
-        title: 'Spinner',
-      },
-      {
-        id: 'slider',
-        title: 'Slider',
-      },
-    ],
+  style: {
+    label: 'Стили',
+    available: true,
+    category: true,
   },
-];
+  tooltip: {
+    label: 'Tooltip',
+    parent: 'component',
+    available: true,
+  },
+  slider1: {
+    label: 'Slider1',
+    parent: 'slider',
+    available: true,
+  },
+  slider: {
+    label: 'Slider',
+    parent: 'component',
+  },
+  grid: {
+    label: 'Grid',
+    parent: 'style',
+    available: true,
+  },
+  grid1: {
+    label: 'Grid1',
+    parent: 'grid',
+    available: true,
+  },
+};

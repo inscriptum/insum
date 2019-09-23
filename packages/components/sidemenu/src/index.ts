@@ -1,6 +1,6 @@
 import { Define, AbstractElement, state, attr } from 'abstract-element';
 import litRender from 'abstract-element/render/lit';
-import { html } from 'lit-html';
+import { html, TemplateResult } from 'lit-html';
 
 import './search-icon';
 
@@ -10,12 +10,10 @@ import style from './styles/insum-menu.scss';
  * Interface for input date type
  */
 interface SideMenuItem {
-  title: string;
-  hide: boolean;
-  links: {
-    id: string;
-    title: string;
-  }[];
+  label: string;
+  parent?: string;
+  available?: boolean;
+  category?: boolean;
 }
 
 /**
@@ -32,7 +30,7 @@ export class SideMenu extends AbstractElement {
 
   /** menu data */
   @state()
-  data: SideMenuItem[] = [];
+  data: { [x: string]: SideMenuItem };
   /** last selected menu item */
   @state()
   activeMenuItem: string;
@@ -50,37 +48,59 @@ export class SideMenu extends AbstractElement {
     (this.querySelectorAll('.insum-menu__sidenav .insum-menu-search input')[0] as HTMLElement).focus();
   }
 
+  makeMenu(parent?: string): TemplateResult[] {
+    // nested menu level
+    let deepLevel = 0;
+    const findLevel = (item: SideMenuItem): void => {
+      if (item !== undefined) {
+        deepLevel++;
+        if (item.parent !== undefined) {
+          findLevel(this.data[item.parent]);
+        }
+      }
+    };
+    this.data && parent && findLevel(this.data[parent]);
+
+    return (
+      this.data &&
+      Object.keys(this.data)
+        .filter(key => this.data[key].parent === parent)
+        .map(key => {
+          const styles = [];
+          this.data[key].available && styles.push('cursor: pointer');
+
+          if (this.data[key].category) {
+            const categoryCssClass = ['insum-menu-category__title'];
+            this.activeMenuItem === key && categoryCssClass.push('insum-menu-category__title_active');
+            return html`
+              <div class="insum-menu-category">
+                <span @click=${e => this.handleMenuLinkClick(e, key)} class=${categoryCssClass.join(' ')} style=${styles.join(';')}
+                  >${this.data[key].label}</span
+                >
+                ${this.makeMenu(key)}
+              </div>
+            `;
+          } else {
+            const linkCssClass = ['insum-menu-category__link'];
+            this.activeMenuItem === key && linkCssClass.push('insum-menu-category__link_active');
+            this._hideMenuItems.includes(key) && linkCssClass.push('insum-menu-category__link_hide');
+
+            styles.push(`padding-left: ${deepLevel * 10 + 10}px`);
+            return html`
+              <div @click=${e => this.handleMenuLinkClick(e, key)} class=${linkCssClass.join(' ')} style=${styles.join(';')}>
+                ${this.data[key].label}
+              </div>
+              ${this.makeMenu(key)}
+            `;
+          }
+        })
+    );
+  }
+
   /**
    * RENDER - service function
    */
-  render() {
-    const demoMenuCategories = this.data.map(menuItem => {
-      let itemCountInside = 0;
-      const linkElement = menuItem.links.map(link => {
-        let cssClass = 'insum-menu-category__link';
-        if (this._hideMenuItems.includes(link.id)) {
-          cssClass += ' insum-menu-category__link_hide';
-        } else {
-          itemCountInside++;
-        }
-
-        cssClass = this.activeMenuItem === link.id ? `${cssClass} insum-menu-category__link_active` : cssClass;
-
-        return html`
-          <div class="${cssClass}" @click="${e => this.handleMenuLinkClick(e, link.id)}">${link.title}</div>
-        `;
-      });
-
-      const hideClass = itemCountInside === 0 ? ' insum-menu-category_hide' : '';
-
-      return html`
-        <div class="${'insum-menu-category' + hideClass}">
-          <label class="insum-menu-category__title" for="catid_${menuItem.title}">${menuItem.title}</label>
-          <input type="checkbox" id="catid_${menuItem.title}" /> ${linkElement}
-        </div>
-      `;
-    });
-
+  render(): TemplateResult {
     return html`
       <style>
         ${style}
@@ -90,7 +110,7 @@ export class SideMenu extends AbstractElement {
           <insum-search-icon class="insum-menu-search__icon"></insum-search-icon>
           <input @keyup=${this.handleSearchKeyup.bind(this)} type="text" placeholder=${this.searchPlaceholder} />
         </div>
-        ${demoMenuCategories}
+        ${this.makeMenu()}
       </div>
     `;
   }
@@ -99,24 +119,25 @@ export class SideMenu extends AbstractElement {
    * Handler for click by menu item
    *
    * @param event - click event
-   * @param itemId - item ID
+   * @param itemKey - item ID
    */
-  handleMenuLinkClick(event: MouseEvent, itemId: string): void {
+  handleMenuLinkClick(event: MouseEvent, itemKey: string): void {
     event.preventDefault();
-    this.activeMenuItem = itemId;
-    const changeActiveEvent = new CustomEvent('changeActive', {
-      detail: {
-        itemId,
-      },
-    });
-    this.dispatchEvent(changeActiveEvent);
+    event.stopPropagation();
+    if (this.data[itemKey].available) {
+      this.activeMenuItem = itemKey;
+      const changeActiveEvent = new CustomEvent('changeActive', {
+        detail: this.data[itemKey],
+      });
+      this.dispatchEvent(changeActiveEvent);
+    }
   }
 
   /**
    * Handler for keyup inside search field
    * @param event - keyup event
    */
-  handleSearchKeyup(event: KeyboardEvent) {
+  handleSearchKeyup(event: KeyboardEvent): void {
     event.preventDefault();
     if (event && event.target) {
       this.search(event.target['value']);
@@ -125,16 +146,15 @@ export class SideMenu extends AbstractElement {
 
   /**
    * Filter menu items by text inside search field
-   * @param searchfor - text from search field
+   *
+   * @param searchFor - text from search field
    */
-  search(searchfor: string) {
+  search(searchFor: string): void {
     this._hideMenuItems.length = 0;
 
-    for (const category of this.data) {
-      for (const link of category.links) {
-        if (link.title.toLowerCase().indexOf(searchfor.toLowerCase()) === -1) {
-          this._hideMenuItems.push(link.id);
-        }
+    for (const item in this.data) {
+      if (this.data[item].label.toLowerCase().indexOf(searchFor.toLowerCase()) === -1) {
+        this._hideMenuItems.push(item);
       }
     }
     this.forceUpdate();
