@@ -42,6 +42,13 @@ demoMenu.data = {
     label: 'Slider1',
     parent: 'slider',
     available: true,
+    hide: true,
+  },
+  slider_hide: {
+    label: 'Slider hide',
+    parent: 'slider',
+    available: true,
+    hide: true,
   },
   slider: {
     label: 'Slider',

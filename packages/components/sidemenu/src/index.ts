@@ -14,6 +14,7 @@ interface SideMenuItem {
   parent?: string;
   available?: boolean;
   category?: boolean;
+  hide?: boolean;
 }
 
 /**
@@ -72,26 +73,30 @@ export class SideMenu extends AbstractElement {
           if (this.data[key].category) {
             const categoryCssClass = ['insum-menu-category__title'];
             this.activeMenuItem === key && categoryCssClass.push('insum-menu-category__title_active');
-            return html`
-              <div class="insum-menu-category">
-                <span @click=${e => this.handleMenuLinkClick(e, key)} class=${categoryCssClass.join(' ')} style=${styles.join(';')}
-                  >${this.data[key].label}</span
-                >
-                ${this.makeMenu(key)}
-              </div>
-            `;
+            return this.data[key].hide
+              ? undefined
+              : html`
+                  <div class="insum-menu-category">
+                    <span @click=${e => this.handleMenuLinkClick(e, key)} class=${categoryCssClass.join(' ')} style=${styles.join(';')}>
+                      ${this.data[key].label}
+                    </span>
+                    ${this.makeMenu(key)}
+                  </div>
+                `;
           } else {
             const linkCssClass = ['insum-menu-category__link'];
             this.activeMenuItem === key && linkCssClass.push('insum-menu-category__link_active');
             this._hideMenuItems.includes(key) && linkCssClass.push('insum-menu-category__link_hide');
 
             styles.push(`padding-left: ${deepLevel * 10 + 10}px`);
-            return html`
-              <div @click=${e => this.handleMenuLinkClick(e, key)} class=${linkCssClass.join(' ')} style=${styles.join(';')}>
-                ${this.data[key].label}
-              </div>
-              ${this.makeMenu(key)}
-            `;
+            return this.data[key].hide
+              ? undefined
+              : html`
+                  <div @click=${e => this.handleMenuLinkClick(e, key)} class=${linkCssClass.join(' ')} style=${styles.join(';')}>
+                    ${this.data[key].label}
+                  </div>
+                  ${this.makeMenu(key)}
+                `;
           }
         })
     );
