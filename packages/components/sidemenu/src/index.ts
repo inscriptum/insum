@@ -9,7 +9,7 @@ import style from './styles/insum-menu.scss';
 /**
  * Interface for input date type
  */
-interface SideMenuItem {
+export interface SideMenuItem {
   label: string;
   parent?: string;
   available?: boolean;
