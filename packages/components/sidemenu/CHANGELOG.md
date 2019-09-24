@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0-alpha.7](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.6...@insum/sidemenu@1.0.0-alpha.7) (2019-09-24)
+
+
+### Features
+
+* **sidemenu:** 🌟 add flag "hide" to menu item ([92230d6](https://github.com/inscriptum/insum/commit/92230d6))
+* **sidemenu:** 🌟 add optional css variable "insum-sidemenu__size_widt" ([1d5ff69](https://github.com/inscriptum/insum/commit/1d5ff69))
+
+
+
+
+
 # [1.0.0-alpha.6](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.5...@insum/sidemenu@1.0.0-alpha.6) (2019-09-24)
 
 **Note:** Version bump only for package @insum/sidemenu
