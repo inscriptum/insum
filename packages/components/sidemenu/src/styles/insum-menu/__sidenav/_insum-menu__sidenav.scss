@@ -5,7 +5,7 @@
 
   overflow-y: auto;
 
-  width: 200px;
+  width: var(--insum-sidemenu__size_width, $insum-sidemenu__size_width);
   height: 100%;
 
   color: var(--insum-sidemenu__font-main-color, $insum-sidemenu__font-main-color);
