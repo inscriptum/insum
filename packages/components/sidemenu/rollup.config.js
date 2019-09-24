@@ -1,9 +1,8 @@
 import { dev, prod } from '@insum/rollup.config';
 
-import typescriptPlugin from 'rollup-plugin-typescript';
+import typescriptPlugin from 'rollup-plugin-typescript2';
 import postcss from 'rollup-plugin-postcss';
-var atImport = require('postcss-import');
-
+const atImport = require('postcss-import');
 
 // `npm run build` -> `production` is true
 // `npm run dev` -> `production` is false
@@ -14,10 +13,8 @@ const plugins = [
   postcss({
     inject: false,
     extensions: ['.css', '.pcss', '.scss'],
-    plugins: [atImport()]
-  })
+    plugins: [atImport()],
+  }),
 ];
 
-export default production
-  ? prod('./src/index.ts', './lib/index.js', plugins)
-  : dev('./public/index.ts', './public/index.js', plugins);
+export default production ? prod('./src/index.ts', './lib/index.js', plugins) : dev('./public/index.ts', './public/index.js', plugins);

@@ -3,6 +3,7 @@
   "version": "1.0.0-alpha.7",
   "description": "side menu for page",
   "main": "lib/index.js",
+  "types": "lib/src/index.d.ts",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
@@ -38,7 +39,7 @@
     "postcss-import": "^12.0.1",
     "rollup": "^1.21.4",
     "rollup-plugin-postcss": "^2.0.3",
-    "rollup-plugin-typescript": "^1.0.1",
+    "rollup-plugin-typescript2": "^0.24.2",
     "sass": "^1.22.12",
     "tslib": "^1.10.0",
     "typescript": "^3.6.3"

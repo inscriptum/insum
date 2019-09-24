@@ -1,0 +1,8 @@
+{
+  "extends": "@insum/ts.config/tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "declaration": true,
+    "inlineSources": true
+  }
+}
