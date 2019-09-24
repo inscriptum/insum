@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0-alpha.9](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.8...@insum/sidemenu@1.0.0-alpha.9) (2019-09-24)
+
+
+### Bug Fixes
+
+* **sidemenu:** 🐛 change typescript build config to target=esnext ([49689e4](https://github.com/inscriptum/insum/commit/49689e4))
+
+
+
+
+
 # [1.0.0-alpha.8](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.7...@insum/sidemenu@1.0.0-alpha.8) (2019-09-24)
 
 
