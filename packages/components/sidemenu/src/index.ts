@@ -17,7 +17,7 @@ interface SideMenuItem {
 }
 
 /**
- * Web components
+ * Side menu web component
  */
 @Define('insum-sidemenu')
 export class SideMenu extends AbstractElement {
@@ -127,7 +127,10 @@ export class SideMenu extends AbstractElement {
     if (this.data[itemKey].available) {
       this.activeMenuItem = itemKey;
       const changeActiveEvent = new CustomEvent('changeActive', {
-        detail: this.data[itemKey],
+        detail: {
+          ...this.data[itemKey],
+          key: itemKey,
+        },
       });
       this.dispatchEvent(changeActiveEvent);
     }
@@ -135,6 +138,7 @@ export class SideMenu extends AbstractElement {
 
   /**
    * Handler for keyup inside search field
+   *
    * @param event - keyup event
    */
   handleSearchKeyup(event: KeyboardEvent): void {
