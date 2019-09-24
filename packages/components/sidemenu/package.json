@@ -3,9 +3,9 @@
   "version": "1.0.0-alpha.8",
   "description": "side menu for page",
   "main": "lib/index.js",
-  "types": "lib/src/index.d.ts",
+  "types": "lib/index.d.ts",
   "scripts": {
-    "build": "rollup -c",
+    "build": "rm -rf ./lib && rollup -c",
     "watch": "rollup -c -w",
     "dev": "concurrently \"npm:start\" \"npm:watch\"",
     "start": "browser-sync 'public' -w --port 8080 --no-open",

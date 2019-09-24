@@ -9,7 +9,13 @@ const atImport = require('postcss-import');
 const production = !process.env.ROLLUP_WATCH;
 
 const plugins = [
-  typescriptPlugin(),
+  typescriptPlugin({
+    tsconfigOverride: {
+      compilerOptions: {
+        declaration: production,
+      },
+    },
+  }),
   postcss({
     inject: false,
     extensions: ['.css', '.pcss', '.scss'],
