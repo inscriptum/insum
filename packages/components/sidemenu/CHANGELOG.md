@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0-alpha.12](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.11...@insum/sidemenu@1.0.0-alpha.12) (2019-10-04)
+
+
+### Bug Fixes
+
+* **sidemenu:** 🐛 focus on search input when conndectedCallback ([d31592c](https://github.com/inscriptum/insum/commit/d31592c))
+
+
+
+
+
 # [1.0.0-alpha.11](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.10...@insum/sidemenu@1.0.0-alpha.11) (2019-10-04)
 
 
