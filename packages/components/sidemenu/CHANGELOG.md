@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0-alpha.11](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.10...@insum/sidemenu@1.0.0-alpha.11) (2019-10-04)
+
+
+### Features
+
+* **sidemenu:** 🌟 add slot content ([7fd84ea](https://github.com/inscriptum/insum/commit/7fd84ea))
+* **sidemenu:** 🌟 custom border-radius and box-shadow ([1b605f6](https://github.com/inscriptum/insum/commit/1b605f6))
+
+
+
+
+
 # [1.0.0-alpha.10](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.9...@insum/sidemenu@1.0.0-alpha.10) (2019-09-25)
 
 **Note:** Version bump only for package @insum/sidemenu
