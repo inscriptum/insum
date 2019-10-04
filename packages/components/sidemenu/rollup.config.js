@@ -10,11 +10,7 @@ const production = !process.env.ROLLUP_WATCH;
 
 const plugins = [
   typescriptPlugin({
-    tsconfigOverride: {
-      compilerOptions: {
-        declaration: production,
-      },
-    },
+    tsconfig: `./tsconfig.${production ? 'prod' : 'dev'}.json`,
   }),
   postcss({
     inject: false,

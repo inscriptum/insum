@@ -5,9 +5,6 @@
     "target": "esnext",
     "allowJs": false,
     "inlineSources": true,
-    "rootDir": "src"
-  },
-  "exclude": [
-    "public"
-  ]
+    "rootDir": "."
+  }
 }
