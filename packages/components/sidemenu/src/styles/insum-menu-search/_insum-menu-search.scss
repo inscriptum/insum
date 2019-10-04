@@ -13,10 +13,9 @@
   }
 
   input {
-    width: 100%;
+    width: calc(100% - 50px);
     height: 40px;
-    padding: 0 10px;
-    padding-left: 40px;
+    padding: 0 10px 0 40px;
 
     transition: 0.2s all;
 

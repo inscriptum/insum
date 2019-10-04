@@ -46,7 +46,7 @@ export class SideMenu extends AbstractElement {
   connectedCallback(): void {
     super.connectedCallback();
 
-    (this.querySelectorAll('.insum-menu__sidenav .insum-menu-search input')[0] as HTMLElement).focus();
+    (this.shadowRoot.querySelector('[ref=insum-menu__sidenav_input]') as HTMLElement).focus();
   }
 
   makeMenu(parent?: string): TemplateResult[] {
@@ -113,7 +113,12 @@ export class SideMenu extends AbstractElement {
       <div class="insum-menu__sidenav">
         <div class="insum-menu-search">
           <insum-search-icon class="insum-menu-search__icon"></insum-search-icon>
-          <input @keyup=${this.handleSearchKeyup.bind(this)} type="text" placeholder=${this.searchPlaceholder} />
+          <input
+            @keyup=${this.handleSearchKeyup.bind(this)}
+            type="text"
+            placeholder=${this.searchPlaceholder}
+            ref="insum-menu__sidenav_input"
+          />
         </div>
         ${this.makeMenu()}
         <slot></slot>
