@@ -3,6 +3,8 @@ $insum-sidemenu__font-family: "Ubuntu", sans-serif;
 $insum-sidemenu__font-main-color: #d9d9d9;
 $insum-sidemenu__font-accent-color: #ffffff;
 $insum-sidemenu__size_width: 200px;
+$insum-sidemenu__border-radius: 0;
+$insum-sidemenu__box-shadow: 0 2px 4px rgba(0, 0, 0, 0.25);
 
 @keyframes moveout {
   from {
