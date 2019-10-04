@@ -19,8 +19,21 @@
 </head>
 
 <body>
-  <insum-sidemenu search-placeholder="Поиск"></insum-sidemenu>
-  <div id="content" style="margin-left: 300px;"></div>
+  <insum-sidemenu search-placeholder="Поиск">
+    <footer style="
+        display: flex;
+        height: 100%;
+        flex-direction: column;
+        justify-content: flex-end;
+        padding: 5px;
+      ">
+      <small>&copy; Copyright 2019, Example Corporation</small>
+    </footer>
+  </insum-sidemenu>
+  <div
+    id="content"
+    style="margin-left: 300px;"
+  ></div>
   <script src='index.js'></script>
 </body>
 

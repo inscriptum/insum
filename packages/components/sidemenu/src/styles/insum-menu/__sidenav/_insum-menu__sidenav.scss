@@ -3,6 +3,9 @@
   top: 0;
   left: 0;
 
+  display: flex;
+  flex-direction: column;
+
   overflow-y: auto;
 
   width: var(--insum-sidemenu__size_width, $insum-sidemenu__size_width);

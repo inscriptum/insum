@@ -37,7 +37,7 @@ export class SideMenu extends AbstractElement {
   activeMenuItem: string;
 
   constructor() {
-    super(litRender, false);
+    super(litRender, true);
   }
 
   /**
@@ -116,6 +116,7 @@ export class SideMenu extends AbstractElement {
           <input @keyup=${this.handleSearchKeyup.bind(this)} type="text" placeholder=${this.searchPlaceholder} />
         </div>
         ${this.makeMenu()}
+        <slot></slot>
       </div>
     `;
   }
