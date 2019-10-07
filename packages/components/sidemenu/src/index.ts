@@ -49,7 +49,12 @@ export class SideMenu extends AbstractElement {
     (this.shadowRoot.querySelector('[ref=insum-menu__sidenav_input]') as HTMLElement).focus();
   }
 
-  makeMenu(parent?: string): TemplateResult[] {
+  /**
+   * Create a sub-menu template base on data
+   *
+   * @param parent - parent item key
+   */
+  makeMenu(parent: string = null): TemplateResult[] {
     // nested menu level
     let deepLevel = 0;
     const findLevel = (item: SideMenuItem): void => {
@@ -65,7 +70,7 @@ export class SideMenu extends AbstractElement {
     return (
       this.data &&
       Object.keys(this.data)
-        .filter(key => this.data[key].parent === parent)
+        .filter(key => (this.data[key].parent || null) === parent)
         .map(key => {
           const styles = [];
           this.data[key].available && styles.push('cursor: pointer');

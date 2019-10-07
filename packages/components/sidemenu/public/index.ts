@@ -52,7 +52,7 @@ demoMenu.data = {
   },
   slider: {
     label: 'Slider',
-    parent: 'component',
+    parent: null,
   },
   grid: {
     label: 'Grid',
