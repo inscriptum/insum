@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [1.0.0](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.13...@insum/sidemenu@1.0.0) (2019-10-08)
+
+**Note:** Version bump only for package @insum/sidemenu
+
+
+
+
+
 # [1.0.0-alpha.13](https://github.com/inscriptum/insum/compare/@insum/sidemenu@1.0.0-alpha.12...@insum/sidemenu@1.0.0-alpha.13) (2019-10-07)
 
 **Note:** Version bump only for package @insum/sidemenu
