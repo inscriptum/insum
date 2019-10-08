@@ -1,0 +1,20 @@
+.insum-menu__sidenav {
+  position: absolute;
+  top: 0;
+  left: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  overflow-y: auto;
+
+  width: var(--insum-sidemenu__size_width, $insum-sidemenu__size_width);
+  height: 100%;
+
+  color: var(--insum-sidemenu__font-main-color, $insum-sidemenu__font-main-color);
+  border-radius: var(--insum-sidemenu__border-radius, $insum-sidemenu__border-radius);
+  background: var(--insum-sidemenu__background-color, $insum-sidemenu__background-color);
+  box-shadow: var(--insum-sidemenu__box-shadow, $insum-sidemenu__box-shadow);
+
+  font-family: var(--insum-sidemenu__font-family, $insum-sidemenu__font-family);
+}

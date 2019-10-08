@@ -1,0 +1,17 @@
+.insum-menu-category__link {
+  height: 25px;
+  max-height: 30px;
+  padding-top: 10px;
+  padding-left: 30px;
+
+  user-select: none;
+  transition: 0.4s all;
+  transform: translateX(0);
+
+  opacity: 1;
+
+  font-size: 13px;
+}
+
+@import "_hide/_insum-menu-category__link_hide";
+@import "_active/_insum-menu-category__link_active";

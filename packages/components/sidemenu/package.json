@@ -1,0 +1,53 @@
+{
+  "name": "@insum/sidemenu",
+  "version": "1.0.0-alpha.13",
+  "description": "side menu for page",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "rm -rf ./lib && rollup -c",
+    "watch": "rollup -c -w",
+    "dev": "concurrently \"npm:start\" \"npm:watch\"",
+    "start": "browser-sync 'public' -w --port 8080 --no-open",
+    "test": "echo \"Error: run tests from root\" && exit 1",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inscriptum/insum.git"
+  },
+  "keywords": [
+    "menu"
+  ],
+  "author": "@inscriptum",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/inscriptum/insum/issues"
+  },
+  "homepage": "https://github.com/inscriptum/insum#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "lib/"
+  ],
+  "dependencies": {
+    "abstract-element": "^4.5.1",
+    "lit-html": "^1.1.2"
+  },
+  "devDependencies": {
+    "@insum/rollup.config": "1.0.0-alpha.0",
+    "@insum/ts.config": "1.0.0-alpha.0",
+    "@types/node": "^10.3.2",
+    "browser-sync": "^2.26.7",
+    "concurrently": "^4.1.2",
+    "postcss-import": "^12.0.1",
+    "rollup": "^1.21.4",
+    "rollup-plugin-postcss": "^2.0.3",
+    "rollup-plugin-typescript2": "^0.24.2",
+    "sass": "^1.22.12",
+    "tslib": "^1.10.0",
+    "typescript": "^3.6.3"
+  },
+  "gitHead": "19f93f5ec67cec6e5f98d38bea66ee4d29290b07"
+}

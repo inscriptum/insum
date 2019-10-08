@@ -1,0 +1,17 @@
+{
+  "name": "@insum/ts.config",
+  "version": "1.0.0-alpha.0",
+  "description": "Typescript config",
+  "main": "tsconfig.base.json",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "typescript": "3.x"
+  }
+}

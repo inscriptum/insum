@@ -1,0 +1,10 @@
+{
+  "extends": "@insum/ts.config/tsconfig.base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "target": "esnext",
+    "allowJs": false,
+    "inlineSources": true,
+    "rootDir": "."
+  }
+}
