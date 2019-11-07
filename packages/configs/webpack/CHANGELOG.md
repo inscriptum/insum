@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [2.0.0-alpha.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@1.1.0-alpha.0...@insum/webpack.config@2.0.0-alpha.0) (2019-11-07)
+
+
+### Features
+
+* **webpack.config:** 🌟 individual webpack loaders ([b80bbbd](https://github.com/inscriptum/insum/commit/b80bbbd))
+
+
+### BREAKING CHANGES
+
+* **webpack.config:** To use a loader need to import it separately
+
+
+
+
+
 # [1.1.0-alpha.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@1.0.0...@insum/webpack.config@1.1.0-alpha.0) (2019-11-07)
 
 
