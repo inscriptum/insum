@@ -4,12 +4,11 @@ const dependencies = ['raw-loader'];
 
 installDependencies(dependencies);
 
-
 module.exports = {
   test: /\.css$/,
   use: [
     {
-      loader: 'raw-loader'
-    }
-  ]
+      loader: 'raw-loader',
+    },
+  ],
 };

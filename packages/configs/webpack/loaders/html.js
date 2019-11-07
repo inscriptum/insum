@@ -6,5 +6,5 @@ installDependencies(dependencies);
 
 module.exports = {
   test: /\.html$/,
-  use: ['html-loader']
+  use: ['html-loader'],
 };

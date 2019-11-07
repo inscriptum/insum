@@ -8,13 +8,13 @@ module.exports = {
   test: /\.scss$/,
   use: [
     {
-      loader: 'raw-loader'
+      loader: 'raw-loader',
     },
     {
-      loader: 'postcss-loader'
+      loader: 'postcss-loader',
     },
     {
-      loader: 'sass-loader'
-    }
-  ]
+      loader: 'sass-loader',
+    },
+  ],
 };
