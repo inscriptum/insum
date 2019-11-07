@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [2.0.0-alpha.1](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.0.0-alpha.0...@insum/webpack.config@2.0.0-alpha.1) (2019-11-07)
+
+**Note:** Version bump only for package @insum/webpack.config
+
+
+
+
+
 # [2.0.0-alpha.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@1.1.0-alpha.0...@insum/webpack.config@2.0.0-alpha.0) (2019-11-07)
 
 
