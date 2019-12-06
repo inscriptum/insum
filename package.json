@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "prepublishOnly": "node prepublish.js",
-    "release": "RELEASE_MODE=true node prepublish.js"
+    "prepublishOnly": "node scripts/prepublish.js",
+    "release": "RELEASE_MODE=true node scripts/release.js"
   },
   "repository": {
     "type": "git",
