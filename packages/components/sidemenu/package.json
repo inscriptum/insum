@@ -9,7 +9,6 @@
     "watch": "rollup -c -w",
     "dev": "concurrently \"npm:start\" \"npm:watch\"",
     "start": "browser-sync 'public' -w --port 8080 --no-open",
-    "test": "echo \"Error: run tests from root\" && exit 1",
     "prepublishOnly": "npm run build"
   },
   "repository": {
