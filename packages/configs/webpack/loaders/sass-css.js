@@ -1,6 +1,6 @@
 const installDependencies = require('../_installer');
 
-const dependencies = [['sass', 'node-sass'], 'raw-loader', 'postcss-loader', 'postcss-css-variables', 'sass-loader'];
+const dependencies = [['sass', 'node-sass'], 'css-loader', 'postcss-loader', 'postcss-css-variables', 'sass-loader'];
 
 installDependencies(dependencies);
 
@@ -8,7 +8,7 @@ module.exports = {
   test: /\.(sa|sc|c)ss$/,
   use: [
     {
-      loader: 'raw-loader',
+      loader: 'css-loader',
     },
     {
       loader: 'postcss-loader',
