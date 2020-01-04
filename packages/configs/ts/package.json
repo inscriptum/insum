@@ -1,6 +1,6 @@
 {
   "name": "@insum/ts.config",
-  "version": "1.0.1-feature-loaders.0",
+  "version": "1.0.1",
   "description": "Typescript config",
   "main": "tsconfig.base.json",
   "author": "",

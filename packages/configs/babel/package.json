@@ -1,6 +1,6 @@
 {
   "name": "@insum/babel.config",
-  "version": "1.0.1-feature-loaders.0",
+  "version": "1.0.1",
   "description": "Babel config",
   "main": "babel.config.js",
   "author": "",
