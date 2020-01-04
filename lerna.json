@@ -5,7 +5,7 @@
   ],
   "command": {
     "version": {
-      "allowBranch": ["master", "feature/*", "bug/*", "patch/*"],
+      "allowBranch": ["master", "feature/*", "bug/*", "patch/*", "test/*"],
       "conventionalCommits": true,
       "exact": true,
       "gitRemote": "origin",
@@ -15,7 +15,8 @@
   "ignoreChanges": [
     "**/__fixtures__/**",
     "**/__tests__/**",
-    "**/*.md"
+    "**/*.md",
+    "**/package-lock.json"
   ],
   "version": "independent"
 }
