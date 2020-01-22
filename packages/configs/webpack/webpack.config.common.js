@@ -1,6 +1,11 @@
+/** @typedef {import('./types').Helper} Helper */
+
+/**
+ * @param {Helper} helper
+ */
 module.exports = function(helper) {
   return {
-    mode: process.env.NODE_ENV,
+    mode: helper.TARGET,
     output: {
       path: helper.PATHS.dist,
       publicPath: '/',

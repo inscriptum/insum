@@ -1,6 +1,8 @@
+/** @typedef {import('./types').Helper} Helper */
+
 const webpack = require('webpack');
 
-module.exports = function(helper) {
+module.exports = function() {
   return {
     plugins: [
       new webpack.DefinePlugin({
