@@ -7,8 +7,9 @@ export interface Helper {
     publicPath: string;
     outputPath: string;
   };
-  TARGET: string;
   ENV: {
+    isDevMode: boolean;
+    target?: string;
     devServerPort?: number;
   };
 }

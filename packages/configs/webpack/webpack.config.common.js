@@ -5,7 +5,7 @@
  */
 module.exports = function(helper) {
   return {
-    mode: helper.TARGET,
+    mode: helper.ENV.isDevMode ? 'development' : 'production',
     output: {
       path: helper.PATHS.dist,
       publicPath: '/',
