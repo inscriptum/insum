@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## [2.1.1](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.1.0...@insum/webpack.config@2.1.1) (2020-01-22)
+
+
+### Bug Fixes
+
+* **webpack.config:** 🐛 change mode from TARGET to NODE_ENV ([f353615](https://github.com/inscriptum/insum/commit/f353615776730551e5e486e238997913c53065e5))
+
+
+
+
+
 # [2.1.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.0.0...@insum/webpack.config@2.1.0) (2020-01-22)
 
 
