@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [2.1.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.0.0...@insum/webpack.config@2.1.0) (2020-01-22)
+
+
+### Features
+
+* **webpack.config:** 🌟 create Helper type ([19743a3](https://github.com/inscriptum/insum/commit/19743a3292ebf2430c1e0395d68460a7492efddb))
+
+
+
+
+
 # [2.0.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.0.0-feature-loaders.1...@insum/webpack.config@2.0.0) (2020-01-04)
 
 **Note:** Version bump only for package @insum/webpack.config
