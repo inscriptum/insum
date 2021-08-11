@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [3.0.0](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.1.1...@insum/webpack.config@3.0.0) (2021-08-11)
+
+
+### chore
+
+* **webpack.config:** 🔧 update dependencies ([2da9c67](https://github.com/inscriptum/insum/commit/2da9c67ade73e0dc39dbef388a356bc5b04448b3))
+
+
+### BREAKING CHANGES
+
+* **webpack.config:** webpack 5
+
+
+
+
+
 ## [2.1.1](https://github.com/inscriptum/insum/compare/@insum/webpack.config@2.1.0...@insum/webpack.config@2.1.1) (2020-01-22)
 
 
