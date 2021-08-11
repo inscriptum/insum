@@ -9,8 +9,8 @@
     "access": "public"
   },
   "peerDependencies": {
-    "webpack": "4.x",
-    "webpack-cli": "3.x",
+    "webpack": "5.x",
+    "webpack-cli": "4.x",
     "webpack-dev-server": "3.x"
   }
 }
