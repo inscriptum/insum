@@ -41,7 +41,7 @@
     "prettier": "^1.19.1",
     "prettier-eslint": "^9.0.1",
     "prettier-stylelint": "^0.4.2",
-    "stylelint": "^10.1.0",
+    "stylelint": "^14.16.1",
     "stylelint-config-htmlacademy": "^0.1.4",
     "stylelint-config-recommended": "^3.0.0",
     "stylelint-config-recommended-scss": "^3.3.0",
