@@ -24,7 +24,7 @@
   },
   "homepage": "https://github.com/inscriptum/insum#readme",
   "devDependencies": {
-    "@commitlint/cli": "^8.3.5",
+    "@commitlint/cli": "^17.6.3",
     "@commitlint/config-conventional": "^8.3.4",
     "@types/node": "^10.17.13",
     "@typescript-eslint/eslint-plugin": "^2.17.0",
