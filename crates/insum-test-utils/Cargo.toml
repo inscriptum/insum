@@ -1,0 +1,15 @@
+[package]
+name = "insum-test-utils"
+description = "Fixture generation for insum tests: valid .um containers and .note documents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
