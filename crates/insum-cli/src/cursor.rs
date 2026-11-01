@@ -167,13 +167,17 @@ impl Cursor {
         })
     }
 
-    /// A cursor only resumes the exact same query position (spec §6.2).
+    /// A cursor only resumes the exact same query position and options
+    /// (spec §6.2: bound to path, note, note_rev, depth and the last
+    /// returned position).
     pub fn validate(
         &self,
         kind: &str,
         path: &str,
         note_id: Option<&str>,
         note_rev: &str,
+        depth: Option<usize>,
+        text_limit: usize,
     ) -> Result<(), UmError> {
         if self.kind != kind {
             return Err(UmError::usage("cursor belongs to another command"));
@@ -192,6 +196,11 @@ impl Cursor {
         if self.note_rev != note_rev {
             return Err(cursor_stale(
                 "the note revision changed since the cursor was issued".to_owned(),
+            ));
+        }
+        if self.depth != depth || self.text_limit != text_limit {
+            return Err(cursor_stale(
+                "cursor was issued with different --depth/--text-limit options".to_owned(),
             ));
         }
         Ok(())

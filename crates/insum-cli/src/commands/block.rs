@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use insum_core::model::{BlockEntry, ID_ATTR};
 use insum_core::{ErrorCode, Limits, UmError, pointer};
 
-use crate::support::{read_views, render_path};
+use crate::support::{read_notes, render_path};
 
 pub fn run(
     path: &Path,
@@ -48,13 +48,14 @@ pub fn run(
         _ => {}
     }
 
-    let mut views = read_views(path, note, limits)?;
+    let filters = note.map(|n| vec![n.to_owned()]);
+    let mut views = read_notes(path, filters.as_deref(), limits)?.views;
     let view = views
         .pop()
         .ok_or_else(|| UmError::new(ErrorCode::NoteNotFound, "the container has no notes"))?;
 
     // The block must exist as a traversable structural node.
-    let all_blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
+    let all_blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
     let entry: &BlockEntry = all_blocks
         .iter()
         .find(|block| block.pointer == pointer)

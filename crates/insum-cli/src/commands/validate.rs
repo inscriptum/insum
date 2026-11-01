@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use insum_core::{ErrorCode, Limits, UmError};
 
 use crate::commands::block::KNOWN_TYPES;
-use crate::support::{collect_files, read_views, render_path};
+use crate::support::{collect_files, read_notes, render_path};
 
 pub fn run(
     paths: &[PathBuf],
@@ -41,9 +41,21 @@ pub fn run(
         .with_hint("Structural validation runs without --schema; schema/full levels arrive with the schema-cli task."));
     }
 
-    let files = collect_files(paths, hidden)?;
+    let (files, walk_errors) = collect_files(paths, hidden)?;
     let mut file_results = Vec::new();
     let mut all_valid = true;
+
+    // locations that could not be enumerated lower the result (spec §11)
+    for walk_error in &walk_errors {
+        all_valid = false;
+        file_results.push(json!({
+            "path": walk_error.path,
+            "valid": false,
+            "notes": [],
+            "errors": [{"code": "IO_ERROR", "message": walk_error.message}],
+            "warnings": [],
+        }));
+    }
 
     for file in &files {
         let rendered = render_path(file);
@@ -81,7 +93,7 @@ pub fn run(
 }
 
 fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, UmError> {
-    let views = read_views(path, None, limits)?;
+    let views = read_notes(path, None, limits)?.views;
     let mut notes = Vec::new();
     let mut file_valid = true;
 
@@ -93,11 +105,12 @@ fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, Um
         if strict && !warnings.is_empty() {
             // §6.6: --strict turns every warning into an error. The §11
             // registry has no dedicated code for a failed warning, so strict
-            // failures use INTERNAL with the warning text; without --strict
-            // a warning alone never flips `valid`.
+            // failures use NOTE_DOC_INVALID (data-level, exit 4); without
+            // --strict a warning alone never flips `valid`.
+            file_valid = false;
             let mut strict_errors: Vec<Value> = warnings
                 .iter()
-                .map(|warning| json!({"code": "INTERNAL", "message": warning}))
+                .map(|warning| json!({"code": "NOTE_DOC_INVALID", "message": warning}))
                 .collect();
             strict_errors.extend(errors);
             notes.push(json!({
@@ -132,7 +145,7 @@ fn validate_note(
 ) -> (bool, Vec<Value>, Vec<String>) {
     let mut warnings = Vec::new();
     let mut errors: Vec<Value> = Vec::new();
-    let blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
+    let blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
 
     for block in &blocks {
         if !KNOWN_TYPES.contains(&block.node_type.as_str()) {

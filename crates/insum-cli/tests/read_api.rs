@@ -3,6 +3,7 @@
 //! generated into a temp directory per test; nothing outside it is touched.
 
 use std::fs;
+use std::path::Path;
 use std::process::Output as ProcessOutput;
 
 use assert_cmd::Command;
@@ -666,6 +667,309 @@ fn ls_respects_hidden_and_node_modules() {
             .iter()
             .all(|path| !path.contains("node_modules"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review-driven regressions
+// ---------------------------------------------------------------------------
+
+/// §5.4: note_rev hashes the RAW payload bytes — re-archiving the same
+/// semantic document with different payload whitespace changes the revision.
+#[test]
+fn note_rev_follows_raw_payload_bytes() {
+    let dir = TempDir::new().expect("tempdir");
+
+    let compact = dir.path().join("compact.um");
+    fixtures::write_um(
+        &compact,
+        &[fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(3),
+            "r",
+            &doc_content(),
+        )],
+    )
+    .unwrap();
+
+    // same document, but serialized with pretty JSON inside the archive
+    let pretty = dir.path().join("pretty.um");
+    write_um_pretty_payload(&pretty);
+
+    let rev_compact =
+        run_json(&["tree", compact.to_string_lossy().as_ref()])["notes"][0]["note_rev"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let rev_pretty = run_json(&["tree", pretty.to_string_lossy().as_ref()])["notes"][0]["note_rev"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(rev_compact, rev_pretty, "raw payload bytes feed note_rev");
+
+    // stable across runs on identical bytes
+    let again = run_json(&["tree", compact.to_string_lossy().as_ref()])["notes"][0]["note_rev"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(rev_compact, again);
+}
+
+fn doc_content() -> Vec<Value> {
+    vec![fixtures::paragraph(&[fixtures::text("rev test")])]
+}
+
+/// A `.um` whose payload JSON is pretty-printed (different raw bytes).
+fn write_um_pretty_payload(path: &Path) {
+    use std::io::Write as _;
+    let file = std::fs::File::create(path).expect("create");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    let note_id = fixtures::ulid_seq(3);
+    let manifest = format!(
+        "{{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[{{\"id\":\"{note_id}\",\"path\":\"notes/{note_id}.json\",\"order\":0,\"title\":\"r\",\"schema\":\"plain\",\"schemaVersion\":2}}]}}"
+    );
+    zip.start_file("manifest.json", options).unwrap();
+    zip.write_all(manifest.as_bytes()).unwrap();
+    let payload = serde_json::to_string_pretty(&serde_json::json!({
+        "type": "noteDoc",
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "rev test"}]}]
+    }))
+    .unwrap();
+    zip.start_file(format!("notes/{note_id}.json"), options)
+        .unwrap();
+    zip.write_all(payload.as_bytes()).unwrap();
+    zip.finish().unwrap();
+}
+
+/// §12: duplicate archive entries are rejected (zip 9 collapses them in
+/// lookups, so the explicit probe is the only reliable guard).
+#[test]
+fn duplicate_archive_entries_are_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("dup.um");
+    write_zip_with_duplicate(&path);
+
+    let output = insum()
+        .args(["tree", path.to_string_lossy().as_ref()])
+        .output()
+        .expect("insum runs");
+    assert_eq!(output.status.code(), Some(4), "exit 4 for invalid data");
+    let error = stderr_json(&output);
+    assert_eq!(error["error"]["code"], "ARCHIVE_DUPLICATE_ENTRY");
+}
+
+fn write_zip_with_duplicate(path: &Path) {
+    // zip 9's writer refuses duplicate names, so build the raw bytes: two
+    // STOREd entries sharing one name, with a matching central directory.
+    let name = b"manifest.json";
+    let data = b"{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[]}";
+    let mut out: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    let mut offset = 0u32;
+    for _ in 0..2 {
+        let lfh_offset = offset;
+        let mut lfh = Vec::new();
+        lfh.extend(0x0403_4b50u32.to_le_bytes());
+        lfh.extend(20u16.to_le_bytes()); // version needed
+        lfh.extend(0u16.to_le_bytes()); // flags
+        lfh.extend(0u16.to_le_bytes()); // method: store
+        lfh.extend(0u16.to_le_bytes()); // mtime
+        lfh.extend(0u16.to_le_bytes()); // mdate
+        lfh.extend(0u32.to_le_bytes()); // crc (data is never read)
+        lfh.extend((data.len() as u32).to_le_bytes());
+        lfh.extend((data.len() as u32).to_le_bytes());
+        lfh.extend((name.len() as u16).to_le_bytes());
+        lfh.extend(0u16.to_le_bytes()); // extra len
+        lfh.extend_from_slice(name);
+        lfh.extend_from_slice(data);
+        out.extend(&lfh);
+
+        let mut cdh = Vec::new();
+        cdh.extend(0x0201_4b50u32.to_le_bytes());
+        cdh.extend(20u16.to_le_bytes()); // version made by
+        cdh.extend(20u16.to_le_bytes()); // version needed
+        cdh.extend(0u16.to_le_bytes()); // flags
+        cdh.extend(0u16.to_le_bytes()); // method
+        cdh.extend(0u16.to_le_bytes()); // mtime
+        cdh.extend(0u16.to_le_bytes()); // mdate
+        cdh.extend(0u32.to_le_bytes()); // crc
+        cdh.extend((data.len() as u32).to_le_bytes());
+        cdh.extend((data.len() as u32).to_le_bytes());
+        cdh.extend((name.len() as u16).to_le_bytes());
+        cdh.extend(0u16.to_le_bytes()); // extra
+        cdh.extend(0u16.to_le_bytes()); // comment
+        cdh.extend(0u16.to_le_bytes()); // disk start
+        cdh.extend(0u16.to_le_bytes()); // internal attrs
+        cdh.extend(0u32.to_le_bytes()); // external attrs
+        cdh.extend(lfh_offset.to_le_bytes());
+        cdh.extend_from_slice(name);
+        central.extend(cdh);
+
+        offset += lfh.len() as u32;
+    }
+    out.extend(&central);
+    out.extend(0x0605_4b50u32.to_le_bytes());
+    out.extend(0u16.to_le_bytes()); // disk
+    out.extend(0u16.to_le_bytes()); // cd disk
+    out.extend(2u16.to_le_bytes()); // entries this disk
+    out.extend(2u16.to_le_bytes()); // entries total
+    out.extend((central.len() as u32).to_le_bytes());
+    out.extend(offset.to_le_bytes()); // cd offset
+    out.extend(0u16.to_le_bytes()); // comment len
+    std::fs::write(path, out).expect("write raw zip");
+}
+
+/// §6.2: a cursor issued with other --depth/--text-limit options is stale.
+#[test]
+fn cursor_rejects_changed_query_options() {
+    let corpus = Corpus::new();
+    let file = corpus.path("regular.um");
+    let first = run_json(&["tree", &file, "--max-bytes", "300"]);
+    let cursor = first["notes"][0]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let output = insum()
+        .args([
+            "tree",
+            &file,
+            "--max-bytes",
+            "300",
+            "--depth",
+            "2",
+            "--cursor",
+            &cursor,
+        ])
+        .output()
+        .expect("insum runs");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(stderr_json(&output)["error"]["code"], "CURSOR_STALE");
+}
+
+/// §6.2: a cursor position past the document is stale, not an empty page.
+#[test]
+fn cursor_past_the_end_is_stale() {
+    let corpus = Corpus::new();
+    let file = corpus.path("regular.um");
+    let first = run_json(&["tree", &file, "--max-bytes", "300"]);
+    let cursor = first["notes"][0]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // decode, push bi far beyond the document, re-encode
+    let decoded = base64url_decode(&cursor);
+    let mut value: Value = serde_json::from_slice(&decoded).unwrap();
+    value["bi"] = serde_json::json!(9999);
+    let tampered = base64url_encode(value.to_string().as_bytes());
+
+    let output = insum()
+        .args(["tree", &file, "--max-bytes", "300", "--cursor", &tampered])
+        .output()
+        .expect("insum runs");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(stderr_json(&output)["error"]["code"], "CURSOR_STALE");
+}
+
+fn base64url_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(triple >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(triple >> 6 & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+fn base64url_decode(text: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes: Vec<usize> = text
+        .bytes()
+        .map(|b| {
+            ALPHABET
+                .iter()
+                .position(|&a| a == b)
+                .expect("cursor alphabet")
+        })
+        .collect();
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        match chunk.len() {
+            4 => {
+                let t = (chunk[0] << 18) | (chunk[1] << 12) | (chunk[2] << 6) | chunk[3];
+                out.push((t >> 16) as u8);
+                out.push((t >> 8) as u8);
+                out.push(t as u8);
+            }
+            3 => {
+                let t = (chunk[0] << 18) | (chunk[1] << 12) | (chunk[2] << 6);
+                out.push((t >> 16) as u8);
+                out.push((t >> 8) as u8);
+            }
+            2 => {
+                let t = (chunk[0] << 18) | (chunk[1] << 12);
+                out.push((t >> 16) as u8);
+            }
+            _ => panic!("bad cursor"),
+        }
+    }
+    out
+}
+
+/// §6.4: search honors --max-bytes by truncating at whole matches.
+#[test]
+fn search_respects_max_bytes_budget() {
+    let corpus = Corpus::new();
+    let result = run_json(&[
+        "search",
+        "-F",
+        "е",
+        "--max-bytes",
+        "300",
+        &corpus.path("regular.um"),
+    ]);
+    assert_eq!(result["truncated"], Value::Bool(true));
+    assert_eq!(result["complete"], Value::Bool(false));
+    // whole matches only
+    assert!(!result["matches"].as_array().unwrap().is_empty());
+}
+
+/// §6.6: --strict turns warnings into errors and flips `valid`.
+#[test]
+fn validate_strict_turns_warnings_into_errors() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "ok"}]},
+            {"type": "exoticUnknown", "content": [{"type": "text", "text": "?"}]}
+        ]
+    });
+    let file = dir.path().join("unknown.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+
+    // without --strict: valid, with a warning
+    let plain = run_json(&["validate", file.to_string_lossy().as_ref()]);
+    assert_eq!(plain["valid"], Value::Bool(true));
+    let warnings = &plain["files"][0]["notes"][0]["warnings"];
+    assert_eq!(warnings.as_array().unwrap().len(), 1);
+
+    // with --strict: invalid, error carries the warning text
+    let strict = run_json(&["validate", "--strict", file.to_string_lossy().as_ref()]);
+    assert_eq!(strict["valid"], Value::Bool(false));
+    assert_eq!(strict["files"][0]["valid"], Value::Bool(false));
+    let errors = strict["files"][0]["notes"][0]["errors"].as_array().unwrap();
+    assert_eq!(errors[0]["code"], "NOTE_DOC_INVALID");
 }
 
 #[test]

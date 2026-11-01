@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use insum_core::container::peek_um_manifest;
 use insum_core::{ErrorCode, Limits, NoteFile, UmContainer, UmError};
 
-use crate::support::{error_value, mtime_iso, render_path};
+use crate::support::{error_value, hidden_below, mtime_iso, render_path};
 
 pub fn run(path: Option<String>, hidden: bool, limits: &Limits) -> Result<Value, UmError> {
     let path = PathBuf::from(path.unwrap_or_else(|| ".".to_owned()));
@@ -60,12 +60,7 @@ fn list_directory(dir: &Path, hidden: bool, limits: &Limits) -> Result<Value, Um
                 // --hidden re-enables hidden files but not node_modules. The
                 // check applies below the traversal root only: the root
                 // itself is user-specified (temp dirs are often hidden).
-                let below_root = path.strip_prefix(dir).unwrap_or(path.as_path());
-                let hidden_here = below_root.components().any(|component| {
-                    let segment = component.as_os_str().to_string_lossy();
-                    segment == "node_modules" || (!hidden && segment.starts_with('.'))
-                });
-                if hidden_here {
+                if hidden_below(dir, &path, hidden) {
                     continue;
                 }
                 paths.push(path);
@@ -177,8 +172,10 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
                 "type": container.manifest.container_type,
                 "features": container.manifest.features,
                 "parts": container.parts,
-                "notes": container.manifest.notes.iter()
-                    .map(insum_core::NoteDescriptor::to_output)
+                "notes": container
+                    .notes_in_order()
+                    .iter()
+                    .map(|descriptor| descriptor.to_output())
                     .collect::<Vec<_>>(),
             }))
         }

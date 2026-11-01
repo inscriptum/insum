@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
@@ -89,7 +90,25 @@ impl UmContainer {
         note: &NoteDescriptor,
         limits: &Limits,
     ) -> Result<NoteDoc, UmError> {
-        if note.path.contains("..") || note.path.starts_with('/') || note.path.contains('\\') {
+        self.read_note_with_rev(note, limits)
+            .map(|parsed| parsed.note)
+    }
+
+    /// Read one note payload and compute its `note_rev` in the same pass.
+    ///
+    /// `note_rev` per spec §5.4: SHA-256 over length-prefixed components —
+    /// the domain `UM-NOTE-REV-1`, the RAW uncompressed payload bytes (not a
+    /// re-serialization) and the canonical (RFC 8785-style) JSON of the
+    /// note's manifest descriptor.
+    pub fn read_note_with_rev(
+        &mut self,
+        note: &NoteDescriptor,
+        limits: &Limits,
+    ) -> Result<ParsedNote, UmError> {
+        if note.path.starts_with('/')
+            || note.path.contains('\\')
+            || note.path.split('/').any(|segment| segment == "..")
+        {
             return Err(UmError::new(
                 ErrorCode::ArchiveEntryNameInvalid,
                 format!("unsafe note payload path {:?}", note.path),
@@ -114,25 +133,75 @@ impl UmContainer {
                 format!("note payload is not UTF-8: {err}"),
             )
         })?;
-        let value: Value = serde_json::from_str(&payload).map_err(|err| {
-            UmError::new(
-                ErrorCode::NoteJsonInvalid,
-                format!("note payload is not JSON: {err}"),
-            )
-        })?;
-        NoteDoc::parse(&value)
-    }
-
-    /// `note_rev` per spec §5.4: SHA-256 over length-prefixed components —
-    /// the domain `UM-NOTE-REV-1`, the uncompressed payload bytes and the
-    /// canonical (RFC 8785-style) JSON of the note's manifest descriptor.
-    pub fn note_rev(&mut self, note: &NoteDescriptor, limits: &Limits) -> Result<String, UmError> {
-        let note_doc = self.read_note(note, limits)?;
-        let payload = serde_json::to_vec(&note_doc.doc)
-            .map_err(|err| UmError::internal(format!("payload re-serialization failed: {err}")))?;
+        let value = parse_json_limited(&payload, limits.max_depth)?;
+        let note_doc = NoteDoc::parse(&value)?;
         let descriptor = canon::canonical_json(&note.raw);
-        Ok(note_rev_hex(&payload, descriptor.as_bytes()))
+        let note_rev = note_rev_hex(payload.as_bytes(), descriptor.as_bytes());
+        Ok(ParsedNote {
+            note: note_doc,
+            note_rev,
+        })
     }
+}
+
+/// A note payload together with its logical revision.
+pub struct ParsedNote {
+    pub note: NoteDoc,
+    pub note_rev: String,
+}
+
+/// Parse JSON with the depth limit enforced on the raw text before parsing
+/// (so hostile nesting fails as `LIMIT_EXCEEDED`, not as a parse error) and
+/// with serde_json's own recursion limit disabled afterwards.
+fn parse_json_limited(text: &str, max_depth: usize) -> Result<Value, UmError> {
+    if json_depth_exceeds(text, max_depth) {
+        return Err(limit_exceeded(format!(
+            "JSON depth exceeds UM_MAX_DEPTH ({max_depth})"
+        )));
+    }
+    let deserializer = &mut serde_json::Deserializer::from_str(text);
+    deserializer.disable_recursion_limit();
+    let value = Value::deserialize(deserializer).map_err(|err| {
+        UmError::new(
+            ErrorCode::NoteJsonInvalid,
+            format!("note payload is not JSON: {err}"),
+        )
+    })?;
+    Ok(value)
+}
+
+/// Single-pass scan of the raw JSON text tracking `[`/`{` nesting outside
+/// strings — cheap and recursion-free.
+fn json_depth_exceeds(text: &str, max_depth: usize) -> bool {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '[' | '{' => {
+                depth += 1;
+                if depth > max_depth {
+                    return true;
+                }
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `note_rev` over already-collected components (shared with `.note` files).
@@ -217,6 +286,14 @@ fn check_archive_safety(archive: &mut ZipArchive<File>, limits: &Limits) -> Resu
             archive.len(),
             limits.max_archive_entries
         )));
+    }
+    // zip 9 keeps entries in a name-keyed map, so duplicates collapse during
+    // lookup — the explicit probe is the only reliable rejection (§12)
+    if archive.has_duplicate_names() {
+        return Err(UmError::new(
+            ErrorCode::ArchiveDuplicateEntry,
+            "archive contains duplicate entry names",
+        ));
     }
     let mut total: u64 = 0;
     let mut seen: Vec<String> = Vec::with_capacity(archive.len());
@@ -331,12 +408,7 @@ impl NoteFile {
                 format!("note is not UTF-8: {err}"),
             )
         })?;
-        let value: Value = serde_json::from_str(&text).map_err(|err| {
-            UmError::new(
-                ErrorCode::NoteJsonInvalid,
-                format!("note is not valid JSON: {err}"),
-            )
-        })?;
+        let value = parse_json_limited(&text, limits.max_depth)?;
         let note = NoteDoc::parse(&value.clone())?;
         Ok(Self {
             note,

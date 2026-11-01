@@ -170,6 +170,13 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --schema is accepted globally but only validate knows it (§5.1); say
+    // so before running anything
+    if !matches!(cli.command, Some(Command::Validate { .. })) && cli.schema.is_some() {
+        let err = UmError::usage("--schema is supported by `insum validate` only in this release");
+        fail(&err, cli.pretty);
+    }
+
     let limits = insum_core::Limits::from_env();
     let result: Result<Output, UmError> = match &cli.command {
         None => {
@@ -263,12 +270,6 @@ fn main() {
                 .map(Output::Json)
         }
     };
-
-    // commands that do not support --schema must say so (§5.1)
-    if !matches!(cli.command, Some(Command::Validate { .. })) && cli.schema.is_some() {
-        let err = UmError::usage("--schema is supported by `insum validate` only in this release");
-        fail(&err, cli.pretty);
-    }
 
     match result {
         Ok(Output::Json(value)) => print_json(&value, cli.pretty),

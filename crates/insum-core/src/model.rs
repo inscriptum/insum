@@ -230,11 +230,21 @@ pub struct BlockEntry {
     pub children_truncated: bool,
 }
 
+/// The flat block listing of one document, plus the depth-limit signal.
+#[derive(Debug, Default)]
+pub struct Traversal {
+    pub blocks: Vec<BlockEntry>,
+    /// True when the document is deeper than the enforced JSON depth limit
+    /// (UM_MAX_DEPTH) — callers must fail with `LIMIT_EXCEEDED` (spec §5.5).
+    pub depth_exceeded: bool,
+}
+
 /// Walk the document in document order (preorder), producing the flat block
 /// listing. `max_depth` of `Some(d)` stops descending below depth `d`;
-/// parents at the cut get `children_truncated`.
-pub fn traverse(doc: &Value, max_depth: Option<usize>, max_json_depth: usize) -> Vec<BlockEntry> {
-    let mut blocks = Vec::new();
+/// parents at the cut get `children_truncated`. `max_json_depth` is the
+/// enforced UM_MAX_DEPTH: walking stops (with `depth_exceeded`) beyond it.
+pub fn traverse(doc: &Value, max_depth: Option<usize>, max_json_depth: usize) -> Traversal {
+    let mut traversal = Traversal::default();
     let content = doc
         .get("content")
         .and_then(Value::as_array)
@@ -248,11 +258,12 @@ pub fn traverse(doc: &Value, max_depth: Option<usize>, max_json_depth: usize) ->
             index,
             max_depth,
             max_json_depth,
-            &mut blocks,
+            &mut traversal.blocks,
             0,
+            &mut traversal.depth_exceeded,
         );
     }
-    blocks
+    traversal
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -265,18 +276,19 @@ fn walk(
     max_json_depth: usize,
     blocks: &mut Vec<BlockEntry>,
     json_depth: usize,
-) -> bool {
+    depth_exceeded: &mut bool,
+) {
     if json_depth > max_json_depth {
-        // The caller turns this into LIMIT_EXCEEDED; stop walking.
-        return false;
+        *depth_exceeded = true;
+        return;
     }
     let object = match node.as_object() {
         Some(object) => object,
-        None => return true,
+        None => return,
     };
     let node_type = object.get("type").and_then(Value::as_str).unwrap_or("");
     if INLINE_NODE_TYPES.contains(&node_type) {
-        return true; // inline nodes are not blocks
+        return; // inline nodes are not blocks
     }
 
     let pointer = match parent_pointer {
@@ -322,11 +334,11 @@ fn walk(
         children_truncated,
     });
     if !descend {
-        return true;
+        return;
     }
     if let Some(children) = object.get("content").and_then(Value::as_array) {
         for (child_index, child) in children.iter().enumerate() {
-            let ok = walk(
+            walk(
                 child,
                 Some(&pointer),
                 depth + 1,
@@ -335,13 +347,10 @@ fn walk(
                 max_json_depth,
                 blocks,
                 json_depth + 1,
+                depth_exceeded,
             );
-            if !ok {
-                return false;
-            }
         }
     }
-    true
 }
 
 /// Direct inline text of a node, if its content consists of inline nodes.
@@ -439,7 +448,7 @@ mod tests {
 
     #[test]
     fn traversal_is_flat_preorder_with_pointers() {
-        let blocks = traverse(&sample_doc(), None, 128);
+        let blocks = traverse(&sample_doc(), None, 128).blocks;
         let pointers: Vec<&str> = blocks.iter().map(|b| b.pointer.as_str()).collect();
         assert_eq!(
             pointers,
@@ -466,7 +475,7 @@ mod tests {
 
     #[test]
     fn text_does_not_duplicate_on_ancestors() {
-        let blocks = traverse(&sample_doc(), None, 128);
+        let blocks = traverse(&sample_doc(), None, 128).blocks;
         // bulletList and listItem have no aggregated text
         assert!(blocks[1].text.is_none());
         assert!(blocks[2].text.is_none());
@@ -476,7 +485,7 @@ mod tests {
 
     #[test]
     fn id_is_lifted_and_removed_from_attrs() {
-        let blocks = traverse(&sample_doc(), None, 128);
+        let blocks = traverse(&sample_doc(), None, 128).blocks;
         assert_eq!(blocks[4].id.as_deref(), Some("a1b2c3d4e5"));
         assert_eq!(blocks[4].attrs, json!({}));
         assert_eq!(blocks[0].attrs, json!({"level": 2}));
@@ -486,7 +495,7 @@ mod tests {
     fn depth_limit_marks_truncation() {
         // --depth 1: only the top level is emitted; block parents at the cut
         // are marked children_truncated.
-        let blocks = traverse(&sample_doc(), Some(1), 128);
+        let blocks = traverse(&sample_doc(), Some(1), 128).blocks;
         assert_eq!(blocks.len(), 3);
         assert!(blocks.iter().all(|b| b.depth == 0));
         let list = blocks.iter().find(|b| b.pointer == "/content/1").unwrap();
@@ -495,7 +504,7 @@ mod tests {
         // inline-only parents have no children to truncate
         assert!(!heading.children_truncated);
         // --depth 2 shows two levels
-        let blocks2 = traverse(&sample_doc(), Some(2), 128);
+        let blocks2 = traverse(&sample_doc(), Some(2), 128).blocks;
         assert!(blocks2.iter().any(|b| b.depth == 1));
         let item = blocks2
             .iter()

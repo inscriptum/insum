@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use insum_core::{ErrorCode, Limits, UmError};
 
-use crate::support::{collect_files, error_value, read_views, render_path};
+use crate::support::{collect_files, error_value, read_notes, render_path};
 
 const DEFAULT_WINDOW: usize = 160;
 
@@ -41,8 +41,6 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     if context > 5 {
         return Err(UmError::usage("--context accepts 0..5"));
     }
-    let _ = max_bytes; // the budget applies via `limit`; kept for CLI parity
-
     let pattern = if fixed_strings {
         regex::escape(query)
     } else {
@@ -58,20 +56,39 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     } else {
         paths.to_vec()
     };
-    let files = collect_files(&search_paths, hidden)?;
+    let (files, walk_errors) = collect_files(&search_paths, hidden)?;
 
     let effective_limit = limit.min(limits.max_search_matches);
+    let budget = limits.output_bytes(max_bytes);
     let mut matches: Vec<Value> = Vec::new();
+    let mut matches_size: usize = 128; // envelope overhead estimate
     let mut skipped: Vec<Value> = Vec::new();
     let mut truncated = false;
+
+    // locations that could not be enumerated count into `skipped` (§11)
+    for walk_error in &walk_errors {
+        skipped.push(json!({
+            "path": walk_error.path,
+            "error": {"code": "IO_ERROR", "message": walk_error.message},
+        }));
+    }
 
     'files: for file in &files {
         if matches.len() >= effective_limit {
             truncated = true;
             break;
         }
-        let views = match read_views(file, note, limits) {
-            Ok(views) => views,
+        // a .note file cannot contain a note selected by --note: skip it
+        if note.is_some()
+            && !file
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("um"))
+        {
+            continue;
+        }
+        let views = match read_notes(file, note.map(|n| vec![n.to_owned()]).as_deref(), limits) {
+            Ok(source) => source.views,
             Err(err) => {
                 // skip files that are invalid or fail their limits
                 if matches!(
@@ -97,7 +114,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
             }
         };
         for view in views {
-            let blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
+            let blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
             for (block_index, block) in blocks.iter().enumerate() {
                 let Some(text) = &block.text else {
                     continue;
@@ -107,7 +124,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                         truncated = true;
                         break 'files;
                     }
-                    matches.push(json!({
+                    let hit = json!({
                         "path": render_path(file),
                         "note_id": view.note_id,
                         "note_title": view.note_title,
@@ -117,7 +134,15 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                         "match": found.as_str(),
                         "text": window(text, found.start(), found.end()),
                         "context": context_blocks(&blocks, block_index, context),
-                    }));
+                    });
+                    // budget: whole matches only, no silent truncation (§6.4)
+                    let hit_size = serde_json::to_string(&hit).map_or(256, |s| s.len() + 1);
+                    if !matches.is_empty() && matches_size + hit_size > budget {
+                        truncated = true;
+                        break 'files;
+                    }
+                    matches_size += hit_size;
+                    matches.push(hit);
                 }
             }
         }

@@ -5,10 +5,10 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use insum_core::model::BlockEntry;
-use insum_core::{Limits, UmError};
+use insum_core::{ErrorCode, Limits, UmError};
 
 use crate::cursor::Cursor;
-use crate::support::{NoteView, read_views, render_path};
+use crate::support::{NoteView, read_notes, render_path};
 
 pub fn run(
     path: &Path,
@@ -20,17 +20,11 @@ pub fn run(
     limits: &Limits,
 ) -> Result<Value, UmError> {
     let rendered = render_path(path);
-    let mut selected: Vec<NoteView> = Vec::new();
-    if note.is_empty() {
-        selected = read_views(path, None, limits)?;
-    } else {
-        for note_id in note {
-            let mut one = read_views(path, Some(note_id), limits)?;
-            selected.append(&mut one);
-        }
-    }
+    let filters = if note.is_empty() { None } else { Some(note) };
+    let source = read_notes(path, filters, limits)?;
+    let selected = &source.views;
 
-    // cursor contract: same query, same revision (validated per note below)
+    // cursor contract: same query options and same revision (§6.2)
     let cursor = match cursor_token {
         Some(token) => Some(Cursor::decode(token)?),
         None => None,
@@ -42,7 +36,14 @@ pub fn run(
             &rendered,
             view.and_then(|v| v.note_id.as_deref()),
             view.map(|v| v.note_rev.as_str()).unwrap_or_default(),
+            depth,
+            text_limit,
         )?;
+        if cursor.note_index >= selected.len() {
+            return Err(stale_cursor(
+                "cursor points past the last note of this response",
+            ));
+        }
     }
     let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
     let budget = limits.output_bytes(max_bytes);
@@ -78,6 +79,11 @@ pub fn run(
     }))
 }
 
+fn stale_cursor(message: &str) -> UmError {
+    UmError::new(ErrorCode::CursorStale, message.to_owned())
+        .with_hint("Re-run the command without --cursor and paginate from the start.")
+}
+
 /// Query context threaded through note pagination.
 struct PageCtx<'a> {
     rendered: &'a str,
@@ -94,12 +100,26 @@ fn paginate_note(
     start_block: usize,
     limits: &Limits,
 ) -> Result<(Value, bool), UmError> {
-    let all_blocks = insum_core::traverse(&view.doc, ctx.depth, limits.max_depth);
+    let traversal = insum_core::traverse(&view.doc, ctx.depth, limits.max_depth);
+    if traversal.depth_exceeded {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!("document deeper than UM_MAX_DEPTH ({})", limits.max_depth),
+        ));
+    }
+    // a cursor position past the document would silently produce an empty
+    // `complete` page — treat it as stale instead (§6.2)
+    if start_block > traversal.blocks.len() {
+        return Err(stale_cursor(
+            "cursor block position is past the end of the note",
+        ));
+    }
+
     let mut blocks_out: Vec<Value> = Vec::new();
     let mut used: usize = 512; // envelope overhead estimate
     let mut has_more = false;
 
-    for block in all_blocks.iter().skip(start_block) {
+    for block in traversal.blocks.iter().skip(start_block) {
         let entry = block_json(block, ctx.text_limit);
         let entry_size = serde_json::to_string(&entry).map_or(256, |s| s.len() + 1);
         if !blocks_out.is_empty() && used + entry_size > ctx.budget {
@@ -110,7 +130,7 @@ fn paginate_note(
         blocks_out.push(entry);
     }
 
-    let children_truncated = all_blocks.iter().any(|b| b.children_truncated);
+    let children_truncated = traversal.blocks.iter().any(|b| b.children_truncated);
     let next_cursor = if has_more {
         let next_index = start_block + blocks_out.len();
         let cursor = Cursor::tree(

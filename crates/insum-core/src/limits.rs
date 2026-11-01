@@ -3,89 +3,64 @@
 
 use std::env;
 
-/// One limit: default value, absolute safety cap, and the env var name.
+/// One limit: default value, absolute safety ceiling, and the env var name.
+/// The ceiling is the "absolute safety cap" of §5.5: environment values above
+/// it fall back to the default, and per-command options are clamped to it.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitSpec {
     pub env: &'static str,
     pub default: usize,
-    /// Hard ceiling; a configured value above it requires an explicit flag
-    /// which stage A does not provide (spec §5.5).
     pub cap: usize,
 }
 
-const LIMITS: [(&str, LimitSpec); 9] = [
-    (
-        "UM_MAX_ENTRY_BYTES",
-        LimitSpec {
-            env: "UM_MAX_ENTRY_BYTES",
-            default: 33_554_432,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_ARCHIVE_ENTRIES",
-        LimitSpec {
-            env: "UM_MAX_ARCHIVE_ENTRIES",
-            default: 10_000,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_TOTAL_BYTES",
-        LimitSpec {
-            env: "UM_MAX_TOTAL_BYTES",
-            default: 268_435_456,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_DEPTH",
-        LimitSpec {
-            env: "UM_MAX_DEPTH",
-            default: 128,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_OUTPUT_BYTES",
-        LimitSpec {
-            env: "UM_MAX_OUTPUT_BYTES",
-            default: 65_536,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_OPS_BYTES",
-        LimitSpec {
-            env: "UM_MAX_OPS_BYTES",
-            default: 4_194_304,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_SEARCH_MATCHES",
-        LimitSpec {
-            env: "UM_MAX_SEARCH_MATCHES",
-            default: 1_000,
-            cap: 1_000,
-        },
-    ),
-    (
-        "UM_MAX_APPLY_OPS",
-        LimitSpec {
-            env: "UM_MAX_APPLY_OPS",
-            default: 1_000,
-            cap: usize::MAX,
-        },
-    ),
-    (
-        "UM_MAX_COMMIT_RETRIES",
-        LimitSpec {
-            env: "UM_MAX_COMMIT_RETRIES",
-            default: 3,
-            cap: usize::MAX,
-        },
-    ),
+const GIB: usize = 1024 * 1024 * 1024;
+
+const LIMITS: [LimitSpec; 9] = [
+    LimitSpec {
+        env: "UM_MAX_ENTRY_BYTES",
+        default: 33_554_432,
+        cap: GIB,
+    },
+    LimitSpec {
+        env: "UM_MAX_ARCHIVE_ENTRIES",
+        default: 10_000,
+        cap: 1_000_000,
+    },
+    LimitSpec {
+        env: "UM_MAX_TOTAL_BYTES",
+        default: 268_435_456,
+        cap: 8 * GIB,
+    },
+    LimitSpec {
+        env: "UM_MAX_DEPTH",
+        default: 128,
+        cap: 1024,
+    },
+    LimitSpec {
+        env: "UM_MAX_OUTPUT_BYTES",
+        default: 65_536,
+        cap: GIB,
+    },
+    LimitSpec {
+        env: "UM_MAX_OPS_BYTES",
+        default: 4_194_304,
+        cap: GIB,
+    },
+    LimitSpec {
+        env: "UM_MAX_SEARCH_MATCHES",
+        default: 1_000,
+        cap: 1_000,
+    },
+    LimitSpec {
+        env: "UM_MAX_APPLY_OPS",
+        default: 1_000,
+        cap: 100_000,
+    },
+    LimitSpec {
+        env: "UM_MAX_COMMIT_RETRIES",
+        default: 3,
+        cap: 100,
+    },
 ];
 
 /// The resolved limit values for one process run.
@@ -104,20 +79,20 @@ pub struct Limits {
 
 impl Limits {
     /// Read limits from the environment. Values that are absent, unparsable
-    /// or above the absolute safety cap fall back to the default (a stricter
-    /// configured value is honored; caps are not reachable via env).
+    /// or above the absolute safety cap fall back to the default; a stricter
+    /// configured value is honored (spec §5.5).
     pub fn from_env() -> Self {
         let mut limits = Self::defaults();
         for (slot, spec) in [
-            (&mut limits.max_entry_bytes, &LIMITS[0].1),
-            (&mut limits.max_archive_entries, &LIMITS[1].1),
-            (&mut limits.max_total_bytes, &LIMITS[2].1),
-            (&mut limits.max_depth, &LIMITS[3].1),
-            (&mut limits.max_output_bytes, &LIMITS[4].1),
-            (&mut limits.max_ops_bytes, &LIMITS[5].1),
-            (&mut limits.max_search_matches, &LIMITS[6].1),
-            (&mut limits.max_apply_ops, &LIMITS[7].1),
-            (&mut limits.max_commit_retries, &LIMITS[8].1),
+            (&mut limits.max_entry_bytes, &LIMITS[0]),
+            (&mut limits.max_archive_entries, &LIMITS[1]),
+            (&mut limits.max_total_bytes, &LIMITS[2]),
+            (&mut limits.max_depth, &LIMITS[3]),
+            (&mut limits.max_output_bytes, &LIMITS[4]),
+            (&mut limits.max_ops_bytes, &LIMITS[5]),
+            (&mut limits.max_search_matches, &LIMITS[6]),
+            (&mut limits.max_apply_ops, &LIMITS[7]),
+            (&mut limits.max_commit_retries, &LIMITS[8]),
         ] {
             if let Some(value) = read_limit(spec) {
                 *slot = value;
@@ -141,10 +116,13 @@ impl Limits {
     }
 
     /// The output budget for one response: `--max-bytes` override or the
-    /// default (spec §6.2). The budget protects the consumer; input safety
-    /// caps are separate and never reachable via output options.
+    /// default, clamped to the absolute ceiling (spec §5.5: options refine
+    /// the limit but never break the safety cap).
     pub fn output_bytes(&self, requested: Option<usize>) -> usize {
-        requested.unwrap_or(self.max_output_bytes)
+        match requested {
+            Some(value) => value.min(GIB),
+            None => self.max_output_bytes,
+        }
     }
 }
 
@@ -174,5 +152,13 @@ mod tests {
         assert_eq!(limits.max_search_matches, 1_000);
         assert_eq!(limits.max_apply_ops, 1_000);
         assert_eq!(limits.max_commit_retries, 3);
+    }
+
+    #[test]
+    fn output_budget_never_breaks_the_cap() {
+        let limits = Limits::defaults();
+        assert_eq!(limits.output_bytes(Some(1024)), 1024);
+        assert_eq!(limits.output_bytes(Some(10 * GIB)), GIB);
+        assert_eq!(limits.output_bytes(None), 65_536);
     }
 }

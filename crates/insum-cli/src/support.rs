@@ -48,11 +48,37 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
+/// Hidden segments and `node_modules` are skipped (spec §5.2). The check
+/// applies to segments below the traversal root only: the root itself is
+/// user-specified (and temp directories are often hidden).
+pub fn hidden_below(root: &Path, path: &Path, hidden: bool) -> bool {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|component| {
+            let segment = component.as_os_str().to_string_lossy();
+            segment == "node_modules" || (!hidden && segment.starts_with('.'))
+        })
+}
+
+/// A location that could not even be enumerated: best-effort commands report
+/// it and lower `complete` (spec §11).
+pub struct WalkError {
+    pub path: String,
+    pub message: String,
+}
+
 /// Walk the given paths and collect `.um`/`.note` files (spec §5.2):
 /// recursive, no symlink following, hidden files and `node_modules` skipped
-/// unless `hidden` (the toggle never re-enables `node_modules`).
-pub fn collect_files(paths: &[PathBuf], hidden: bool) -> Result<Vec<PathBuf>, UmError> {
+/// unless `hidden` (the toggle never re-enables `node_modules`). Explicitly
+/// named file arguments are opened directly even when they are symlinks —
+/// the no-symlink rule governs traversal, not user-provided arguments.
+pub fn collect_files(
+    paths: &[PathBuf],
+    hidden: bool,
+) -> Result<(Vec<PathBuf>, Vec<WalkError>), UmError> {
     let mut files = Vec::new();
+    let mut walk_errors = Vec::new();
     for path in paths {
         let metadata = std::fs::symlink_metadata(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -72,37 +98,35 @@ pub fn collect_files(paths: &[PathBuf], hidden: bool) -> Result<Vec<PathBuf>, Um
                 .follow_links(false)
                 .sort_by_file_name()
                 .into_iter()
-                .filter_map(Result::ok)
             {
-                if !entry.file_type().is_file() {
-                    continue; // directories and symlinks are not entries
-                }
-                let entry_path = entry.path();
-                // skip rules apply below the traversal root only (the root
-                // itself is user-specified; temp dirs are often hidden)
-                let below_root = entry_path.strip_prefix(path).unwrap_or(entry_path);
-                if should_skip(below_root, hidden) {
-                    continue;
-                }
-                if classify_extension(entry_path).is_some() {
-                    files.push(entry.into_path());
+                match entry {
+                    Ok(entry) => {
+                        if !entry.file_type().is_file() {
+                            continue; // directories and symlinks are not entries
+                        }
+                        let entry_path = entry.path();
+                        if hidden_below(path, entry_path, hidden) {
+                            continue;
+                        }
+                        if classify_extension(entry_path).is_some() {
+                            files.push(entry.into_path());
+                        }
+                    }
+                    Err(err) => walk_errors.push(WalkError {
+                        path: err.path().map(render_path).unwrap_or_default(),
+                        message: err.to_string(),
+                    }),
                 }
             }
-        } else if !metadata.is_symlink() && classify_extension(path).is_some() {
+        } else if classify_extension(path).is_some() {
+            // an explicitly named document is a valid argument even when it
+            // is a symlink (the no-symlink rule governs traversal)
             files.push(path.clone());
         }
     }
     files.sort_by_key(|path| render_path(path));
     files.dedup_by_key(|path| render_path(path));
-    Ok(files)
-}
-
-/// Hidden segments and `node_modules` are skipped (spec §5.2).
-fn should_skip(path: &Path, hidden: bool) -> bool {
-    path.components().any(|component| {
-        let segment = component.as_os_str().to_string_lossy();
-        segment == "node_modules" || (!hidden && segment.starts_with('.'))
-    })
+    Ok((files, walk_errors))
 }
 
 /// One note ready for output: identity, revision, document, features.
@@ -128,41 +152,58 @@ impl NoteView {
     }
 }
 
+/// The result of opening one document path: the file-level revision plus the
+/// requested notes (in manifest order, single pass — one decompression per
+/// payload).
+pub struct SourceRead {
+    pub file_rev: String,
+    pub views: Vec<NoteView>,
+}
+
 /// Open a `.um`/`.note` path and read the requested notes in manifest order.
-pub fn read_views(
+/// `filters` selects notes by id (repeatable `--note`); `None` reads all.
+pub fn read_notes(
     path: &Path,
-    note_filter: Option<&str>,
+    filters: Option<&[String]>,
     limits: &Limits,
-) -> Result<Vec<NoteView>, UmError> {
+) -> Result<SourceRead, UmError> {
     match classify_extension(path) {
         Some("um") => {
             let mut container = UmContainer::open(path, limits)?;
-            if let Some(filter) = note_filter {
-                let descriptor = container.find_note(filter)?.clone();
-                let note_rev = container.note_rev(&descriptor, limits)?;
-                let note_doc = container.read_note(&descriptor, limits)?;
-                return Ok(vec![NoteView::from_descriptor(
-                    &descriptor,
-                    &note_doc.doc,
-                    note_rev,
-                )]);
+            if let Some(filters) = filters {
+                let mut views = Vec::with_capacity(filters.len());
+                for filter in filters {
+                    let descriptor = container.find_note(filter)?.clone();
+                    let parsed = container.read_note_with_rev(&descriptor, limits)?;
+                    views.push(NoteView::from_descriptor(
+                        &descriptor,
+                        &parsed.note.doc,
+                        parsed.note_rev,
+                    ));
+                }
+                return Ok(SourceRead {
+                    file_rev: container.file_rev,
+                    views,
+                });
             }
             let descriptors: Vec<NoteDescriptor> =
                 container.notes_in_order().into_iter().cloned().collect();
             let mut views = Vec::with_capacity(descriptors.len());
             for descriptor in &descriptors {
-                let note_rev = container.note_rev(descriptor, limits)?;
-                let note_doc = container.read_note(descriptor, limits)?;
+                let parsed = container.read_note_with_rev(descriptor, limits)?;
                 views.push(NoteView::from_descriptor(
                     descriptor,
-                    &note_doc.doc,
-                    note_rev,
+                    &parsed.note.doc,
+                    parsed.note_rev,
                 ));
             }
-            Ok(views)
+            Ok(SourceRead {
+                file_rev: container.file_rev,
+                views,
+            })
         }
         Some("note") => {
-            if note_filter.is_some() {
+            if filters.is_some() {
                 return Err(UmError::usage(
                     "--note is not allowed for a .note file (it holds a single document)",
                 ));
@@ -174,14 +215,17 @@ pub fn read_views(
                 .and_then(|f| f.get("block_ids"))
                 .and_then(Value::as_u64)
                 == Some(1);
-            Ok(vec![NoteView {
-                note_id: None,
-                note_title: note_title(None, &note_file.note.doc),
-                note_rev: note_file.note_rev.clone(),
-                doc: note_file.note.doc.clone(),
-                features,
-                block_ids_enabled,
-            }])
+            Ok(SourceRead {
+                file_rev: note_file.file_rev.clone(),
+                views: vec![NoteView {
+                    note_id: None,
+                    note_title: note_title(None, &note_file.note.doc),
+                    note_rev: note_file.note_rev.clone(),
+                    doc: note_file.note.doc.clone(),
+                    features,
+                    block_ids_enabled,
+                }],
+            })
         }
         _ => Err(UmError::new(
             ErrorCode::PathNotFound,

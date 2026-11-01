@@ -10,7 +10,12 @@ use insum_core::model::BlockEntry;
 use insum_core::{ErrorCode, Limits, UmError};
 
 use crate::cursor::Cursor;
-use crate::support::{Output, read_views, render_path};
+use crate::support::{Output, read_notes, render_path};
+
+fn stale_cursor(message: &str) -> UmError {
+    UmError::new(insum_core::ErrorCode::CursorStale, message.to_owned())
+        .with_hint("Re-run the command without --cursor and paginate from the start.")
+}
 
 pub fn run(
     path: &Path,
@@ -29,12 +34,14 @@ pub fn run(
         }
     }
     let rendered = render_path(path);
-    let views = read_views(path, note, limits)?;
+    let filters = note.map(|n| vec![n.to_owned()]);
+    let source = read_notes(path, filters.as_deref(), limits)?;
+    let views = &source.views;
 
     if format == "json" {
         let budget = limits.output_bytes(max_bytes);
         let mut notes = Vec::new();
-        for view in &views {
+        for view in views.iter() {
             let note_value = json!({
                 "note_id": view.note_id,
                 "note_title": view.note_title,
@@ -59,7 +66,7 @@ pub fn run(
         return Ok(Output::Json(json!({
             "api_version": 1,
             "path": rendered,
-            "file_rev": file_rev(path, limits)?,
+            "file_rev": source.file_rev,
             "notes": notes,
         })));
     }
@@ -76,7 +83,14 @@ pub fn run(
             &rendered,
             view.and_then(|v| v.note_id.as_deref()),
             view.map(|v| v.note_rev.as_str()).unwrap_or_default(),
+            None,
+            0,
         )?;
+        if cursor.note_index >= views.len() {
+            return Err(stale_cursor(
+                "cursor points past the last note of this response",
+            ));
+        }
     }
     let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
     let budget = limits.output_bytes(max_bytes);
@@ -103,7 +117,7 @@ pub fn run(
         }
         out.push_str(&header);
         let mut used = out.len();
-        let blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
+        let blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
         let top_level: Vec<&BlockEntry> = blocks.iter().filter(|b| b.depth == 0).collect();
         for (block_position, block) in top_level.iter().enumerate().skip(start_block) {
             let mut rendered_block = String::new();
@@ -142,13 +156,6 @@ pub fn run(
     }
 
     Ok(Output::Text(out))
-}
-
-fn file_rev(path: &Path, limits: &Limits) -> Result<String, UmError> {
-    match insum_core::container::classify_extension(path) {
-        Some("um") => Ok(insum_core::UmContainer::open(path, limits)?.file_rev),
-        _ => Ok(insum_core::NoteFile::open(path, limits)?.file_rev),
-    }
 }
 
 fn render_block(block: &BlockEntry, blocks: &[BlockEntry], out: &mut String) {
