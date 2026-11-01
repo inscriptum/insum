@@ -109,7 +109,7 @@ fn paginate_note(
     }
     // a cursor position past the document would silently produce an empty
     // `complete` page — treat it as stale instead (§6.2)
-    if start_block > traversal.blocks.len() {
+    if start_block >= traversal.blocks.len() && start_block > 0 {
         return Err(stale_cursor(
             "cursor block position is past the end of the note",
         ));

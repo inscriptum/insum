@@ -15,7 +15,9 @@ use crate::support::{error_value, hidden_below, mtime_iso, render_path};
 
 pub fn run(path: Option<String>, hidden: bool, limits: &Limits) -> Result<Value, UmError> {
     let path = PathBuf::from(path.unwrap_or_else(|| ".".to_owned()));
-    let metadata = std::fs::symlink_metadata(&path).map_err(|err| {
+    // the explicit argument is opened directly (even a symlink); traversal
+    // inside directories still never follows symlinks
+    let metadata = std::fs::metadata(&path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             UmError::new(
                 ErrorCode::PathNotFound,
