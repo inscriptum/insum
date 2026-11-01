@@ -7,6 +7,10 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- Read API — six commands over any `.um`/`.note` knowledge base: `ls`,
+  `search`, `tree`, `block get`, `read`, `validate`. Agents get a safe JSON
+  view with pointers, revisions, paging and stable error codes; files are
+  never modified.
 - Rust workspace scaffold with three crates (`insum-core`, `insum-cli`,
   `insum-test-utils`), CI on Linux, macOS and Windows.
 - `insum --version` reports version info as JSON, `--pretty` indents any
