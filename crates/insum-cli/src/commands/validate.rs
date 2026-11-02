@@ -3,7 +3,7 @@
 //! Stage A checks containers, manifests, note JSON structure, entry names,
 //! limits and (when a document is marked `features.block_ids`) ID grammar
 //! and uniqueness. The level is always `structural`: without a schema
-//! artifact the CLI must not claim schema/full validation (§6.6).
+//! artifact the CLI must not claim schema/full validation (§6.6, §15.5 №48).
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +11,7 @@ use serde_json::{Value, json};
 
 use insum_core::{ErrorCode, Limits, UmError};
 
-use crate::commands::block::KNOWN_TYPES;
-use crate::support::{collect_files, read_notes, render_path};
+use crate::support::{Revs, collect_files, read_notes, render_path};
 
 pub fn run(
     paths: &[PathBuf],
@@ -38,7 +37,9 @@ pub fn run(
             ErrorCode::SchemaValidationIncomplete,
             "schema-level validation is not available on stage A",
         )
-        .with_hint("Structural validation runs without --schema; schema/full levels arrive with the schema-cli task."));
+        .with_hint(
+            "Structural validation runs without --schema; schema/full levels arrive with the schema-cli task.",
+        ));
     }
 
     let (files, walk_errors) = collect_files(paths, hidden)?;
@@ -93,26 +94,24 @@ pub fn run(
 }
 
 fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, UmError> {
-    let views = read_notes(path, None, limits)?.views;
+    let views = read_notes(path, None, limits, Revs::Compute)?.views;
     let mut notes = Vec::new();
     let mut file_valid = true;
 
     for view in views {
-        let (note_valid, errors, warnings) = validate_note(&view, limits);
-        if !note_valid {
+        // validation logic lives in insum-core (§14, review K-13); the CLI
+        // only shapes the output
+        let validation = insum_core::validate_note_doc(&view.doc, view.block_ids_enabled, limits)?;
+        if !validation.valid() {
             file_valid = false;
         }
-        if strict && !warnings.is_empty() {
-            // §6.6: --strict turns every warning into an error. The §11
-            // registry has no dedicated code for a failed warning, so strict
-            // failures use NOTE_DOC_INVALID (data-level, exit 4); without
-            // --strict a warning alone never flips `valid`.
+        if strict && !validation.warnings.is_empty() {
+            // §6.6/§10.2: --strict promotes warnings to errors. NOTE_DOC_INVALID
+            // is the data-level code the §11 registry offers for it (exit 4);
+            // without --strict a warning never flips `valid`.
             file_valid = false;
-            let mut strict_errors: Vec<Value> = warnings
-                .iter()
-                .map(|warning| json!({"code": "NOTE_DOC_INVALID", "message": warning}))
-                .collect();
-            strict_errors.extend(errors);
+            let mut strict_errors = warnings_as_errors(&validation.warnings);
+            strict_errors.extend(diagnostics(&validation.errors));
             notes.push(json!({
                 "id": view.note_id,
                 "valid": false,
@@ -123,9 +122,9 @@ fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, Um
         }
         notes.push(json!({
             "id": view.note_id,
-            "valid": note_valid,
-            "errors": errors,
-            "warnings": warnings,
+            "valid": validation.valid(),
+            "errors": diagnostics(&validation.errors),
+            "warnings": diagnostics(&validation.warnings),
         }));
     }
 
@@ -137,62 +136,21 @@ fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, Um
     }))
 }
 
-/// Validate one note: parsing already proved the container/JSON structure;
-/// block ID rules apply only to documents marked `features.block_ids` (§6.6).
-fn validate_note(
-    view: &crate::support::NoteView,
-    limits: &Limits,
-) -> (bool, Vec<Value>, Vec<String>) {
-    let mut warnings = Vec::new();
-    let mut errors: Vec<Value> = Vec::new();
-    let blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
-
-    for block in &blocks {
-        if !KNOWN_TYPES.contains(&block.node_type.as_str()) {
-            warnings.push(format!(
-                "unknown node type {:?} at {} (preserved as-is)",
-                block.node_type, block.pointer
-            ));
-        }
-    }
-
-    if view.block_ids_enabled {
-        let mut seen: Vec<(String, String)> = Vec::new(); // (id, first pointer)
-        for block in &blocks {
-            match &block.id {
-                None => errors.push(json!({
-                    "code": "BLOCK_ID_MISSING",
-                    "message": format!("block at {} has no id though block_ids is enabled", block.pointer),
-                })),
-                Some(id) => {
-                    if !is_valid_id(id) {
-                        errors.push(json!({
-                            "code": "BLOCK_ID_INVALID",
-                            "message": format!(
-                                "id {id:?} at {} does not match ^[a-z0-9]{{8,12}}$",
-                                block.pointer
-                            ),
-                        }));
-                    }
-                    if let Some((_, first)) = seen.iter().find(|(known, _)| known == id) {
-                        errors.push(json!({
-                            "code": "BLOCK_ID_DUPLICATE",
-                            "message": format!("id {id:?} at {} duplicates {}", block.pointer, first),
-                        }));
-                    } else {
-                        seen.push((id.clone(), block.pointer.clone()));
-                    }
-                }
-            }
-        }
-    }
-
-    (errors.is_empty(), errors, warnings)
+fn warnings_as_errors(warnings: &[insum_core::Diag]) -> Vec<Value> {
+    warnings
+        .iter()
+        .map(|warning| {
+            json!({
+                "code": "NOTE_DOC_INVALID",
+                "message": format!("strict: {} ({})", warning.message, warning.code)
+            })
+        })
+        .collect()
 }
 
-fn is_valid_id(id: &str) -> bool {
-    (8..=12).contains(&id.len())
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+fn diagnostics(diags: &[insum_core::Diag]) -> Vec<Value> {
+    diags
+        .iter()
+        .map(|diag| json!({"code": diag.code, "message": diag.message}))
+        .collect()
 }

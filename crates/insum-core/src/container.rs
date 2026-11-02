@@ -33,7 +33,7 @@ impl UmContainer {
         let bytes = std::fs::metadata(path)
             .map_err(|err| path_error(path, err))?
             .len();
-        let file_rev = hash_file(path)?;
+        let file_rev = format_rev(hash_file(path)?);
         let mut archive = ZipArchive::new(File::open(path).map_err(|err| path_error(path, err))?)
             .map_err(|err| {
             UmError::new(
@@ -44,7 +44,7 @@ impl UmContainer {
         })?;
         check_archive_safety(&mut archive, limits)?;
 
-        let manifest = Manifest::parse(read_manifest_value(&mut archive)?)?;
+        let manifest = Manifest::parse(read_manifest_value(&mut archive, limits)?)?;
         let mut parts: Vec<String> = archive
             .file_names()
             .filter_map(|name| name.ok())
@@ -136,7 +136,7 @@ impl UmContainer {
         let value = parse_json_limited(&payload, limits.max_depth)?;
         let note_doc = NoteDoc::parse(&value)?;
         let descriptor = canon::canonical_json(&note.raw);
-        let note_rev = note_rev_hex(payload.as_bytes(), descriptor.as_bytes());
+        let note_rev = format_rev(note_rev_hex(payload.as_bytes(), descriptor.as_bytes()));
         Ok(ParsedNote {
             note: note_doc,
             note_rev,
@@ -204,29 +204,54 @@ fn json_depth_exceeds(text: &str, max_depth: usize) -> bool {
     false
 }
 
-/// `note_rev` over already-collected components (shared with `.note` files).
-pub fn note_rev_hex(payload_bytes: &[u8], canonical_descriptor: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"UM-NOTE-REV-1");
-    hash_component(&mut hasher, payload_bytes);
-    hash_component(&mut hasher, canonical_descriptor);
-    hex(&hasher.finalize())
+/// The wire format of every revision (§5.4/§6.2/§8.5 examples: `sha256:` +
+/// 64 hex characters). Internal hashing stays on raw bytes.
+pub fn format_rev(hex: String) -> String {
+    format!("sha256:{hex}")
 }
 
-/// Length-prefix a component so concatenation stays unambiguous (spec §5.4).
-fn hash_component(hasher: &mut Sha256, component: &[u8]) {
-    hasher.update((component.len() as u64).to_le_bytes());
-    hasher.update(component);
+/// `note_rev` per spec §8.6 — the normative formula:
+/// `SHA-256("UM-NOTE-REV-1\x00" + BE64(len) + payload + BE64(len) + descriptor)`
+/// where the descriptor is the canonical (RFC 8785-style) JSON of the note's
+/// manifest entry. §5.4's "length before value" wording does not fix the byte
+/// order; §8.6 does (big-endian) and wins as the more precise contract.
+pub fn note_rev_hex(payload_bytes: &[u8], canonical_descriptor: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"UM-NOTE-REV-1\x00");
+    hasher.update((payload_bytes.len() as u64).to_be_bytes());
+    hasher.update(payload_bytes);
+    hasher.update((canonical_descriptor.len() as u64).to_be_bytes());
+    hasher.update(canonical_descriptor);
+    hex(&hasher.finalize())
 }
 
 /// `note_rev` for a `.note` file: SHA-256 of the whole file bytes
 /// (legacy document or full envelope, spec §5.4).
 pub fn note_rev_for_file_bytes(file_bytes: &[u8]) -> String {
-    sha256_hex(file_bytes)
+    format_rev(sha256_hex(file_bytes))
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
+}
+
+/// Read a file with a hard byte cap (spec §12: limits are enforced on the
+/// actual bytes, races with growing files included).
+fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
+    let file = File::open(path).map_err(|err| path_error(path, err))?;
+    let mut buffer = Vec::new();
+    let mut taken = file.take(limits.max_entry_bytes as u64 + 1);
+    taken
+        .read_to_end(&mut buffer)
+        .map_err(|err| path_error(path, err))?;
+    if buffer.len() > limits.max_entry_bytes {
+        return Err(limit_exceeded(format!(
+            "{} exceeds UM_MAX_ENTRY_BYTES ({} bytes)",
+            path.display(),
+            limits.max_entry_bytes
+        )));
+    }
+    Ok(buffer)
 }
 
 /// Stream-hash the whole file — `file_rev` covers every byte (spec §5.4)
@@ -255,14 +280,16 @@ fn hex(digest: &[u8]) -> String {
     out
 }
 
-fn read_manifest_value(archive: &mut ZipArchive<File>) -> Result<Value, UmError> {
+fn read_manifest_value(archive: &mut ZipArchive<File>, limits: &Limits) -> Result<Value, UmError> {
+    let _depth = limits.max_depth;
     let mut entry = archive.by_name("manifest.json").map_err(|_| {
         UmError::new(
             ErrorCode::ManifestMissing,
             "no manifest.json at archive root",
         )
     })?;
-    let mut text = String::with_capacity(entry.size() as usize);
+    // capacity is bounded: the declared entry size is attacker-controlled
+    let mut text = String::with_capacity(entry.size().min(1 << 20) as usize);
     entry.read_to_string(&mut text).map_err(|err| {
         UmError::new(
             ErrorCode::ManifestInvalid,
@@ -390,17 +417,11 @@ pub struct NoteFile {
 
 impl NoteFile {
     pub fn open(path: &Path, limits: &Limits) -> Result<Self, UmError> {
-        let bytes = std::fs::metadata(path)
-            .map_err(|err| path_error(path, err))?
-            .len();
-        if bytes as usize > limits.max_entry_bytes {
-            return Err(limit_exceeded(format!(
-                "{} exceeds UM_MAX_ENTRY_BYTES ({bytes} bytes)",
-                path.display()
-            )));
-        }
-        let raw = std::fs::read(path).map_err(|err| path_error(path, err))?;
-        let file_rev = sha256_hex(&raw);
+        // Read with a hard cap instead of stat-then-read: a FIFO or a file
+        // growing between stat and read cannot inflate the allocation (§12).
+        let raw = read_bounded(path, limits)?;
+        let bytes = raw.len() as u64;
+        let file_rev = format_rev(sha256_hex(&raw));
         let note_rev = note_rev_for_file_bytes(&raw);
         let text = String::from_utf8(raw).map_err(|err| {
             UmError::new(
@@ -433,7 +454,7 @@ pub fn peek_um_manifest(path: &Path, limits: &Limits) -> Result<(Manifest, Vec<S
             .with_hint("Check the file type or restore a valid UM container.")
         })?;
     check_archive_safety(&mut archive, limits)?;
-    let manifest = Manifest::parse(read_manifest_value(&mut archive)?)?;
+    let manifest = Manifest::parse(read_manifest_value(&mut archive, limits)?)?;
     let mut parts: Vec<String> = archive
         .file_names()
         .filter_map(|name| name.ok())

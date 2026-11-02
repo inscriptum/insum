@@ -290,7 +290,11 @@ fn pagination_resumes_and_detects_stale_revisions() {
         let page = run_json(&["tree", &file, "--max-bytes", "300", "--cursor", &cursor]);
         let page_note = &page["notes"][0];
         for block in page_note["blocks"].as_array().unwrap() {
-            let pointer = block["pointer"].as_str().unwrap().to_owned();
+            // T-13: strict extraction — a broken entry must fail loudly
+            let pointer = block["pointer"]
+                .as_str()
+                .expect("block carries a pointer")
+                .to_owned();
             assert!(!emitted.contains(&pointer), "pages never repeat a block");
             emitted.push(pointer);
         }
@@ -303,19 +307,20 @@ fn pagination_resumes_and_detects_stale_revisions() {
     }
     assert!(complete, "pagination terminates");
 
-    // a cursor from another revision is CURSOR_STALE (§6.2): rewrite the
-    // container with different note content so note_rev changes
-    let changed = TempDir::new().expect("tempdir");
+    // T-01: the note_rev branch specifically — rewrite the SAME path with
+    // the SAME note id but different content, so only note_rev diverges
+    let note_id = note["note_id"].as_str().unwrap().to_owned();
     let notes = [fixtures::FixtureNote::plain_page(
-        &fixtures::ulid_seq(9),
+        &note_id,
         "Changed content",
         &[fixtures::paragraph(&[fixtures::text("Different body")])],
     )];
-    fixtures::write_um(&changed.path().join("regular.um"), &notes).expect("rewrite");
+    fixtures::write_um(&std::path::PathBuf::from(corpus.path("regular.um")), &notes)
+        .expect("rewrite");
     let output = insum()
         .args([
             "tree",
-            &changed.path().join("regular.um").to_string_lossy(),
+            &corpus.path("regular.um"),
             "--max-bytes",
             "300",
             "--cursor",
@@ -326,6 +331,15 @@ fn pagination_resumes_and_detects_stale_revisions() {
     assert_eq!(output.status.code(), Some(7), "CURSOR_STALE exits 7");
     let error = stderr_json(&output);
     assert_eq!(error["error"]["code"], "CURSOR_STALE");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("revision"),
+        "stale by revision, not by path: {}",
+        error["error"]["message"]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +430,12 @@ fn broken_files_surface_as_invalid_or_skipped() {
         "Legacy",
         corpus.dir.path().to_string_lossy().as_ref(),
     ]);
-    assert_eq!(search["complete"], Value::Bool(false));
+    assert_eq!(
+        search["complete"],
+        Value::Bool(false),
+        "real response: {}",
+        serde_json::to_string(&search).unwrap()
+    );
     assert_eq!(search["skipped"].as_array().unwrap().len(), 1);
     assert_eq!(search["skipped"][0]["error"]["code"], "NOT_A_ZIP");
     assert!(!search["matches"].as_array().unwrap().is_empty());
@@ -740,6 +759,35 @@ fn write_um_pretty_payload(path: &Path) {
     zip.finish().unwrap();
 }
 
+/// Raw STORE-entry ZIP builder for hostile-input fixtures: entries are
+/// (name, bytes) pairs, written verbatim (no writer-side validation).
+fn write_raw_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    let file = std::fs::File::create(path).expect("create");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, data) in entries {
+        zip.start_file(*name, options).expect("start entry");
+        zip.write_all(data).expect("write entry");
+    }
+    zip.finish().expect("finish zip");
+}
+
+fn run_json_env(args: &[&str], key: &str, value: &str) -> Value {
+    let output = insum()
+        .args(args)
+        .env(key, value)
+        .output()
+        .expect("insum runs");
+    assert!(
+        output.status.success(),
+        "command {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("stdout of {args:?} is one JSON document: {err}"))
+}
+
 /// §12: duplicate archive entries are rejected (zip 9 collapses them in
 /// lookups, so the explicit probe is the only reliable guard).
 #[test]
@@ -935,7 +983,7 @@ fn search_respects_max_bytes_budget() {
         "-F",
         "е",
         "--max-bytes",
-        "300",
+        "600",
         &corpus.path("regular.um"),
     ]);
     assert_eq!(result["truncated"], Value::Bool(true));
@@ -989,4 +1037,542 @@ fn search_in_a_note_file_and_directory_work() {
         .collect();
     assert!(!found.is_empty());
     assert!(found[0]["note_id"].is_null(), ".note files have no note id");
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 — contract fixes (K-01..K-06, S-01..S-03, C-04, T-02/T-03)
+// ---------------------------------------------------------------------------
+
+/// §8.6 formula computed INDEPENDENTLY in the test (raw payload bytes from
+/// the archive, BE64 lengths, NUL-terminated domain) — not via insum-core.
+#[test]
+fn note_rev_matches_spec_8_6_formula() {
+    use sha2::{Digest, Sha256};
+
+    let corpus = Corpus::new();
+    let file = corpus.path("minimal.um");
+    let tree = run_json(&["tree", &file]);
+    let cli_rev = tree["notes"][0]["note_rev"].as_str().unwrap();
+    assert!(
+        cli_rev.starts_with("sha256:"),
+        "wire format is sha256:<hex> (K-02)"
+    );
+
+    // raw payload bytes straight from the archive
+    let zip = std::fs::File::open(&file).unwrap();
+    let mut archive = zip::ZipArchive::new(zip).unwrap();
+    let note_id = tree["notes"][0]["note_id"].as_str().unwrap().to_owned();
+    let mut payload_entry = archive.by_name(&format!("notes/{note_id}.json")).unwrap();
+    let mut payload = Vec::new();
+    std::io::Read::read_to_end(&mut payload_entry, &mut payload).unwrap();
+
+    // canonical descriptor: manifest entry sorted-keys compact JSON
+    let manifest: Value =
+        serde_json::from_slice(&read_zip_entry_bytes(&file, "manifest.json")).unwrap();
+    let descriptor = &manifest["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == Value::String(note_id.clone()))
+        .unwrap()
+        .clone();
+    let canonical = canonical_json_str(descriptor);
+
+    // literal §8.6: "UM-NOTE-REV-1\x00" + BE64 + payload + BE64 + descriptor
+    let mut hasher = Sha256::new();
+    hasher.update(b"UM-NOTE-REV-1\x00");
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(&payload);
+    hasher.update((canonical.len() as u64).to_be_bytes());
+    hasher.update(canonical.as_bytes());
+    let expected = format!("sha256:{}", hex(&hasher.finalize()));
+    assert_eq!(cli_rev, expected, "note_rev follows §8.6 (BE, NUL domain)");
+}
+
+fn read_zip_entry_bytes(path: &str, name: &str) -> Vec<u8> {
+    let file = std::fs::File::open(path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut entry = archive.by_name(name).unwrap();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+    buf
+}
+
+/// Minimal canonical JSON for descriptor-shaped values (sorted keys, compact).
+fn canonical_json_str(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_by_key(|k| k.encode_utf16().collect::<Vec<u16>>());
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap(),
+                        canonical_json_str(&map[k.as_str()])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(canonical_json_str).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+fn hex(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn revisions_carry_the_sha256_prefix() {
+    let corpus = Corpus::new();
+    let ls = run_json(&["ls", &corpus.path("minimal.um")]);
+    assert!(ls["file_rev"].as_str().unwrap().starts_with("sha256:"));
+    let tree = run_json(&["tree", &corpus.path("regular.um")]);
+    for note in tree["notes"].as_array().unwrap() {
+        assert!(note["note_rev"].as_str().unwrap().starts_with("sha256:"));
+    }
+    let note_ls = run_json(&["ls", &corpus.path("legacy.note")]);
+    assert!(note_ls["file_rev"].as_str().unwrap().starts_with("sha256:"));
+    assert!(note_ls["note_rev"].as_str().unwrap().starts_with("sha256:"));
+}
+
+/// §10.1 structural checks: attrs/text/content/marks shape errors (K-04).
+#[test]
+fn validate_catches_broken_structures() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "attrs": "not-an-object", "content": [
+                {"type": "text", "text": "ok"}
+            ]},
+            {"type": "text"},
+            {"type": "paragraph", "content": {"a": 1}},
+            {"type": "paragraph", "marks": [{"type": "strong"}], "content": [
+                {"type": "text", "text": "marked"}
+            ]},
+            {"type": "exoticUnknown", "content": []}
+        ]
+    });
+    let file = dir.path().join("broken.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let result = run_json(&["validate", file.to_string_lossy().as_ref()]);
+    assert_eq!(
+        result["valid"],
+        Value::Bool(false),
+        "structural errors fail"
+    );
+    let notes = result["files"][0]["notes"].as_array().unwrap();
+    let codes: Vec<&str> = notes[0]["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["code"].as_str())
+        .collect();
+    assert_eq!(codes.len(), 3, "attrs/text/content violations: {codes:?}");
+    assert!(codes.iter().all(|c| *c == "NOTE_DOC_INVALID"));
+    // unknown node type is a warning, not an error
+    let warn_codes: Vec<&str> = notes[0]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(warn_codes.contains(&"UNKNOWN_NODE_TYPE"));
+}
+
+/// §4.7: unknown inline nodes withhold text and lower search completeness.
+#[test]
+fn unknown_inline_nodes_are_not_silent() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "deploy the "},
+                {"type": "fancyMention", "content": [{"type": "text", "text": "@x"}]},
+                {"type": "text", "text": "service now"}
+            ]}
+        ]
+    });
+    let file = dir.path().join("mention.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+
+    let tree = run_json(&["tree", file.to_string_lossy().as_ref()]);
+    let block = &tree["notes"][0]["blocks"][0];
+    assert_eq!(block["text_incomplete"], Value::Bool(true));
+    assert!(
+        tree["notes"][0]["warnings"].as_array().is_some(),
+        "note carries a warning"
+    );
+
+    let search = run_json(&["search", "-F", "deploy", file.to_string_lossy().as_ref()]);
+    // the block has no extractable text → no match, and completeness is NOT
+    // claimed (a false proof of absence is the failure mode under review)
+    assert_eq!(search["complete"], Value::Bool(false));
+    assert_eq!(search["warnings"].as_array().unwrap().len(), 1);
+}
+
+/// §6.5: anchors precede nested blocks; known marks project to markdown.
+#[test]
+fn annotated_covers_nested_blocks_and_marks() {
+    let corpus = Corpus::new();
+    let output = insum()
+        .args(["read", "--format", "annotated", &corpus.path("regular.um")])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    // nested anchors: the list item and its paragraph are addressable (K-06)
+    assert!(
+        text.contains("<!-- um:pointer=\"/content/3/content/0\" -->"),
+        "listItem anchor present"
+    );
+    assert!(
+        text.contains("<!-- um:pointer=\"/content/3/content/0/content/0\" -->"),
+        "nested paragraph anchor present"
+    );
+    assert!(text.contains("- Установить зависимости"));
+
+    // marks (K-08): bold projects to **
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "plain "},
+                {"type": "text", "marks": [{"type": "bold"}], "text": "bold"},
+                {"type": "text", "marks": [{"type": "sparkle"}], "text": "!"}
+            ]}
+        ]
+    });
+    let marked = dir.path().join("marked.note");
+    fixtures::write_legacy_note(&marked, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            marked.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let body = String::from_utf8(out.stdout).unwrap();
+    assert!(body.contains("plain **bold**"), "bold projects: {body}");
+    assert!(
+        body.contains("um:unrendered-marks=\"sparkle\""),
+        "unknown marks are explicit"
+    );
+}
+
+/// §11: one broken file must not kill search (S-01) — best-effort with
+/// skipped + complete:false; NOTE_NOT_FOUND only when the note is nowhere.
+#[test]
+fn search_is_best_effort_over_broken_files() {
+    let corpus = Corpus::new();
+    let search = run_json(&[
+        "search",
+        "-F",
+        "Установить",
+        corpus.dir.path().to_string_lossy().as_ref(),
+    ]);
+    assert_eq!(search["complete"], Value::Bool(false));
+    assert!(
+        !search["matches"].as_array().unwrap().is_empty(),
+        "healthy files still match"
+    );
+    assert!(
+        search["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["error"]["code"] == "NOT_A_ZIP"),
+        "broken.um is in skipped"
+    );
+
+    // --note missing in the searched container → NOTE_NOT_FOUND exit 3
+    // (a directory with additional broken files stays best-effort exit 0)
+    let output = insum()
+        .args([
+            "search",
+            "-F",
+            "x",
+            "--note",
+            "no-such-note",
+            &corpus.path("minimal.um"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stderr_json(&output)["error"]["code"], "NOTE_NOT_FOUND");
+}
+
+/// §6.2/§5.5: UM_MAX_OUTPUT_BYTES bounds the WHOLE response (P-01).
+#[test]
+fn tree_budget_covers_the_whole_response() {
+    let corpus = Corpus::new();
+    let out = insum()
+        .args(["tree", &corpus.path("regular.um"), "--max-bytes", "700"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = out.stdout.len();
+    assert!(
+        stdout < 1600,
+        "response stays near the budget across notes: {stdout} bytes"
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let last = value["notes"].as_array().unwrap().last().unwrap();
+    assert!(
+        last["next_cursor"].is_string() || last["complete"] == Value::Bool(true),
+        "pagination signal present"
+    );
+}
+
+/// Hostile attrs must not break the budget (S-02).
+#[test]
+fn tree_caps_hostile_attrs() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "attrs": {"pad": "x".repeat(5_000_000)}, "content": [
+                {"type": "text", "text": "tiny"}
+            ]}
+        ]
+    });
+    let file = dir.path().join("padded.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args(["tree", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    let stdout = out.stdout.len();
+    assert!(stdout < 8_000, "attrs capped: {stdout} bytes");
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let block = &value["notes"][0]["blocks"][0];
+    assert_eq!(block["attrs_truncated"], Value::Bool(true));
+}
+
+/// --context neighbors get windows; the budget includes the first match (S-03).
+#[test]
+fn search_context_is_windowed_and_budgeted() {
+    let dir = TempDir::new().expect("tempdir");
+    let huge = "z".repeat(300_000);
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": huge}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "needle here"}]}
+        ]
+    });
+    let file = dir.path().join("huge.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "search",
+            "-F",
+            "needle",
+            "--context",
+            "1",
+            "--max-bytes",
+            "4000",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = out.stdout.len();
+    assert!(stdout < 20_000, "context is windowed: {stdout} bytes");
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // the window keeps the whole response inside the budget → no truncation
+    assert_eq!(value["truncated"], Value::Bool(false));
+    let neighbor_text = value["matches"][0]["context"][0]["text"].as_str().unwrap();
+    assert!(
+        neighbor_text.ends_with("…"),
+        "neighbor text carries a window marker"
+    );
+}
+
+/// Explicit symlinked directories are followed (C-04): no silent empty sweep.
+#[test]
+fn search_follows_symlinked_directories() {
+    let corpus = Corpus::new();
+    let link = corpus.dir.path().join("kb-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(corpus.dir.path(), &link).expect("symlink");
+    #[cfg(not(unix))]
+    panic!("symlink test requires unix");
+
+    let hits = run_json(&["search", "-F", "Legacy", link.to_string_lossy().as_ref()]);
+    assert!(
+        !hits["matches"].as_array().unwrap().is_empty(),
+        "symlinked dir is searched, not silently skipped"
+    );
+}
+
+/// №3/№4 proven black-box: ls reads manifest only; payload corruption does
+/// not affect ls but fails tree (T-02).
+#[test]
+fn ls_does_not_decompress_payload() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("corrupt.um");
+    let note_id = fixtures::ulid_seq(4);
+    let manifest = format!(
+        "{{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[{{\"id\":\"{note_id}\",\"path\":\"notes/{note_id}.json\",\"order\":0,\"title\":\"t\",\"schema\":\"plain\",\"schemaVersion\":2}}]}}"
+    );
+    write_raw_zip(
+        &file,
+        &[
+            ("manifest.json", manifest.as_bytes()),
+            (
+                format!("notes/{note_id}.json").as_str(),
+                b"this is not JSON",
+            ),
+        ],
+    );
+
+    // ls: exit 0 — manifest only, payload never touched
+    let ls = insum()
+        .args(["ls", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    assert!(ls.status.success(), "ls works with a corrupt payload");
+    // tree: exit 4 — payload fails to parse
+    let tree = insum()
+        .args(["tree", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    assert_eq!(tree.status.code(), Some(4));
+    assert_eq!(stderr_json(&tree)["error"]["code"], "NOTE_JSON_INVALID");
+}
+
+/// Hostile inputs hit LIMIT_EXCEEDED, not crashes (T-03).
+#[test]
+fn hostile_limits_are_enforced() {
+    // deep JSON nesting in a payload → exit 5, not a stack overflow
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("deep.um");
+    let note_id = fixtures::ulid_seq(5);
+    let manifest = format!(
+        "{{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[{{\"id\":\"{note_id}\",\"path\":\"notes/{note_id}.json\",\"order\":0,\"title\":\"t\",\"schema\":\"plain\",\"schemaVersion\":2}}]}}"
+    );
+    let deep = format!("{{\"a\":{}", "[".repeat(5000));
+    write_raw_zip(
+        &file,
+        &[
+            ("manifest.json", manifest.as_bytes()),
+            (format!("notes/{note_id}.json").as_str(), deep.as_bytes()),
+        ],
+    );
+    let out = insum()
+        .args(["tree", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5), "deep payload → LIMIT_EXCEEDED");
+    assert_eq!(stderr_json(&out)["error"]["code"], "LIMIT_EXCEEDED");
+
+    // UM_MAX_TOTAL_BYTES enforced on actual data — ls <file> hard-fails
+    // (a directory listing is best-effort and reports invalid entries instead)
+    let corpus = Corpus::new();
+    let out = insum()
+        .args(["ls", &corpus.path("minimal.um")])
+        .env("UM_MAX_TOTAL_BYTES", "10")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(stderr_json(&out)["error"]["code"], "LIMIT_EXCEEDED");
+
+    // UM_MAX_ARCHIVE_ENTRIES enforced
+    let corpus = Corpus::new();
+    let out = insum()
+        .args(["ls", &corpus.path("minimal.um")])
+        .env("UM_MAX_ARCHIVE_ENTRIES", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+
+    // search match cap from env
+    let hits = run_json_env(
+        &["search", "-F", "е", &corpus.path("regular.um")],
+        "UM_MAX_SEARCH_MATCHES",
+        "2",
+    );
+    assert!(hits["matches"].as_array().unwrap().len() <= 2);
+}
+
+/// Unsafe archive entry names are rejected (§12, T-04).
+#[test]
+fn unsafe_zip_entry_names_are_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("evil.um");
+    let manifest = "{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[]}";
+    write_raw_zip(
+        &file,
+        &[
+            ("manifest.json", manifest.as_bytes()),
+            ("../evil.json", b"x"),
+        ],
+    );
+    let out = insum()
+        .args(["ls", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        stderr_json(&out)["error"]["code"],
+        "ARCHIVE_ENTRY_NAME_INVALID"
+    );
+}
+
+/// read / block get work on .note files (T-07).
+#[test]
+fn read_and_block_get_on_note_files() {
+    let corpus = Corpus::new();
+    let file = corpus.path("legacy.note");
+    let read = run_json(&["read", &file]);
+    assert_eq!(read["notes"][0]["note_title"], "Standalone");
+    let block = run_json(&["block", "get", &file, "--pointer", "/content/0"]);
+    assert_eq!(block["block"]["node"]["type"], "heading");
+    // --note on .note is a usage error
+    let out = insum()
+        .args(["read", "--note", "x", &file])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// --depth truncates levels and marks parents (T-08).
+#[test]
+fn tree_depth_truncates_and_marks() {
+    let corpus = Corpus::new();
+    let tree = run_json(&["tree", &corpus.path("regular.um"), "--depth", "1"]);
+    let note = &tree["notes"][0];
+    assert_eq!(
+        note["complete"],
+        Value::Bool(false),
+        "depth cut lowers complete"
+    );
+    let cut: Vec<&Value> = note["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["children_truncated"] == Value::Bool(true))
+        .collect();
+    assert!(!cut.is_empty(), "parents at the cut are marked");
+}
+
+/// C-08: read --format json rejects --cursor instead of ignoring it.
+#[test]
+fn read_json_rejects_cursor() {
+    let corpus = Corpus::new();
+    let out = insum()
+        .args(["read", "--cursor", "abc", &corpus.path("minimal.um")])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }

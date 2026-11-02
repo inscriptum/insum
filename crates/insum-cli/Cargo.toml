@@ -22,4 +22,5 @@ walkdir = { workspace = true }
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }
 zip = { workspace = true }
+sha2 = { workspace = true }
 insum-test-utils = { path = "../insum-test-utils" }

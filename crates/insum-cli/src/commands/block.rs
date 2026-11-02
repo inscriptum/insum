@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use insum_core::model::{BlockEntry, ID_ATTR};
 use insum_core::{ErrorCode, Limits, UmError, pointer};
 
-use crate::support::{read_notes, render_path};
+use crate::support::{Revs, read_notes, render_path};
 
 pub fn run(
     path: &Path,
@@ -49,7 +49,7 @@ pub fn run(
     }
 
     let filters = note.map(|n| vec![n.to_owned()]);
-    let mut views = read_notes(path, filters.as_deref(), limits)?.views;
+    let mut views = read_notes(path, filters.as_deref(), limits, Revs::Compute)?.views;
     let view = views
         .pop()
         .ok_or_else(|| UmError::new(ErrorCode::NoteNotFound, "the container has no notes"))?;
@@ -144,15 +144,13 @@ fn strip_ids(node: &Value, depth: usize, max_depth: usize) -> Result<Value, UmEr
     }
 }
 
-fn collect_unknown_types(node: &Value, limits: &Limits) -> Vec<String> {
-    let mut warnings = Vec::new();
+fn collect_unknown_types(node: &Value, limits: &Limits) -> Vec<Value> {
+    let mut warnings: Vec<Value> = Vec::new();
     walk_unknown(node, 0, limits.max_depth, &mut warnings);
-    warnings.sort();
-    warnings.dedup();
     warnings
 }
 
-fn walk_unknown(node: &Value, depth: usize, max_depth: usize, warnings: &mut Vec<String>) {
+fn walk_unknown(node: &Value, depth: usize, max_depth: usize, warnings: &mut Vec<Value>) {
     if depth > max_depth {
         return;
     }
@@ -160,9 +158,12 @@ fn walk_unknown(node: &Value, depth: usize, max_depth: usize, warnings: &mut Vec
         Value::Object(map) => {
             if let Some(node_type) = map.get("type").and_then(Value::as_str)
                 && !insum_core::model::INLINE_NODE_TYPES.contains(&node_type)
-                && !KNOWN_TYPES.contains(&node_type)
+                && !insum_core::model::KNOWN_NODE_TYPES.contains(&node_type)
             {
-                warnings.push(format!("unknown node type {node_type:?}"));
+                warnings.push(json!({
+                    "code": "UNKNOWN_NODE_TYPE",
+                    "message": format!("unknown node type {node_type:?} (preserved as-is)"),
+                }));
             }
             for value in map.values() {
                 walk_unknown(value, depth + 1, max_depth, warnings);
@@ -176,35 +177,3 @@ fn walk_unknown(node: &Value, depth: usize, max_depth: usize, warnings: &mut Vec
         _ => {}
     }
 }
-
-/// The node dictionary from `~/insum/.instruments/um-format.md` (observed
-/// on-disk types). Types outside it are preserved but reported as unknown.
-pub const KNOWN_TYPES: [&str; 27] = [
-    "noteDoc",
-    "doc",
-    "noteTitle",
-    "noteSummary",
-    "noteProperty",
-    "notePropertyName",
-    "notePropertyValue",
-    "heading",
-    "paragraph",
-    "text",
-    "hardBreak",
-    "bulletList",
-    "orderedList",
-    "taskList",
-    "listItem",
-    "taskItem",
-    "blockquote",
-    "mermaid",
-    "attachment",
-    "horizontalRule",
-    "hljsCodeBlock",
-    "hljsCodeBlockRow",
-    "image",
-    "table",
-    "tableRow",
-    "tableCell",
-    "tableHeader",
-];

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use insum_core::{ErrorCode, Limits, UmError};
 
-use crate::support::{collect_files, error_value, read_notes, render_path};
+use crate::support::{Revs, collect_files, error_value, read_notes, render_path};
 
 const DEFAULT_WINDOW: usize = 160;
 
@@ -63,6 +63,8 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     let mut matches: Vec<Value> = Vec::new();
     let mut matches_size: usize = 128; // envelope overhead estimate
     let mut skipped: Vec<Value> = Vec::new();
+    let mut unknown_inline_files: Vec<Value> = Vec::new();
+    let mut not_found_files = 0usize;
     let mut truncated = false;
 
     // locations that could not be enumerated count into `skipped` (§11)
@@ -87,42 +89,52 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         {
             continue;
         }
-        let views = match read_notes(file, note.map(|n| vec![n.to_owned()]).as_deref(), limits) {
+        let views = match read_notes(
+            file,
+            note.map(|n| vec![n.to_owned()]).as_deref(),
+            limits,
+            Revs::Skip,
+        ) {
             Ok(source) => source.views,
             Err(err) => {
-                // skip files that are invalid or fail their limits
-                if matches!(
-                    err.code,
-                    ErrorCode::NotAZip
-                        | ErrorCode::ManifestMissing
-                        | ErrorCode::ManifestInvalid
-                        | ErrorCode::UnsupportedVersion
-                        | ErrorCode::UnsupportedType
-                        | ErrorCode::NoteJsonInvalid
-                        | ErrorCode::NoteDocInvalid
-                        | ErrorCode::NoteFileMissing
-                        | ErrorCode::NoteDescriptorInvalid
-                        | ErrorCode::LimitExceeded
-                ) {
-                    skipped.push(json!({
-                        "path": render_path(file),
-                        "error": error_value(&err),
-                    }));
-                    continue;
+                // S-01: search is best-effort — ANY per-file error lands in
+                // skipped and lowers complete (§11); one broken file must not
+                // kill the whole run
+                if err.code == ErrorCode::NoteNotFound {
+                    not_found_files += 1;
                 }
-                return Err(err);
+                skipped.push(json!({
+                    "path": render_path(file),
+                    "error": error_value(&err),
+                }));
+                continue;
             }
         };
         for view in views {
-            let blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
+            let traversal = insum_core::traverse(&view.doc, None, limits.max_depth);
+            let blocks = &traversal.blocks;
+            if traversal.unknown_inline {
+                unknown_inline_files.push(json!({
+                    "path": render_path(file),
+                    "note_id": view.note_id,
+                    "code": "UNKNOWN_NODE_TYPE",
+                    "message": "some blocks contain unknown inline node types; search completeness is not confirmed",
+                }));
+            }
             for (block_index, block) in blocks.iter().enumerate() {
                 let Some(text) = &block.text else {
                     continue;
                 };
+                // K-10: the §6.4 text window is defined around the FIRST
+                // match of the block; all hits in this block share it
+                let mut block_window: Option<String> = None;
                 for found in regex.find_iter(text) {
                     if matches.len() >= effective_limit {
                         truncated = true;
                         break 'files;
+                    }
+                    if block_window.is_none() {
+                        block_window = Some(window(text, found.start(), found.end()));
                     }
                     let hit = json!({
                         "path": render_path(file),
@@ -132,12 +144,13 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                         "pointer": block.pointer,
                         "type": block.node_type,
                         "match": found.as_str(),
-                        "text": window(text, found.start(), found.end()),
-                        "context": context_blocks(&blocks, block_index, context),
+                        "text": block_window.clone().unwrap_or_default(),
+                        "context": context_blocks(blocks, block_index, context),
                     });
-                    // budget: whole matches only, no silent truncation (§6.4)
+                    // budget: whole matches only, no silent truncation —
+                    // the first match is subject to the budget too (S-03)
                     let hit_size = serde_json::to_string(&hit).map_or(256, |s| s.len() + 1);
-                    if !matches.is_empty() && matches_size + hit_size > budget {
+                    if matches_size + hit_size > budget {
                         truncated = true;
                         break 'files;
                     }
@@ -148,8 +161,22 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         }
     }
 
-    let complete = !truncated && skipped.is_empty();
-    Ok(json!({
+    // NOTE_NOT_FOUND is only an error when the note exists nowhere (S-01)
+    if let Some(note_id) = note
+        && matches.is_empty()
+        && not_found_files > 0
+        && not_found_files == skipped.len()
+        && !skipped.is_empty()
+    {
+        return Err(UmError::new(
+            ErrorCode::NoteNotFound,
+            format!("note {note_id:?} was not found in any searched container"),
+        ));
+    }
+
+    // K-05: notes with unknown inline types cannot prove the absence of data
+    let complete = !truncated && skipped.is_empty() && unknown_inline_files.is_empty();
+    let mut response = json!({
         "api_version": 1,
         "query": query,
         "mode": if fixed_strings { "literal" } else { "regex" },
@@ -158,7 +185,11 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         "truncated": truncated,
         "complete": complete,
         "skipped": skipped,
-    }))
+    });
+    if !unknown_inline_files.is_empty() {
+        response["warnings"] = json!(unknown_inline_files);
+    }
+    Ok(response)
 }
 
 /// A window of up to `DEFAULT_WINDOW` characters around the first match,
@@ -201,7 +232,15 @@ fn context_blocks(blocks: &[insum_core::BlockEntry], index: usize, context: usiz
                 "type": neighbor.node_type,
             });
             if let Some(text) = &neighbor.text {
-                entry["text"] = json!(text);
+                // S-03: neighbors get a window too — a 5MB sibling paragraph
+                // must not leak into the response whole
+                let chars: Vec<char> = text.chars().collect();
+                if chars.len() > DEFAULT_WINDOW {
+                    let head: String = chars[..DEFAULT_WINDOW].iter().collect();
+                    entry["text"] = json!(format!("{head}…"));
+                } else {
+                    entry["text"] = json!(text);
+                }
             }
             entry
         })

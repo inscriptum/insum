@@ -13,6 +13,39 @@ pub const INLINE_NODE_TYPES: [&str; 2] = ["text", "hardBreak"];
 /// (spec §4.4); it is reported separately, not inside `attrs`.
 pub const ID_ATTR: &str = "id";
 
+/// The node dictionary from `~/insum/.instruments/um-format.md` (observed
+/// on-disk types). Types outside it are preserved but reported as unknown
+/// (warnings) — and their text cannot be extracted (§4.7).
+pub const KNOWN_NODE_TYPES: [&str; 27] = [
+    "noteDoc",
+    "doc",
+    "noteTitle",
+    "noteSummary",
+    "noteProperty",
+    "notePropertyName",
+    "notePropertyValue",
+    "heading",
+    "paragraph",
+    "text",
+    "hardBreak",
+    "bulletList",
+    "orderedList",
+    "taskList",
+    "listItem",
+    "taskItem",
+    "blockquote",
+    "mermaid",
+    "attachment",
+    "horizontalRule",
+    "hljsCodeBlock",
+    "hljsCodeBlockRow",
+    "image",
+    "table",
+    "tableRow",
+    "tableCell",
+    "tableHeader",
+];
+
 /// A parsed manifest: known fields extracted, the raw value kept for
 /// unknown-field preservation (spec §3.10, §12).
 #[derive(Debug, Clone)]
@@ -117,6 +150,11 @@ impl NoteDescriptor {
             .get("order")
             .and_then(Value::as_u64)
             .ok_or_else(|| note_descriptor_invalid("note descriptor missing integer `order`"))?;
+        if order > u32::MAX as u64 {
+            return Err(note_descriptor_invalid(format!(
+                "note descriptor order {order} exceeds u32"
+            )));
+        }
         if path != format!("notes/{id}.json") && !path.ends_with(".json") {
             return Err(note_descriptor_invalid(format!(
                 "note descriptor path {path:?} is not a JSON payload path"
@@ -227,16 +265,23 @@ pub struct BlockEntry {
     /// Text of nodes whose direct content is inline; never aggregates
     /// children (spec §6.2/§6.4).
     pub text: Option<String>,
+    /// True when `text` was dropped because the content contains an inline
+    /// node type outside the known dictionary (spec §4.7).
+    pub text_incomplete: bool,
     pub children_truncated: bool,
 }
 
-/// The flat block listing of one document, plus the depth-limit signal.
+/// The flat block listing of one document, plus the completeness signals.
 #[derive(Debug, Default)]
 pub struct Traversal {
     pub blocks: Vec<BlockEntry>,
     /// True when the document is deeper than the enforced JSON depth limit
     /// (UM_MAX_DEPTH) — callers must fail with `LIMIT_EXCEEDED` (spec §5.5).
     pub depth_exceeded: bool,
+    /// True when some block lost its text because of an unknown inline node
+    /// type — search/tree consumers must not claim full completeness
+    /// (spec §4.7, §3.5 «никаких тихих потерь»).
+    pub unknown_inline: bool,
 }
 
 /// Walk the document in document order (preorder), producing the flat block
@@ -245,11 +290,9 @@ pub struct Traversal {
 /// enforced UM_MAX_DEPTH: walking stops (with `depth_exceeded`) beyond it.
 pub fn traverse(doc: &Value, max_depth: Option<usize>, max_json_depth: usize) -> Traversal {
     let mut traversal = Traversal::default();
-    let content = doc
-        .get("content")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let Some(content) = doc.get("content").and_then(Value::as_array) else {
+        return traversal;
+    };
     for (index, node) in content.iter().enumerate() {
         walk(
             node,
@@ -261,6 +304,7 @@ pub fn traverse(doc: &Value, max_depth: Option<usize>, max_json_depth: usize) ->
             &mut traversal.blocks,
             0,
             &mut traversal.depth_exceeded,
+            &mut traversal.unknown_inline,
         );
     }
     traversal
@@ -277,6 +321,7 @@ fn walk(
     blocks: &mut Vec<BlockEntry>,
     json_depth: usize,
     depth_exceeded: &mut bool,
+    unknown_inline: &mut bool,
 ) {
     if json_depth > max_json_depth {
         *depth_exceeded = true;
@@ -308,7 +353,10 @@ fn walk(
         }
         _ => Value::Object(Map::new()),
     };
-    let text = inline_text(object);
+    let (text, text_incomplete) = inline_text(object);
+    if text_incomplete {
+        *unknown_inline = true;
+    }
     let mut children_truncated = false;
 
     // `--depth n` shows levels 0..n-1; a parent at the cut is emitted and
@@ -331,6 +379,7 @@ fn walk(
         index,
         attrs,
         text,
+        text_incomplete,
         children_truncated,
     });
     if !descend {
@@ -348,28 +397,44 @@ fn walk(
                 blocks,
                 json_depth + 1,
                 depth_exceeded,
+                unknown_inline,
             );
         }
     }
 }
 
 /// Direct inline text of a node, if its content consists of inline nodes.
-/// Parent containers never aggregate descendant text (spec §6.2).
-fn inline_text(object: &Map<String, Value>) -> Option<String> {
-    let children = object.get("content")?.as_array()?;
+/// Parent containers never aggregate descendant text (spec §6.2). The flag
+/// reports unknown inline node types: their text is unknowable without a
+/// schema artifact, so partial text is withheld instead of silently
+/// returned (spec §4.7, §3.5).
+fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
+    let Some(children) = object.get("content").and_then(Value::as_array) else {
+        return (None, false);
+    };
     if children.is_empty() {
-        return None;
+        return (None, false);
     }
     let mut text = String::new();
     for child in children {
-        let child_type = child.get("type").and_then(Value::as_str)?;
+        let Some(child_type) = child.get("type").and_then(Value::as_str) else {
+            return (None, true);
+        };
         match child_type {
-            "text" => text.push_str(child.get("text").and_then(Value::as_str)?),
+            "text" => match child.get("text").and_then(Value::as_str) {
+                Some(t) => text.push_str(t),
+                None => return (None, true),
+            },
             "hardBreak" => text.push('\n'),
-            _ => return None, // a block child: this node has no own text
+            // a known structural child: this node is a container and has no
+            // text of its own (normal, not a loss)
+            t if KNOWN_NODE_TYPES.contains(&t) => return (None, false),
+            // unknown node type: its text is unknowable without a schema
+            // artifact — withhold instead of silently dropping (§4.7, §3.5)
+            _ => return (None, true),
         }
     }
-    Some(text)
+    (Some(text), false)
 }
 
 fn has_block_children(object: &Map<String, Value>) -> bool {
@@ -385,21 +450,28 @@ fn has_block_children(object: &Map<String, Value>) -> bool {
 }
 
 /// Title of a note per spec §6.4: manifest title, else the first top-level
-/// heading's text, else null.
+/// heading's text, else null. `noteTitle` counts as a heading-equivalent —
+/// it is the semantic title node of title-schema pages.
 pub fn note_title(manifest_title: Option<&str>, doc: &Value) -> Option<String> {
     if let Some(title) = manifest_title {
         return Some(title.to_owned());
     }
-    doc.get("content")
-        .and_then(Value::as_array)
-        .and_then(|content| content.iter().next())
-        .filter(|first| first.get("type").and_then(Value::as_str) == Some("heading"))
+    let content = doc.get("content").and_then(Value::as_array)?;
+    content
+        .iter()
+        .find(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("heading") | Some("noteTitle")
+            )
+        })
         .and_then(|first| {
             first
                 .get("content")
                 .and_then(Value::as_array)
                 .map(|inline| inline_text_join(inline))
         })
+        .filter(|title| !title.is_empty())
 }
 
 /// Concatenate inline text without node-type discrimination (used for the

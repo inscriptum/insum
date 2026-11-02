@@ -69,10 +69,12 @@ pub struct WalkError {
 }
 
 /// Walk the given paths and collect `.um`/`.note` files (spec §5.2):
-/// recursive, no symlink following, hidden files and `node_modules` skipped
-/// unless `hidden` (the toggle never re-enables `node_modules`). Explicitly
-/// named file arguments are opened directly even when they are symlinks —
-/// the no-symlink rule governs traversal, not user-provided arguments.
+/// recursive, hidden files and `node_modules` skipped unless `hidden` (the
+/// toggle never re-enables `node_modules`). Explicitly named arguments are
+/// resolved like `ls` resolves them — a symlinked directory or file named
+/// on the command line is followed; the no-follow rule governs traversal
+/// *inside* directories, not user-provided arguments. Silently dropping an
+/// explicit argument would turn into a false "0 matches / valid" answer.
 pub fn collect_files(
     paths: &[PathBuf],
     hidden: bool,
@@ -80,7 +82,8 @@ pub fn collect_files(
     let mut files = Vec::new();
     let mut walk_errors = Vec::new();
     for path in paths {
-        let metadata = std::fs::symlink_metadata(path).map_err(|err| {
+        // follow symlinks for the argument itself (ls parity, review C-04)
+        let metadata = std::fs::metadata(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 UmError::new(
                     ErrorCode::PathNotFound,
@@ -93,8 +96,14 @@ pub fn collect_files(
                 )
             }
         })?;
+        // resolve once so WalkDir does not see a symlink root
+        let walk_root: PathBuf = if metadata.is_dir() {
+            std::fs::canonicalize(path)?
+        } else {
+            path.clone()
+        };
         if metadata.is_dir() {
-            for entry in walkdir::WalkDir::new(path)
+            for entry in walkdir::WalkDir::new(&walk_root)
                 .follow_links(false)
                 .sort_by_file_name()
                 .into_iter()
@@ -105,7 +114,12 @@ pub fn collect_files(
                             continue; // directories and symlinks are not entries
                         }
                         let entry_path = entry.path();
-                        if hidden_below(path, entry_path, hidden) {
+                        // the skip rules compare against the WALK root (the
+                        // canonicalized one): the argument itself is user-
+                        // provided and never filtered (review C-04 fallout —
+                        // /var → /private/var and hidden temp dirs otherwise
+                        // filtered the whole corpus)
+                        if hidden_below(&walk_root, entry_path, hidden) {
                             continue;
                         }
                         if classify_extension(entry_path).is_some() {
@@ -119,8 +133,6 @@ pub fn collect_files(
                 }
             }
         } else if classify_extension(path).is_some() {
-            // an explicitly named document is a valid argument even when it
-            // is a symlink (the no-symlink rule governs traversal)
             files.push(path.clone());
         }
     }
@@ -140,12 +152,12 @@ pub struct NoteView {
 }
 
 impl NoteView {
-    fn from_descriptor(descriptor: &NoteDescriptor, doc: &Value, note_rev: String) -> Self {
+    fn from_descriptor(descriptor: &NoteDescriptor, doc: Value, note_rev: String) -> Self {
         Self {
             note_id: Some(descriptor.id.clone()),
-            note_title: note_title(descriptor.title.as_deref(), doc),
+            note_title: note_title(descriptor.title.as_deref(), &doc),
             note_rev,
-            doc: doc.clone(),
+            doc,
             features: descriptor.features.clone(),
             block_ids_enabled: descriptor.block_ids_enabled(),
         }
@@ -160,12 +172,22 @@ pub struct SourceRead {
     pub views: Vec<NoteView>,
 }
 
+/// Whether to compute note revisions while reading (review P-05: search
+/// matches text and never uses revisions — hashing every payload is pure
+/// overhead there).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Revs {
+    Compute,
+    Skip,
+}
+
 /// Open a `.um`/`.note` path and read the requested notes in manifest order.
 /// `filters` selects notes by id (repeatable `--note`); `None` reads all.
 pub fn read_notes(
     path: &Path,
     filters: Option<&[String]>,
     limits: &Limits,
+    revs: Revs,
 ) -> Result<SourceRead, UmError> {
     match classify_extension(path) {
         Some("um") => {
@@ -174,12 +196,7 @@ pub fn read_notes(
                 let mut views = Vec::with_capacity(filters.len());
                 for filter in filters {
                     let descriptor = container.find_note(filter)?.clone();
-                    let parsed = container.read_note_with_rev(&descriptor, limits)?;
-                    views.push(NoteView::from_descriptor(
-                        &descriptor,
-                        &parsed.note.doc,
-                        parsed.note_rev,
-                    ));
+                    views.push(read_view(&mut container, &descriptor, limits, revs)?);
                 }
                 return Ok(SourceRead {
                     file_rev: container.file_rev,
@@ -190,12 +207,7 @@ pub fn read_notes(
                 container.notes_in_order().into_iter().cloned().collect();
             let mut views = Vec::with_capacity(descriptors.len());
             for descriptor in &descriptors {
-                let parsed = container.read_note_with_rev(descriptor, limits)?;
-                views.push(NoteView::from_descriptor(
-                    descriptor,
-                    &parsed.note.doc,
-                    parsed.note_rev,
-                ));
+                views.push(read_view(&mut container, descriptor, limits, revs)?);
             }
             Ok(SourceRead {
                 file_rev: container.file_rev,
@@ -216,12 +228,12 @@ pub fn read_notes(
                 .and_then(Value::as_u64)
                 == Some(1);
             Ok(SourceRead {
-                file_rev: note_file.file_rev.clone(),
+                file_rev: note_file.file_rev,
                 views: vec![NoteView {
                     note_id: None,
                     note_title: note_title(None, &note_file.note.doc),
-                    note_rev: note_file.note_rev.clone(),
-                    doc: note_file.note.doc.clone(),
+                    note_rev: note_file.note_rev,
+                    doc: note_file.note.doc,
                     features,
                     block_ids_enabled,
                 }],
@@ -231,6 +243,34 @@ pub fn read_notes(
             ErrorCode::PathNotFound,
             format!("no .um or .note document at {}", path.display()),
         )),
+    }
+}
+
+/// Read one note into a view; revisions are computed in the same
+/// decompression pass when requested (review P-02/P-05).
+fn read_view(
+    container: &mut UmContainer,
+    descriptor: &NoteDescriptor,
+    limits: &Limits,
+    revs: Revs,
+) -> Result<NoteView, UmError> {
+    match revs {
+        Revs::Compute => {
+            let parsed = container.read_note_with_rev(descriptor, limits)?;
+            Ok(NoteView::from_descriptor(
+                descriptor,
+                parsed.note.doc,
+                parsed.note_rev,
+            ))
+        }
+        Revs::Skip => {
+            let note_doc = container.read_note(descriptor, limits)?;
+            Ok(NoteView::from_descriptor(
+                descriptor,
+                note_doc.doc,
+                String::new(),
+            ))
+        }
     }
 }
 

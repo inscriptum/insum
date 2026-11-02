@@ -19,6 +19,10 @@ pub struct Cursor {
     /// Options the cursor was issued with; a resumed call must repeat them.
     pub depth: Option<usize>,
     pub text_limit: usize,
+    /// Pointer of the first block of the resumed page (when the resume
+    /// starts inside a note). Detects tampering with the block position
+    /// (review S-04): a mismatch is CURSOR_STALE, not a silent skip.
+    pub next_pointer: Option<String>,
 }
 
 const KIND_TREE: &str = "tree";
@@ -79,6 +83,7 @@ pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 impl Cursor {
+    #[allow(clippy::too_many_arguments)]
     pub fn tree(
         path: String,
         note_id: Option<String>,
@@ -87,6 +92,7 @@ impl Cursor {
         block_index: usize,
         depth: Option<usize>,
         text_limit: usize,
+        next_pointer: Option<String>,
     ) -> Self {
         Self {
             kind: KIND_TREE.to_owned(),
@@ -97,9 +103,11 @@ impl Cursor {
             block_index,
             depth,
             text_limit,
+            next_pointer,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn read(
         path: String,
         note_id: Option<String>,
@@ -118,6 +126,7 @@ impl Cursor {
             block_index,
             depth,
             text_limit,
+            next_pointer: None,
         }
     }
 
@@ -131,6 +140,7 @@ impl Cursor {
             "bi": self.block_index,
             "d": self.depth,
             "t": self.text_limit,
+            "np": self.next_pointer,
         });
         base64url_encode(value.to_string().as_bytes())
     }
@@ -164,6 +174,7 @@ impl Cursor {
             block_index: value.get("bi").and_then(Value::as_u64).unwrap_or(0) as usize,
             depth: value.get("d").and_then(Value::as_u64).map(|v| v as usize),
             text_limit: value.get("t").and_then(Value::as_u64).unwrap_or(0) as usize,
+            next_pointer: value.get("np").and_then(Value::as_str).map(str::to_owned),
         })
     }
 
@@ -226,6 +237,7 @@ mod tests {
             42,
             Some(3),
             120,
+            Some("/content/5".to_owned()),
         );
         let token = cursor.encode();
         assert!(!token.contains('='));
