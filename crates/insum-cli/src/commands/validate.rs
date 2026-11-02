@@ -94,7 +94,7 @@ pub fn run(
 }
 
 fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, UmError> {
-    let views = read_notes(path, None, limits, Revs::Compute)?.views;
+    let views = read_notes(path, None, limits, Revs::Skip)?.views;
     let mut notes = Vec::new();
     let mut file_valid = true;
 

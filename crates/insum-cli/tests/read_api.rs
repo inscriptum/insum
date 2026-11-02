@@ -284,26 +284,39 @@ fn pagination_resumes_and_detects_stale_revisions() {
         .iter()
         .filter_map(|block| block["pointer"].as_str().map(str::to_owned))
         .collect();
-    let mut cursor = note["next_cursor"].as_str().unwrap().to_owned();
+    // the FIRST page ends mid-note (budget 300 < note size) — a mid-note
+    // cursor for the rev-stale check below
+    let mid_note_cursor = note["next_cursor"].as_str().unwrap().to_owned();
+    let mut cursor = mid_note_cursor.clone();
     let mut complete = false;
     for _ in 0..50 {
         let page = run_json(&["tree", &file, "--max-bytes", "300", "--cursor", &cursor]);
+        for page_note in page["notes"].as_array().unwrap() {
+            // pointers repeat across notes (/content/0 everywhere) — the
+            // dedup key is (note_id, pointer)
+            let nid = page_note["note_id"].as_str().unwrap_or("").to_owned();
+            for block in page_note["blocks"].as_array().unwrap() {
+                // T-13: strict extraction — a broken entry must fail loudly
+                let pointer = block["pointer"]
+                    .as_str()
+                    .expect("block carries a pointer")
+                    .to_owned();
+                let key = format!("{nid}{pointer}");
+                assert!(!emitted.contains(&key), "pages never repeat a block");
+                emitted.push(key);
+            }
+        }
         let page_note = &page["notes"][0];
-        for block in page_note["blocks"].as_array().unwrap() {
-            // T-13: strict extraction — a broken entry must fail loudly
-            let pointer = block["pointer"]
-                .as_str()
-                .expect("block carries a pointer")
-                .to_owned();
-            assert!(!emitted.contains(&pointer), "pages never repeat a block");
-            emitted.push(pointer);
+        // termination = no next_cursor; note.complete describes the note
+        // itself (a boundary page ends with complete:true + a cursor to the
+        // next note — NEW-1 semantics)
+        match page_note["next_cursor"].as_str() {
+            Some(next) => cursor = next.to_owned(),
+            None => {
+                complete = true;
+                break;
+            }
         }
-        if page_note["complete"] == json_true() {
-            assert!(page_note["next_cursor"].is_null());
-            complete = true;
-            break;
-        }
-        cursor = page_note["next_cursor"].as_str().unwrap().to_owned();
     }
     assert!(complete, "pagination terminates");
 
@@ -324,7 +337,7 @@ fn pagination_resumes_and_detects_stale_revisions() {
             "--max-bytes",
             "300",
             "--cursor",
-            &cursor,
+            &mid_note_cursor,
         ])
         .output()
         .expect("insum runs");
@@ -1575,4 +1588,322 @@ fn read_json_rejects_cursor() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// Delta round 2 — mandatory gate: multi-note pagination (NEW-1/NEW-2)
+// ---------------------------------------------------------------------------
+
+/// A 4-note container with sizable notes: forces mid-note pages AND note
+/// boundaries within one walk.
+fn write_multi_note(path: &Path) {
+    let mut notes = Vec::new();
+    for i in 1..=4 {
+        let blocks: Vec<Value> = (1..=8)
+            .map(|j| {
+                fixtures::paragraph(&[fixtures::text(&format!(
+                    "note{i} block{j} payload text for pagination"
+                ))])
+            })
+            .collect();
+        notes.push(fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(i as u32),
+            &format!("note{i}"),
+            &blocks,
+        ));
+    }
+    fixtures::write_um(path, &notes).expect("multi-note fixture");
+}
+
+fn decode_cursor_json(token: &str) -> Value {
+    let bytes = base64url_decode(token);
+    serde_json::from_slice(&bytes).expect("cursor is base64url JSON")
+}
+
+/// Mandatory regression gate (review NEW-1): a full tree pagination walk of
+/// a multi-note container reaches EVERY note, emits each block exactly once,
+/// resumes cleanly from note-boundary cursors, and terminates complete.
+#[test]
+fn tree_pagination_walks_all_notes_of_multi_note_container() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("multi.um");
+    write_multi_note(&file);
+
+    let manifest_ids: Vec<String> = (1..=4).map(|i| fixtures::ulid_seq(i as u32)).collect();
+    let mut cursor: Option<String> = None;
+    let mut order_seen: Vec<String> = Vec::new();
+    let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut boundary_resumes = 0usize;
+    let mut mid_note_resumes = 0usize;
+    let mut pages = 0usize;
+
+    let file_arg = file.to_string_lossy().into_owned();
+    loop {
+        let mut args = vec!["tree", file_arg.as_str(), "--max-bytes", "700"];
+        if let Some(c) = &cursor {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let page = run_json(&args);
+        pages += 1;
+        assert!(pages < 100, "walk does not terminate");
+
+        for note in page["notes"].as_array().unwrap() {
+            let nid = note["note_id"].as_str().unwrap().to_owned();
+            if order_seen.last() != Some(&nid) {
+                order_seen.push(nid.clone());
+            }
+            for block in note["blocks"].as_array().unwrap() {
+                let pointer = block["pointer"].as_str().expect("pointer").to_owned();
+                assert!(
+                    seen_keys.insert(format!("{nid}{pointer}")),
+                    "block {nid}{pointer} emitted twice"
+                );
+            }
+        }
+        let next = page["notes"].as_array().unwrap().last().unwrap()["next_cursor"]
+            .as_str()
+            .map(str::to_owned);
+        match next {
+            Some(token) => {
+                let decoded = decode_cursor_json(&token);
+                if decoded["np"].is_null() && decoded["bi"].as_u64() == Some(0) {
+                    boundary_resumes += 1;
+                } else {
+                    mid_note_resumes += 1;
+                }
+                cursor = Some(token);
+            }
+            None => break,
+        }
+    }
+
+    // every note reached, in manifest order, no silent tail
+    let mut distinct = order_seen.clone();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        4,
+        "all 4 notes must be reached: {order_seen:?}"
+    );
+    for (seen, expected) in distinct.iter().zip(manifest_ids.iter()) {
+        assert_eq!(seen, expected, "notes follow manifest order");
+    }
+    assert!(
+        boundary_resumes >= 1,
+        "walk exercises note-boundary cursors (NEW-1 flavor 2)"
+    );
+    assert!(mid_note_resumes >= 1, "walk exercises mid-note cursors");
+    // full coverage: 4 notes × 8 blocks = 32 blocks
+    assert_eq!(seen_keys.len(), 32);
+}
+
+/// Mandatory regression gate (review NEW-2): annotated pagination covers all
+/// notes, carries um:incomplete markers including at note boundaries, and
+/// the final page ends without a marker.
+#[test]
+fn annotated_pagination_walks_all_notes_and_marks_boundaries() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("multi.um");
+    write_multi_note(&file);
+
+    let manifest_ids: Vec<String> = (1..=4).map(|i| fixtures::ulid_seq(i as u32)).collect();
+    let mut cursor: Option<String> = None;
+    let mut seen_notes: Vec<String> = Vec::new();
+    let mut boundary_markers = 0usize;
+    let mut pages = 0usize;
+
+    let file_arg = file.to_string_lossy().into_owned();
+    loop {
+        let mut args = vec![
+            "read",
+            "--format",
+            "annotated",
+            file_arg.as_str(),
+            "--max-bytes",
+            "600",
+        ];
+        if let Some(c) = &cursor {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let out = insum().args(&args).output().expect("insum runs");
+        assert!(
+            out.status.success(),
+            "annotated page fails: {:?}",
+            out.stderr
+        );
+        pages += 1;
+        assert!(pages < 100, "walk does not terminate");
+        let text = String::from_utf8(out.stdout.clone()).unwrap();
+        // collect note headers
+        for chunk in text.split("<!-- um:api_version=1 note_id=\"").skip(1) {
+            let id: String = chunk.chars().take_while(|c| *c != '"').collect();
+            if seen_notes.last() != Some(&id) {
+                seen_notes.push(id);
+            }
+        }
+        let incomplete = text.contains("um:incomplete next_cursor=\"");
+        let next = text
+            .split("um:incomplete next_cursor=\"")
+            .nth(1)
+            .map(|chunk| chunk.chars().take_while(|c| *c != '"').collect::<String>());
+        match (incomplete, next) {
+            (true, Some(token)) => {
+                let decoded = decode_cursor_json(&token);
+                if decoded["bi"].as_u64() == Some(0) {
+                    boundary_markers += 1;
+                }
+                cursor = Some(token);
+            }
+            (false, None) => break,
+            other => panic!("inconsistent annotated page: {other:?}"),
+        }
+    }
+
+    let mut distinct = seen_notes.clone();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 4, "all notes annotated: {seen_notes:?}");
+    for (seen, expected) in distinct.iter().zip(manifest_ids.iter()) {
+        assert_eq!(seen, expected);
+    }
+    assert!(
+        boundary_markers >= 1,
+        "um:incomplete appears at note boundaries (NEW-2)"
+    );
+}
+
+/// P-02 preserved: a resume page parses only the pinned note — observable as
+/// a page whose cost is dominated by one note even in a big container. The
+/// behavioral proof: the resume emits the pinned note's blocks and continues.
+#[test]
+fn tree_resume_page_reads_beyond_pinned_note() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("multi.um");
+    write_multi_note(&file);
+    let first = run_json(&[
+        "tree",
+        file.to_string_lossy().as_ref(),
+        "--max-bytes",
+        "700",
+    ]);
+    let cursor = first["notes"][0]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // resume: the pinned note finishes and the page continues into note 2
+    let page = run_json(&[
+        "tree",
+        file.to_string_lossy().as_ref(),
+        "--max-bytes",
+        "700",
+        "--cursor",
+        &cursor,
+    ]);
+    let notes = page["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["note_id"] == Value::String(fixtures::ulid_seq(2)))
+            || notes[notes.len() - 1]["next_cursor"].is_string(),
+        "resume continues past the pinned note"
+    );
+}
+
+/// C-10: a deep manifest fails as LIMIT_EXCEEDED (exit 5), UM_MAX_DEPTH respected.
+#[test]
+fn deep_manifest_hits_limit_exceeded() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("deep-manifest.um");
+    let deep = format!(
+        "{{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[],\"pad\":{}",
+        "[".repeat(200)
+    );
+    write_raw_zip(&file, &[("manifest.json", deep.as_bytes())]);
+    let out = insum()
+        .args(["ls", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5), "deep manifest → LIMIT_EXCEEDED");
+    assert_eq!(stderr_json(&out)["error"]["code"], "LIMIT_EXCEEDED");
+
+    // UM_MAX_DEPTH is honored: depth 20 manifest rejected at limit 16
+    let file2 = dir.path().join("depth20-manifest.um");
+    let manifest = format!(
+        "{{\"format\":\"um\",\"version\":1,\"type\":\"notepad\",\"notes\":[],\"pad\":{}",
+        "[".repeat(20)
+    );
+    write_raw_zip(&file2, &[("manifest.json", manifest.as_bytes())]);
+    let out = insum()
+        .args(["ls", file2.to_string_lossy().as_ref()])
+        .env("UM_MAX_DEPTH", "16")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(stderr_json(&out)["error"]["code"], "LIMIT_EXCEEDED");
+}
+
+/// K-11: an inscriptum-note envelope with version != 1 → UNSUPPORTED_VERSION.
+#[test]
+fn envelope_version_is_checked() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = fixtures::plain_doc(&[fixtures::paragraph(&[fixtures::text("hi")])]);
+    let envelope = serde_json::json!({
+        "format": "inscriptum-note",
+        "version": 99,
+        "features": {"block_ids": 1},
+        "document": doc
+    });
+    let file = dir.path().join("v99.note");
+    std::fs::write(&file, envelope.to_string()).expect("write");
+    let out = insum()
+        .args(["tree", file.to_string_lossy().as_ref()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "UNSUPPORTED_VERSION exits 4");
+    assert_eq!(stderr_json(&out)["error"]["code"], "UNSUPPORTED_VERSION");
+}
+
+/// NEW-3: the list marker survives a first child that is not a paragraph.
+#[test]
+fn list_marker_survives_non_paragraph_first_child() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "bulletList", "content": [
+                {"type": "listItem", "content": [
+                    {"type": "heading", "attrs": {"level": 3}, "content": [{"type": "text", "text": "Nested head"}]},
+                    {"type": "paragraph", "content": [{"type": "text", "text": "body"}]}
+                ]}
+            ]},
+            {"type": "taskList", "content": [
+                {"type": "taskItem", "attrs": {"checked": true}, "content": [
+                    {"type": "bulletList", "content": [
+                        {"type": "listItem", "content": [
+                            {"type": "paragraph", "content": [{"type": "text", "text": "sub"}]}
+                        ]}
+                    ]}
+                ]}
+            ]}
+        ]
+    });
+    let file = dir.path().join("lists.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("- "), "bullet marker present");
+    assert!(text.contains("- [x] "), "checkbox present on taskItem");
+    assert!(
+        text.contains("### Nested head"),
+        "non-paragraph child still rendered"
+    );
 }

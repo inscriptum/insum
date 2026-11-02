@@ -8,7 +8,7 @@ use insum_core::model::BlockEntry;
 use insum_core::{ErrorCode, Limits, UmError};
 
 use crate::cursor::Cursor;
-use crate::support::{NoteView, Revs, read_notes, render_path};
+use crate::support::{NoteView, Revs, SourceReader, render_path};
 
 /// Serialized `attrs` are capped: a hostile document can carry megabytes in
 /// attributes, and the response budget must not be broken by one entry
@@ -30,67 +30,69 @@ pub fn run(
         None => None,
     };
 
-    // P-02: a cursor resume reads only the note the cursor continues in —
-    // the note_rev binding already protects the consistency of the position.
-    let filters: Option<Vec<String>> = match (&cursor, note.is_empty()) {
-        (_, false) => Some(note.to_vec()),
-        (Some(cursor), true) => cursor.note_id.clone().map(|id| vec![id]),
-        (None, true) => None,
-    };
-    let source = match read_notes(path, filters.as_deref(), limits, Revs::Compute) {
-        Ok(source) => source,
-        // the cursor pins the note it was issued for: a note that has since
-        // disappeared is a stale cursor, not a lookup miss (§6.2)
-        Err(err) if err.code == ErrorCode::NoteNotFound && cursor.is_some() => {
-            return Err(stale_cursor(
-                "the note the cursor was issued for no longer exists",
-            ));
-        }
-        Err(err) => return Err(err),
-    };
-    let selected = &source.views;
+    // NEW-1: the exposed sequence is NOT narrowed by the cursor — pagination
+    // must reach every note (§6.2). The reader parses payloads lazily, so the
+    // P-02 win (a page only pays for the notes it emits) is preserved.
+    let filters = if note.is_empty() { None } else { Some(note) };
+    let mut reader = SourceReader::open(path, filters, limits, Revs::Compute)?;
 
-    // cursor contract: same query options and same revision (§6.2)
+    // A cursor with next_pointer resumes INSIDE a note (bound to its
+    // revision); a cursor without one sits on a note boundary — there is no
+    // intra-note position to protect, so the rev check would only produce a
+    // false CURSOR_STALE there (the second NEW-1 flavor) and is skipped.
+    let resume_pointer = cursor.as_ref().and_then(|c| c.next_pointer.clone());
+    let mid_note = resume_pointer.is_some();
+    let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
+    let budget = limits.output_bytes(max_bytes);
+
     if let Some(cursor) = &cursor {
-        let view = selected.get(cursor.note_index);
-        cursor.validate(
-            "tree",
-            &rendered,
-            view.and_then(|v| v.note_id.as_deref()),
-            view.map(|v| v.note_rev.as_str()).unwrap_or_default(),
-            depth,
-            text_limit,
-        )?;
-        if cursor.note_index >= selected.len() {
+        if start_note >= reader.len() {
             return Err(stale_cursor(
                 "cursor points past the last note of this response",
             ));
         }
+        // cheap checks (kind/path/options) run before any payload read
+        cursor.validate(
+            "tree",
+            &rendered,
+            reader.note_id(start_note).as_deref(),
+            None,
+            depth,
+            text_limit,
+        )?;
     }
-    let resume_pointer = cursor.as_ref().and_then(|c| c.next_pointer.clone());
-    let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
-    let budget = limits.output_bytes(max_bytes);
 
-    // P-01: the budget is per response, not per note — the accumulator is
-    // carried across notes and the cursor lands on the note boundary.
+    // P-01: the budget is per response. Page shape: the first note may be
+    // partial (mid-note cursor); every following note is emitted whole or the
+    // page stops on the note boundary with a cursor to it (NEW-1: the walk
+    // reaches every note instead of silently ending).
     let mut used: usize = 256; // envelope overhead estimate
     let mut notes_out = Vec::new();
+    let mut pos = start_note;
 
-    for (note_index, view) in selected.iter().enumerate().skip(start_note) {
-        let start_block = if note_index == start_note {
-            cursor.as_ref().map_or(0, |c| c.block_index)
-        } else {
-            0
-        };
-        let resume = if note_index == start_note {
-            resume_pointer.as_deref()
-        } else {
-            None
-        };
+    // first note (partial allowed, mid-note cursor)
+    if pos < reader.len() {
+        let view = reader.read_at(pos)?;
+        if let Some(cursor) = &cursor {
+            cursor.validate(
+                "tree",
+                &rendered,
+                view.note_id.as_deref(),
+                if mid_note {
+                    Some(view.note_rev.as_str())
+                } else {
+                    None
+                },
+                depth,
+                text_limit,
+            )?;
+        }
+        let resume = resume_pointer.as_deref();
+        let start_block = cursor.as_ref().map_or(0, |c| c.block_index);
         let (note_json, note_used, has_more) = paginate_note(
             view,
             &rendered,
-            note_index,
+            pos,
             start_block,
             resume,
             depth,
@@ -101,29 +103,46 @@ pub fn run(
         used += note_used;
         notes_out.push(note_json);
         if has_more {
-            // the cursor resumes inside this note
-            break;
+            return Ok(json!({
+                "api_version": 1,
+                "path": rendered,
+                "notes": notes_out,
+            }));
         }
-        if used >= budget {
-            let next = note_index + 1;
-            if next < selected.len() {
-                // note-boundary cursor: continue with the next note
-                let view = &selected[next];
-                let cursor = Cursor::tree(
-                    rendered.clone(),
-                    view.note_id.clone(),
-                    view.note_rev.clone(),
-                    next,
-                    0,
-                    depth,
-                    text_limit,
-                    None,
-                );
-                notes_out.last_mut().expect("a note was just pushed")["next_cursor"] =
-                    Value::String(cursor.encode());
-            }
-            break;
+        pos += 1;
+    }
+
+    // following notes: whole-fit or boundary cursor
+    while pos < reader.len() {
+        let view = reader.read_at(pos)?;
+        let (full_json, full_size) = note_full(view, depth, text_limit, limits)?;
+        if used + full_size < budget {
+            used += full_size + 1;
+            notes_out.push(full_json);
+            pos += 1;
+            continue;
         }
+        // boundary cursor: continue with this note on the next page
+        let cursor = Cursor::tree(
+            rendered.clone(),
+            reader.note_id(pos),
+            notes_out
+                .last()
+                .and_then(|n: &Value| n["note_rev"].as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            pos,
+            0,
+            depth,
+            text_limit,
+            None,
+        );
+        notes_out.last_mut().expect("a note was just pushed")["next_cursor"] =
+            Value::String(cursor.encode());
+        return Ok(json!({
+            "api_version": 1,
+            "path": rendered,
+            "notes": notes_out,
+        }));
     }
 
     Ok(json!({
@@ -138,8 +157,8 @@ fn stale_cursor(message: &str) -> UmError {
         .with_hint("Re-run the command without --cursor and paginate from the start.")
 }
 
-/// Emit one note's blocks within the remaining budget; returns
-/// `(json, bytes_used, has_more)`.
+/// Emit the first note of the page, blocks cut within the remaining budget;
+/// returns `(json, bytes_used, has_more)`.
 #[allow(clippy::too_many_arguments)]
 fn paginate_note(
     view: &NoteView,
@@ -234,6 +253,45 @@ fn paginate_note(
         }]);
     }
     Ok((note_json, used, has_more))
+}
+
+/// The complete JSON of one note with all blocks (no budget cut) — used to
+/// decide whether a following note fits on the page whole.
+fn note_full(
+    view: &NoteView,
+    depth: Option<usize>,
+    text_limit: usize,
+    limits: &Limits,
+) -> Result<(Value, usize), UmError> {
+    let traversal = insum_core::traverse(&view.doc, depth, limits.max_depth);
+    if traversal.depth_exceeded {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!("document deeper than UM_MAX_DEPTH ({})", limits.max_depth),
+        ));
+    }
+    let blocks_out: Vec<Value> = traversal
+        .blocks
+        .iter()
+        .map(|block| block_json(block, text_limit))
+        .collect();
+    let complete = !traversal.blocks.iter().any(|b| b.children_truncated);
+    let mut note_json = json!({
+        "note_id": view.note_id,
+        "note_title": view.note_title,
+        "note_rev": view.note_rev,
+        "blocks": blocks_out,
+        "complete": complete,
+        "next_cursor": Value::Null,
+    });
+    if traversal.unknown_inline {
+        note_json["warnings"] = json!([{
+            "code": "UNKNOWN_NODE_TYPE",
+            "message": "some blocks contain unknown inline node types; their text is not extracted",
+        }]);
+    }
+    let size = serde_json::to_string(&note_json).map_or(384, |s| s.len() + 1);
+    Ok((note_json, size))
 }
 
 fn block_json(block: &BlockEntry, text_limit: usize) -> Value {

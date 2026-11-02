@@ -11,7 +11,7 @@ use insum_core::model::{BlockEntry, INLINE_NODE_TYPES};
 use insum_core::{ErrorCode, Limits, UmError};
 
 use crate::cursor::Cursor;
-use crate::support::{Output, Revs, read_notes, render_path};
+use crate::support::{Output, Revs, SourceReader, render_path};
 
 pub fn run(
     path: &Path,
@@ -44,22 +44,36 @@ pub fn run(
         Some(token) => Some(Cursor::decode(token)?),
         None => None,
     };
-    // P-02: a cursor resume reads only the note it continues in
-    let cursor_filter = cursor
-        .as_ref()
-        .and_then(|c| c.note_id.clone())
-        .or_else(|| note.map(str::to_owned));
-    let filters = cursor_filter.map(|n| vec![n]);
-    let source = read_notes(path, filters.as_deref(), limits, Revs::Compute)?;
-    let views = &source.views;
+    // NEW-2: no cursor-based narrowing — a multi-note container is read
+    // across notes; the lazy reader keeps the per-page cost bounded (P-02).
+    let filters = note.map(|n| vec![n.to_owned()]);
+    let mut reader = SourceReader::open(path, filters.as_deref(), limits, Revs::Compute)?;
+    let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
+    let budget = limits.output_bytes(max_bytes);
+
+    if let Some(cursor) = &cursor {
+        if start_note >= reader.len() {
+            return Err(stale_cursor(
+                "cursor points past the last note of this response",
+            ));
+        }
+        cursor.validate(
+            "read",
+            &rendered,
+            reader.note_id(start_note).as_deref(),
+            None,
+            None,
+            0,
+        )?;
+    }
 
     if format == "json" {
         // P-01: the budget is per response — no silent oversize; the command
-        // names the required budget instead of exceeding it
-        let budget = limits.output_bytes(max_bytes);
+        // names the required size instead of exceeding it
         let mut notes = Vec::new();
         let mut used: usize = 256;
-        for view in views.iter() {
+        for pos in 0..reader.len() {
+            let view = reader.read_at(pos)?;
             let note_value = json!({
                 "note_id": view.note_id,
                 "note_title": view.note_title,
@@ -86,49 +100,42 @@ pub fn run(
         return Ok(Output::Json(json!({
             "api_version": 1,
             "path": rendered,
-            "file_rev": source.file_rev,
+            "file_rev": reader.file_rev()?,
             "notes": notes,
         })));
     }
 
-    // annotated: paginate by top-level blocks (spec §6.5)
-    if let Some(cursor) = &cursor {
-        let view = views.get(cursor.note_index);
-        cursor.validate(
-            "read",
-            &rendered,
-            view.and_then(|v| v.note_id.as_deref()),
-            view.map(|v| v.note_rev.as_str()).unwrap_or_default(),
-            None,
-            0,
-        )?;
-        if cursor.note_index >= views.len() {
-            return Err(stale_cursor(
-                "cursor points past the last note of this response",
-            ));
-        }
-    }
-    let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
-    let budget = limits.output_bytes(max_bytes);
-
+    // annotated: paginate by top-level blocks across notes (spec §6.5).
+    // Page shape mirrors tree: the first note may be partial (mid-note
+    // cursor); every following note is emitted whole or the page stops on
+    // the note boundary with um:incomplete + cursor to it (NEW-2).
     let mut out = String::new();
-    let mut has_more = false;
-    let mut stop_note = 0usize;
-    let mut stop_block = 0usize;
-    for (note_index, view) in views.iter().enumerate().skip(start_note) {
-        let start_block = if note_index == start_note {
-            cursor.as_ref().map_or(0, |c| c.block_index)
-        } else {
-            0
-        };
+    let mut pos = start_note;
+
+    // first note of the page (partial allowed, mid-note cursor)
+    if pos < reader.len() {
+        let view = reader.read_at(pos)?;
+        if let Some(cursor) = &cursor {
+            let mid_note = cursor.next_pointer.is_some();
+            cursor.validate(
+                "read",
+                &rendered,
+                view.note_id.as_deref(),
+                if mid_note {
+                    Some(view.note_rev.as_str())
+                } else {
+                    None
+                },
+                None,
+                0,
+            )?;
+        }
+        let start_block = cursor.as_ref().map_or(0, |c| c.block_index);
         let header = format!(
             "<!-- um:api_version=1 note_id=\"{}\" note_rev=\"{}\" -->\n",
             view.note_id.clone().unwrap_or_default(),
             view.note_rev
         );
-        if !out.is_empty() {
-            out.push('\n');
-        }
         out.push_str(&header);
         let mut used = out.len();
         let blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
@@ -141,46 +148,96 @@ pub fn run(
         // P-06: children are indexed once per note instead of O(B²) scans
         let children_of = children_index(&blocks.blocks);
         let top_level: Vec<&BlockEntry> = blocks.blocks.iter().filter(|b| b.depth == 0).collect();
+        // S-04 parity with tree: a mid-note resume pointer must match the
+        // block at the resumed position
+        if let Some(expected) = cursor.as_ref().and_then(|c| c.next_pointer.clone())
+            && start_block > 0
+            && !top_level
+                .get(start_block)
+                .is_some_and(|block| block.pointer == expected)
+        {
+            return Err(stale_cursor(
+                "cursor block position does not match the recorded pointer",
+            ));
+        }
         for (block_position, block) in top_level.iter().enumerate().skip(start_block) {
             let mut rendered_block = String::new();
-            render_block(
-                block,
-                &view.doc,
-                blocks.blocks.as_slice(),
-                &children_of,
-                &mut rendered_block,
-            );
+            render_block(block, &view.doc, &children_of, &mut rendered_block);
             let chunk = format!("\n{rendered_block}");
             if used + chunk.len() > budget && block_position > start_block {
                 // whole blocks only — no silent or partial truncation
-                has_more = true;
-                stop_note = note_index;
-                stop_block = block_position;
-                break;
+                let next_pointer = top_level.get(block_position).map(|b| b.pointer.clone());
+                let cursor = Cursor::read(
+                    rendered.clone(),
+                    view.note_id.clone(),
+                    view.note_rev.clone(),
+                    pos,
+                    block_position,
+                    None,
+                    0,
+                    next_pointer,
+                );
+                out.push_str(&format!(
+                    "\n<!-- um:incomplete next_cursor=\"{}\" -->\n",
+                    cursor.encode()
+                ));
+                return Ok(Output::Text(out));
             }
             used += chunk.len();
             out.push_str(&chunk);
         }
-        if has_more {
-            break;
-        }
+        pos += 1;
     }
 
-    if has_more {
-        let view = &views[stop_note];
+    // following notes: whole-fit or boundary marker
+    while pos < reader.len() {
+        let view = reader.read_at(pos)?;
+        let mut scratch = String::new();
+        if !out.is_empty() {
+            scratch.push('\n');
+        }
+        scratch.push_str(&format!(
+            "<!-- um:api_version=1 note_id=\"{}\" note_rev=\"{}\" -->\n",
+            view.note_id.clone().unwrap_or_default(),
+            view.note_rev
+        ));
+        let blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
+        if blocks.depth_exceeded {
+            return Err(UmError::new(
+                ErrorCode::LimitExceeded,
+                format!("document deeper than UM_MAX_DEPTH ({})", limits.max_depth),
+            ));
+        }
+        let children_of = children_index(&blocks.blocks);
+        for block in &blocks.blocks {
+            if block.depth != 0 {
+                continue;
+            }
+            let mut rendered_block = String::new();
+            render_block(block, &view.doc, &children_of, &mut rendered_block);
+            scratch.push_str(&format!("\n{rendered_block}"));
+        }
+        if out.len() + scratch.len() <= budget {
+            out.push_str(&scratch);
+            pos += 1;
+            continue;
+        }
+        // NEW-2: boundary marker + cursor to this note
         let cursor = Cursor::read(
             rendered.clone(),
             view.note_id.clone(),
             view.note_rev.clone(),
-            stop_note,
-            stop_block,
+            pos,
+            0,
             None,
             0,
+            None,
         );
         out.push_str(&format!(
             "\n<!-- um:incomplete next_cursor=\"{}\" -->\n",
             cursor.encode()
         ));
+        return Ok(Output::Text(out));
     }
 
     Ok(Output::Text(out))
@@ -208,7 +265,6 @@ fn children_index(blocks: &[BlockEntry]) -> HashMap<&str, Vec<&BlockEntry>> {
 fn render_block(
     block: &BlockEntry,
     doc: &Value,
-    _blocks: &[BlockEntry],
     children_of: &HashMap<&str, Vec<&BlockEntry>>,
     out: &mut String,
 ) {
@@ -267,26 +323,26 @@ fn render_block(
                 .collect();
             out.push_str(&format!("{name}: {}\n", value.join(" ")));
         }
-        "bulletList" | "taskList" => {
-            for child in children {
-                render_list_item(child, doc, children_of, "- ", "  ", out);
-            }
-        }
-        "orderedList" => {
-            let start = block
-                .attrs
-                .get("start")
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
+        "bulletList" | "taskList" | "orderedList" => {
             for (offset, child) in children.iter().enumerate() {
-                let marker = format!("{}. ", start + offset as u64);
-                render_list_item(child, doc, children_of, &marker, "   ", out);
+                let marker = match block.node_type.as_str() {
+                    "orderedList" => {
+                        let start = block
+                            .attrs
+                            .get("start")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1);
+                        format!("{}. ", start + offset as u64)
+                    }
+                    _ => "- ".to_owned(),
+                };
+                render_list_item(child, doc, children_of, &marker, "  ", out);
             }
         }
         "blockquote" => {
             let mut inner = String::new();
             for child in children {
-                render_block(child, doc, _blocks, children_of, &mut inner);
+                render_block(child, doc, children_of, &mut inner);
             }
             for line in inner.lines() {
                 out.push_str("> ");
@@ -393,6 +449,10 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
     out
 }
 
+/// NEW-3: the list marker / checkbox survives a first child that is not a
+/// paragraph — the marker line is always emitted, non-paragraph children
+/// render as indented blocks (review C-09 stays: the first paragraph joins
+/// the marker line instead of duplicating).
 fn render_list_item(
     item: &BlockEntry,
     doc: &Value,
@@ -408,14 +468,25 @@ fn render_list_item(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let mut first_line = String::new();
-    if let Some(task_checked) = item.attrs.get("checked") {
-        let checked = task_checked.as_bool().unwrap_or(false);
-        first_line.push_str(if checked { "- [x] " } else { "- [ ] " });
+    if let Some(checked) = item.attrs.get("checked") {
+        first_line.push_str(if checked.as_bool().unwrap_or(false) {
+            "- [x] "
+        } else {
+            "- [ ] "
+        });
     } else {
         first_line.push_str(marker);
     }
+    let tight_first = children
+        .first()
+        .is_some_and(|first| first.node_type == "paragraph");
+    if !tight_first {
+        // NEW-3: keep the marker even without a leading paragraph
+        out.push_str(&first_line);
+        out.push('\n');
+    }
     for (position, child) in children.iter().enumerate() {
-        if position == 0 && child.node_type == "paragraph" {
+        if position == 0 && tight_first {
             // C-09: only the first *paragraph* contributes to the marker
             // line; its anchor precedes that line (K-06)
             out.push_str(&format!("<!-- um:pointer=\"{}\" -->\n", child.pointer));
@@ -427,7 +498,7 @@ fn render_list_item(
         }
         // non-paragraph children (and extra paragraphs) render as blocks
         let mut nested = String::new();
-        render_block(child, doc, &[], children_of, &mut nested);
+        render_block(child, doc, children_of, &mut nested);
         for line in nested.lines() {
             out.push_str(indent);
             out.push_str(line);

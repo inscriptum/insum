@@ -206,30 +206,49 @@ pub struct NoteDoc {
 }
 
 impl NoteDoc {
-    pub fn parse(payload: &Value) -> Result<Self, UmError> {
-        if let Some(format) = payload.get("format").and_then(Value::as_str) {
-            if format != "inscriptum-note" {
-                return Err(note_doc_invalid(format!(
-                    "unknown note envelope format {format:?}"
-                )));
-            }
-            let doc = payload
-                .get("document")
-                .ok_or_else(|| note_doc_invalid("envelope missing `document`"))?;
-            validate_doc(doc)?;
-            Ok(Self {
-                doc: doc.clone(),
-                envelope: true,
-                features: payload.get("features").cloned(),
-            })
-        } else {
-            validate_doc(payload)?;
-            Ok(Self {
-                doc: payload.clone(),
+    /// Consume the parsed payload (ownership — no deep copies on the read
+    /// path, review P-03). Envelope version is checked (review K-11).
+    pub fn parse(payload: Value) -> Result<Self, UmError> {
+        let envelope_format = payload
+            .get("format")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(format) = envelope_format else {
+            validate_doc(&payload)?;
+            return Ok(Self {
+                doc: payload,
                 envelope: false,
                 features: None,
-            })
+            });
+        };
+        if format != "inscriptum-note" {
+            return Err(note_doc_invalid(format!(
+                "unknown note envelope format {format:?}"
+            )));
         }
+        match payload.get("version").and_then(Value::as_u64) {
+            Some(1) => {}
+            other => {
+                return Err(UmError::new(
+                    ErrorCode::UnsupportedVersion,
+                    format!("unsupported inscriptum-note envelope version {other:?} (expected 1)"),
+                )
+                .with_hint("Re-save the note with a current build, or migrate the envelope."));
+            }
+        }
+        let mut map = match payload {
+            Value::Object(map) => map,
+            _ => return Err(note_doc_invalid("envelope is not a JSON object")),
+        };
+        let doc = map
+            .remove("document")
+            .ok_or_else(|| note_doc_invalid("envelope missing `document`"))?;
+        validate_doc(&doc)?;
+        Ok(Self {
+            doc,
+            envelope: true,
+            features: map.get("features").cloned(),
+        })
     }
 }
 

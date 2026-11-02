@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,8 +20,11 @@ use crate::model::{Manifest, NoteDescriptor, NoteDoc};
 /// central directory + manifest without unpacking payload).
 pub struct UmContainer {
     archive: ZipArchive<File>,
+    path: PathBuf,
     pub manifest: Manifest,
-    pub file_rev: String,
+    /// Computed on demand (review P-05: consumers that never output it never
+    /// pay for the full-file hash).
+    file_rev_cache: Option<String>,
     pub bytes: u64,
     /// Top-level archive directories beyond `manifest.json` and `notes/`
     /// (e.g. `assets`), sorted — reported by `ls <file>` as `parts`.
@@ -33,7 +36,6 @@ impl UmContainer {
         let bytes = std::fs::metadata(path)
             .map_err(|err| path_error(path, err))?
             .len();
-        let file_rev = format_rev(hash_file(path)?);
         let mut archive = ZipArchive::new(File::open(path).map_err(|err| path_error(path, err))?)
             .map_err(|err| {
             UmError::new(
@@ -56,11 +58,21 @@ impl UmContainer {
 
         Ok(Self {
             archive,
+            path: path.to_owned(),
             manifest,
-            file_rev,
+            file_rev_cache: None,
             bytes,
             parts,
         })
+    }
+
+    /// `file_rev` — SHA-256 of all file bytes (spec §5.4), computed on first
+    /// request and cached.
+    pub fn file_rev(&mut self) -> Result<String, UmError> {
+        if self.file_rev_cache.is_none() {
+            self.file_rev_cache = Some(format_rev(hash_file(&self.path)?));
+        }
+        Ok(self.file_rev_cache.clone().expect("just cached"))
     }
 
     /// Note descriptors sorted by `order`, then `id` (spec §5.3).
@@ -84,14 +96,14 @@ impl UmContainer {
     }
 
     /// Read and parse one note payload. The entry size is checked against
-    /// the limit before decompression (spec §12).
+    /// the limit before decompression (spec §12). No revision is computed —
+    /// the light path for consumers that never output revisions (review P-05).
     pub fn read_note(
         &mut self,
         note: &NoteDescriptor,
         limits: &Limits,
     ) -> Result<NoteDoc, UmError> {
-        self.read_note_with_rev(note, limits)
-            .map(|parsed| parsed.note)
+        self.read_note_raw(note, limits)
     }
 
     /// Read one note payload and compute its `note_rev` in the same pass.
@@ -105,6 +117,26 @@ impl UmContainer {
         note: &NoteDescriptor,
         limits: &Limits,
     ) -> Result<ParsedNote, UmError> {
+        let payload = self.read_note_payload(note, limits)?;
+        let note_doc = NoteDoc::parse(parse_json_limited(
+            &payload,
+            limits.max_depth,
+            ErrorCode::NoteJsonInvalid,
+        )?)?;
+        let descriptor = canon::canonical_json(&note.raw);
+        let note_rev = format_rev(note_rev_hex(payload.as_bytes(), descriptor.as_bytes()));
+        Ok(ParsedNote {
+            note: note_doc,
+            note_rev,
+        })
+    }
+
+    /// Decompress and return the RAW payload bytes (no parsing, no hashing).
+    fn read_note_payload(
+        &mut self,
+        note: &NoteDescriptor,
+        limits: &Limits,
+    ) -> Result<String, UmError> {
         if note.path.starts_with('/')
             || note.path.contains('\\')
             || note.path.split('/').any(|segment| segment == "..")
@@ -133,14 +165,18 @@ impl UmContainer {
                 format!("note payload is not UTF-8: {err}"),
             )
         })?;
-        let value = parse_json_limited(&payload, limits.max_depth)?;
-        let note_doc = NoteDoc::parse(&value)?;
-        let descriptor = canon::canonical_json(&note.raw);
-        let note_rev = format_rev(note_rev_hex(payload.as_bytes(), descriptor.as_bytes()));
-        Ok(ParsedNote {
-            note: note_doc,
-            note_rev,
-        })
+        Ok(payload)
+    }
+
+    /// Parse the payload into a document (bounded depth).
+    fn read_note_raw(
+        &mut self,
+        note: &NoteDescriptor,
+        limits: &Limits,
+    ) -> Result<NoteDoc, UmError> {
+        let payload = self.read_note_payload(note, limits)?;
+        let value = parse_json_limited(&payload, limits.max_depth, ErrorCode::NoteJsonInvalid)?;
+        NoteDoc::parse(value)
     }
 }
 
@@ -153,7 +189,11 @@ pub struct ParsedNote {
 /// Parse JSON with the depth limit enforced on the raw text before parsing
 /// (so hostile nesting fails as `LIMIT_EXCEEDED`, not as a parse error) and
 /// with serde_json's own recursion limit disabled afterwards.
-fn parse_json_limited(text: &str, max_depth: usize) -> Result<Value, UmError> {
+fn parse_json_limited(
+    text: &str,
+    max_depth: usize,
+    parse_error: ErrorCode,
+) -> Result<Value, UmError> {
     if json_depth_exceeds(text, max_depth) {
         return Err(limit_exceeded(format!(
             "JSON depth exceeds UM_MAX_DEPTH ({max_depth})"
@@ -161,13 +201,8 @@ fn parse_json_limited(text: &str, max_depth: usize) -> Result<Value, UmError> {
     }
     let deserializer = &mut serde_json::Deserializer::from_str(text);
     deserializer.disable_recursion_limit();
-    let value = Value::deserialize(deserializer).map_err(|err| {
-        UmError::new(
-            ErrorCode::NoteJsonInvalid,
-            format!("note payload is not JSON: {err}"),
-        )
-    })?;
-    Ok(value)
+    Value::deserialize(deserializer)
+        .map_err(|err| UmError::new(parse_error, format!("payload is not valid JSON: {err}")))
 }
 
 /// Single-pass scan of the raw JSON text tracking `[`/`{` nesting outside
@@ -296,12 +331,7 @@ fn read_manifest_value(archive: &mut ZipArchive<File>, limits: &Limits) -> Resul
             format!("manifest is not UTF-8: {err}"),
         )
     })?;
-    serde_json::from_str(&text).map_err(|err| {
-        UmError::new(
-            ErrorCode::ManifestInvalid,
-            format!("manifest is not valid JSON: {err}"),
-        )
-    })
+    parse_json_limited(&text, limits.max_depth, ErrorCode::ManifestInvalid)
 }
 
 /// ZIP safety per spec §12: unsafe or duplicate entry names are rejected;
@@ -322,8 +352,9 @@ fn check_archive_safety(archive: &mut ZipArchive<File>, limits: &Limits) -> Resu
             "archive contains duplicate entry names",
         ));
     }
+    // entry names, sizes and the uncompressed total — all from the actual
+    // central directory data (spec §12)
     let mut total: u64 = 0;
-    let mut seen: Vec<String> = Vec::with_capacity(archive.len());
     for index in 0..archive.len() {
         let entry = archive.by_index_raw(index).map_err(|err| {
             UmError::new(
@@ -342,13 +373,6 @@ fn check_archive_safety(archive: &mut ZipArchive<File>, limits: &Limits) -> Resu
             .to_string();
         check_entry_name(&name)?;
         total = total.saturating_add(entry.size());
-        if seen.contains(&name) {
-            return Err(UmError::new(
-                ErrorCode::ArchiveDuplicateEntry,
-                format!("duplicate archive entry {name:?}"),
-            ));
-        }
-        seen.push(name);
     }
     if total > limits.max_total_bytes as u64 {
         return Err(limit_exceeded(format!(
@@ -407,8 +431,12 @@ fn path_error(path: &Path, err: std::io::Error) -> UmError {
 /// A `.note` document opened for reading (legacy raw doc or envelope).
 pub struct NoteFile {
     pub note: NoteDoc,
-    /// The raw JSON value (envelope metadata lives here, spec §4.6).
-    pub raw: Value,
+    /// Envelope metadata (spec §4.6) — extracted point-wise so the whole
+    /// payload is never cloned on the read path (review P-03).
+    pub envelope_format: Option<String>,
+    pub features: Option<Value>,
+    pub schema: Option<Value>,
+    pub path: PathBuf,
     pub file_rev: String,
     /// `note_rev` for `.note` is the hash of the whole file (spec §5.4).
     pub note_rev: String,
@@ -416,24 +444,40 @@ pub struct NoteFile {
 }
 
 impl NoteFile {
-    pub fn open(path: &Path, limits: &Limits) -> Result<Self, UmError> {
+    pub fn open(path: &Path, limits: &Limits, with_revs: bool) -> Result<Self, UmError> {
         // Read with a hard cap instead of stat-then-read: a FIFO or a file
         // growing between stat and read cannot inflate the allocation (§12).
         let raw = read_bounded(path, limits)?;
         let bytes = raw.len() as u64;
-        let file_rev = format_rev(sha256_hex(&raw));
-        let note_rev = note_rev_for_file_bytes(&raw);
+        // §5.4: for .note both revisions hash the whole file — one digest
+        // serves both; skipped entirely on the light path (review P-05)
+        let (file_rev, note_rev) = if with_revs {
+            let digest = format_rev(sha256_hex(&raw));
+            (digest.clone(), digest)
+        } else {
+            (String::new(), String::new())
+        };
         let text = String::from_utf8(raw).map_err(|err| {
             UmError::new(
                 ErrorCode::NoteJsonInvalid,
                 format!("note is not UTF-8: {err}"),
             )
         })?;
-        let value = parse_json_limited(&text, limits.max_depth)?;
-        let note = NoteDoc::parse(&value.clone())?;
+        let value = parse_json_limited(&text, limits.max_depth, ErrorCode::NoteJsonInvalid)?;
+        // envelope metadata extracted point-wise (no whole-payload clone, P-03)
+        let envelope_format = value
+            .get("format")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let features = value.get("features").cloned();
+        let schema = value.get("schema").cloned();
+        let note = NoteDoc::parse(value)?;
         Ok(Self {
             note,
-            raw: value,
+            envelope_format,
+            features,
+            schema,
+            path: path.to_owned(),
             file_rev,
             note_rev,
             bytes,

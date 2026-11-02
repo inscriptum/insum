@@ -164,11 +164,9 @@ impl NoteView {
     }
 }
 
-/// The result of opening one document path: the file-level revision plus the
-/// requested notes (in manifest order, single pass — one decompression per
-/// payload).
+/// The result of opening one document path: the requested notes in manifest
+/// order, one decompression per payload.
 pub struct SourceRead {
-    pub file_rev: String,
     pub views: Vec<NoteView>,
 }
 
@@ -198,10 +196,7 @@ pub fn read_notes(
                     let descriptor = container.find_note(filter)?.clone();
                     views.push(read_view(&mut container, &descriptor, limits, revs)?);
                 }
-                return Ok(SourceRead {
-                    file_rev: container.file_rev,
-                    views,
-                });
+                return Ok(SourceRead { views });
             }
             let descriptors: Vec<NoteDescriptor> =
                 container.notes_in_order().into_iter().cloned().collect();
@@ -209,10 +204,7 @@ pub fn read_notes(
             for descriptor in &descriptors {
                 views.push(read_view(&mut container, descriptor, limits, revs)?);
             }
-            Ok(SourceRead {
-                file_rev: container.file_rev,
-                views,
-            })
+            Ok(SourceRead { views })
         }
         Some("note") => {
             if filters.is_some() {
@@ -220,7 +212,7 @@ pub fn read_notes(
                     "--note is not allowed for a .note file (it holds a single document)",
                 ));
             }
-            let note_file = NoteFile::open(path, limits)?;
+            let note_file = NoteFile::open(path, limits, revs == Revs::Compute)?;
             let features = note_file.note.features.clone();
             let block_ids_enabled = features
                 .as_ref()
@@ -228,7 +220,6 @@ pub fn read_notes(
                 .and_then(Value::as_u64)
                 == Some(1);
             Ok(SourceRead {
-                file_rev: note_file.file_rev,
                 views: vec![NoteView {
                     note_id: None,
                     note_title: note_title(None, &note_file.note.doc),
@@ -264,6 +255,7 @@ fn read_view(
             ))
         }
         Revs::Skip => {
+            // P-05: the light path — parse only, no SHA-256/canonical_json
             let note_doc = container.read_note(descriptor, limits)?;
             Ok(NoteView::from_descriptor(
                 descriptor,
@@ -291,4 +283,148 @@ pub fn error_value(err: &UmError) -> Value {
 pub enum Output {
     Json(Value),
     Text(String),
+}
+
+/// Lazy note reader over one document path: the container/manifest opens
+/// once, payloads are parsed on demand — a pagination page only pays for the
+/// notes it actually emits (review P-02) while multi-note walks stay
+/// complete (review NEW-1/NEW-2).
+pub struct SourceReader {
+    limits: Limits,
+    revs: Revs,
+    container: Option<UmContainer>,
+    order: Vec<NoteDescriptor>,
+    cache: Vec<Option<NoteView>>,
+    note_file: Option<NoteFile>,
+    single: Option<NoteView>,
+}
+
+impl SourceReader {
+    pub fn open(
+        path: &Path,
+        filters: Option<&[String]>,
+        limits: &Limits,
+        revs: Revs,
+    ) -> Result<Self, UmError> {
+        match classify_extension(path) {
+            Some("um") => {
+                let container = UmContainer::open(path, limits)?;
+                let mut order: Vec<NoteDescriptor> =
+                    container.notes_in_order().into_iter().cloned().collect();
+                if let Some(filters) = filters {
+                    // manifest order preserved (§5.3); unknown ids are errors
+                    for filter in filters {
+                        if !order.iter().any(|note| &note.id == filter) {
+                            return Err(container.find_note(filter).unwrap_err());
+                        }
+                    }
+                    order.retain(|note| filters.contains(&note.id));
+                }
+                let cache: Vec<Option<NoteView>> = (0..order.len()).map(|_| None).collect();
+                Ok(Self {
+                    limits: *limits,
+                    revs,
+                    container: Some(container),
+                    order,
+                    cache,
+                    note_file: None,
+                    single: None,
+                })
+            }
+            Some("note") => {
+                if filters.is_some() {
+                    return Err(UmError::usage(
+                        "--note is not allowed for a .note file (it holds a single document)",
+                    ));
+                }
+                // single note: eager open is the lazy path
+                let note_file = NoteFile::open(path, limits, revs == Revs::Compute)?;
+                let features = note_file.note.features.clone();
+                let block_ids_enabled = features
+                    .as_ref()
+                    .and_then(|f| f.get("block_ids"))
+                    .and_then(Value::as_u64)
+                    == Some(1);
+                let single = NoteView {
+                    note_id: None,
+                    note_title: note_title(None, &note_file.note.doc),
+                    note_rev: note_file.note_rev.clone(),
+                    doc: note_file.note.doc.clone(),
+                    features,
+                    block_ids_enabled,
+                };
+                let note_file = Some(note_file);
+                Ok(Self {
+                    limits: *limits,
+                    revs,
+                    container: None,
+                    order: Vec::new(),
+                    cache: Vec::new(),
+                    note_file,
+                    single: Some(single),
+                })
+            }
+            _ => Err(UmError::new(
+                ErrorCode::PathNotFound,
+                format!("no .um or .note document at {}", path.display()),
+            )),
+        }
+    }
+
+    /// Number of exposed notes (filtered sequence, manifest order).
+    pub fn len(&self) -> usize {
+        if self.container.is_some() {
+            self.order.len()
+        } else {
+            1
+        }
+    }
+
+    /// Cheap note identity (manifest descriptor) without parsing the payload.
+    pub fn note_id(&self, pos: usize) -> Option<String> {
+        if self.container.is_some() {
+            self.order.get(pos).map(|note| note.id.clone())
+        } else {
+            None // .note files have no note id
+        }
+    }
+
+    /// Read (and cache) the note at `pos`; revisions computed per `Revs`.
+    pub fn read_at(&mut self, pos: usize) -> Result<&NoteView, UmError> {
+        if self.container.is_some() {
+            if pos >= self.order.len() {
+                return Err(UmError::new(
+                    ErrorCode::NoteNotFound,
+                    format!("note position {pos} is out of range"),
+                ));
+            }
+            if self.cache[pos].is_none() {
+                let descriptor = self.order[pos].clone();
+                let mut container = self.container.take().expect("container present");
+                let view = read_view(&mut container, &descriptor, &self.limits, self.revs)?;
+                self.container = Some(container);
+                self.cache[pos] = Some(view);
+            }
+            Ok(self.cache[pos].as_ref().expect("just cached"))
+        } else {
+            Ok(self.single.as_ref().expect("single note"))
+        }
+    }
+
+    /// The file-level revision, computed on demand (review P-05: consumers
+    /// that never output it never pay for it).
+    pub fn file_rev(&mut self) -> Result<String, UmError> {
+        if let Some(container) = self.container.as_mut() {
+            container.file_rev()
+        } else {
+            let note_file = self.note_file.as_mut().expect("note file");
+            if note_file.file_rev.is_empty() {
+                // light path was taken; the file hash is needed only now
+                let refreshed = NoteFile::open(&note_file.path, &self.limits, true)?;
+                note_file.file_rev = refreshed.file_rev;
+                note_file.note_rev = refreshed.note_rev;
+            }
+            Ok(note_file.file_rev.clone())
+        }
+    }
 }

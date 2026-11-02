@@ -116,6 +116,7 @@ impl Cursor {
         block_index: usize,
         depth: Option<usize>,
         text_limit: usize,
+        next_pointer: Option<String>,
     ) -> Self {
         Self {
             kind: KIND_READ.to_owned(),
@@ -126,7 +127,7 @@ impl Cursor {
             block_index,
             depth,
             text_limit,
-            next_pointer: None,
+            next_pointer,
         }
     }
 
@@ -186,7 +187,7 @@ impl Cursor {
         kind: &str,
         path: &str,
         note_id: Option<&str>,
-        note_rev: &str,
+        note_rev: Option<&str>,
         depth: Option<usize>,
         text_limit: usize,
     ) -> Result<(), UmError> {
@@ -204,7 +205,12 @@ impl Cursor {
                 "cursor was issued for another note".to_owned(),
             ));
         }
-        if self.note_rev != note_rev {
+        // `None` = boundary cursor: no intra-note position to protect, so a
+        // rev comparison would only produce false staleness (review NEW-1
+        // flavor 2); mid-note resumes pass Some(rev)
+        if let Some(expected) = note_rev
+            && self.note_rev != expected
+        {
             return Err(cursor_stale(
                 "the note revision changed since the cursor was issued".to_owned(),
             ));

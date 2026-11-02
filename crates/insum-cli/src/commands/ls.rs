@@ -162,14 +162,14 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
 
     match extension.as_deref() {
         Some("um") => {
-            let container = UmContainer::open(path, limits)?;
+            let mut container = UmContainer::open(path, limits)?;
             Ok(json!({
                 "api_version": 1,
                 "path": rendered,
                 "kind": "notebook",
                 "bytes": bytes,
                 "mtime": mtime,
-                "file_rev": container.file_rev,
+                "file_rev": container.file_rev()?,
                 "format": container.manifest.format,
                 "type": container.manifest.container_type,
                 "features": container.manifest.features,
@@ -182,7 +182,7 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
             }))
         }
         Some("note") => {
-            let note_file = NoteFile::open(path, limits)?;
+            let note_file = NoteFile::open(path, limits, true)?;
             let mut entry = json!({
                 "api_version": 1,
                 "path": rendered,
@@ -195,12 +195,8 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
             });
             if note_file.note.envelope {
                 entry["format"] = json!("inscriptum-note");
-                entry["features"] = note_file
-                    .raw
-                    .get("features")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                entry["schema"] = note_file.raw.get("schema").cloned().unwrap_or(Value::Null);
+                entry["features"] = note_file.features.clone().unwrap_or(Value::Null);
+                entry["schema"] = note_file.schema.clone().unwrap_or(Value::Null);
             }
             Ok(entry)
         }
