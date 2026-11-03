@@ -51,20 +51,10 @@ pub fn run(
     let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
     let budget = limits.output_bytes(max_bytes);
 
-    if let Some(cursor) = &cursor {
-        if start_note >= reader.len() {
-            return Err(stale_cursor(
-                "cursor points past the last note of this response",
-            ));
-        }
-        cursor.validate(
-            "read",
-            &rendered,
-            reader.note_id(start_note).as_deref(),
-            None,
-            None,
-            0,
-        )?;
+    if cursor.is_some() && start_note >= reader.len() {
+        return Err(stale_cursor(
+            "cursor points past the last note of this response",
+        ));
     }
 
     if format == "json" {
@@ -116,16 +106,13 @@ pub fn run(
     if pos < reader.len() {
         let view = reader.read_at(pos)?;
         if let Some(cursor) = &cursor {
-            let mid_note = cursor.next_pointer.is_some();
+            // NEW-4: unconditional rev binding; NEW-5: the bi⇔np invariant
+            // is enforced inside validate
             cursor.validate(
                 "read",
                 &rendered,
                 view.note_id.as_deref(),
-                if mid_note {
-                    Some(view.note_rev.as_str())
-                } else {
-                    None
-                },
+                view.note_rev.as_str(),
                 None,
                 0,
             )?;

@@ -187,7 +187,7 @@ impl Cursor {
         kind: &str,
         path: &str,
         note_id: Option<&str>,
-        note_rev: Option<&str>,
+        note_rev: &str,
         depth: Option<usize>,
         text_limit: usize,
     ) -> Result<(), UmError> {
@@ -205,12 +205,26 @@ impl Cursor {
                 "cursor was issued for another note".to_owned(),
             ));
         }
-        // `None` = boundary cursor: no intra-note position to protect, so a
-        // rev comparison would only produce false staleness (review NEW-1
-        // flavor 2); mid-note resumes pass Some(rev)
-        if let Some(expected) = note_rev
-            && self.note_rev != expected
-        {
+        // NEW-5: the position/pointer invariant — mid-note (block_index > 0)
+        // must carry its pointer anchor, boundary must not. Without it,
+        // stripping np from a mid-note token deactivates both guards at once.
+        match (self.block_index > 0, &self.next_pointer) {
+            (true, None) => {
+                return Err(cursor_stale(
+                    "mid-note cursor is missing its position pointer".to_owned(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(cursor_stale(
+                    "boundary cursor carries an unexpected position pointer".to_owned(),
+                ));
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+        // NEW-4: the revision comparison is unconditional — boundary cursors
+        // bind to the target note's revision, so a rewrite between pages is
+        // CURSOR_STALE on every resume shape (§6.2, §15.1 №7)
+        if self.note_rev != note_rev {
             return Err(cursor_stale(
                 "the note revision changed since the cursor was issued".to_owned(),
             ));

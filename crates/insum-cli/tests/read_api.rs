@@ -1596,6 +1596,33 @@ fn read_json_rejects_cursor() {
 
 /// A 4-note container with sizable notes: forces mid-note pages AND note
 /// boundaries within one walk.
+/// Rewrite ONLY the note at `index` (same id, fresh content), keeping the
+/// container shape intact — the honest scenario for cursor staleness.
+fn rewrite_one_note(path: &Path, index: usize) {
+    let mut notes = Vec::new();
+    for i in 1..=4 {
+        let blocks: Vec<Value> = if i == index + 1 {
+            vec![fixtures::paragraph(&[fixtures::text(
+                "fresh content freshly written",
+            )])]
+        } else {
+            (1..=8)
+                .map(|j| {
+                    fixtures::paragraph(&[fixtures::text(&format!(
+                        "note{i} block{j} payload text for pagination"
+                    ))])
+                })
+                .collect()
+        };
+        notes.push(fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(i as u32),
+            &format!("note{i}"),
+            &blocks,
+        ));
+    }
+    fixtures::write_um(path, &notes).expect("rewrite");
+}
+
 fn write_multi_note(path: &Path) {
     let mut notes = Vec::new();
     for i in 1..=4 {
@@ -1905,5 +1932,202 @@ fn list_marker_survives_non_paragraph_first_child() {
     assert!(
         text.contains("### Nested head"),
         "non-paragraph child still rendered"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Delta round 4 — NEW-4/NEW-5: boundary staleness + np invariant
+// ---------------------------------------------------------------------------
+
+/// NEW-4: a boundary cursor binds the TARGET note's revision. Rewrite that
+/// note between pages (same id, new content) → the resume is CURSOR_STALE,
+/// phrased about the revision — never a silent new edition (§6.2, §15.1 №7).
+#[test]
+fn tree_boundary_cursor_detects_target_note_rewrite() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("multi.um");
+    write_multi_note(&file);
+
+    // walk until a note-boundary cursor appears (bi == 0, np == null)
+    let file_arg = file_arg_of(&file);
+    let mut cursor: Option<String> = None;
+    let mut boundary = None;
+    for _ in 0..50 {
+        let mut args = vec!["tree", file_arg.as_str(), "--max-bytes", "700"];
+        if let Some(c) = &cursor {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let page = run_json(&args);
+        let next = page["notes"].as_array().unwrap().last().unwrap()["next_cursor"]
+            .as_str()
+            .map(str::to_owned);
+        match next {
+            Some(token) => {
+                let decoded = decode_cursor_json(&token);
+                if decoded["bi"].as_u64() == Some(0) && decoded["np"].is_null() {
+                    boundary = Some(token);
+                    break;
+                }
+                cursor = Some(token);
+            }
+            None => panic!("no boundary cursor produced by the walk"),
+        }
+    }
+    let token = boundary.expect("boundary cursor");
+
+    // the cursor targets the note at its ni — rewrite THAT note in place,
+    // container shape intact
+    let decoded = decode_cursor_json(&token);
+    let ni = decoded["ni"].as_u64().expect("note index") as usize;
+    rewrite_one_note(&file, ni);
+
+    let out = insum()
+        .args([
+            "tree",
+            file_arg.as_str(),
+            "--max-bytes",
+            "700",
+            "--cursor",
+            &token,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7), "stale boundary resume exits 7");
+    let error = stderr_json(&out);
+    assert_eq!(error["error"]["code"], "CURSOR_STALE");
+    let message = error["error"]["message"].as_str().unwrap().to_lowercase();
+    assert!(
+        message.contains("revision"),
+        "phrased about the revision: {message}"
+    );
+}
+
+/// NEW-4 on annotated: the same scenario via `read --format annotated`.
+#[test]
+fn annotated_boundary_cursor_detects_target_note_rewrite() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("multi.um");
+    write_multi_note(&file);
+
+    let file_arg = file.to_string_lossy().into_owned();
+    let mut cursor: Option<String> = None;
+    let mut boundary = None;
+    for _ in 0..50 {
+        let mut args = vec![
+            "read",
+            "--format",
+            "annotated",
+            file_arg.as_str(),
+            "--max-bytes",
+            "600",
+        ];
+        if let Some(c) = &cursor {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let out = insum().args(&args).output().unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let m = re_next_cursor(&text);
+        match m {
+            Some(token) => {
+                let decoded = decode_cursor_json(&token);
+                if decoded["bi"].as_u64() == Some(0) {
+                    boundary = Some(token);
+                    break;
+                }
+                cursor = Some(token);
+            }
+            None => panic!("no boundary marker produced by the annotated walk"),
+        }
+    }
+    let token = boundary.expect("boundary marker");
+    let decoded = decode_cursor_json(&token);
+    let ni = decoded["ni"].as_u64().expect("note index") as usize;
+    rewrite_one_note(&file, ni);
+
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file_arg.as_str(),
+            "--max-bytes",
+            "600",
+            "--cursor",
+            &token,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7), "stale boundary resume exits 7");
+    let message = stderr_json(&out)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    assert!(
+        message.contains("revision"),
+        "phrased about the revision: {message}"
+    );
+}
+
+fn re_next_cursor(text: &str) -> Option<String> {
+    text.split("um:incomplete next_cursor=\"")
+        .nth(1)
+        .map(|chunk| chunk.chars().take_while(|c| *c != '"').collect::<String>())
+}
+
+fn file_arg_of(file: &Path) -> String {
+    file.to_string_lossy().into_owned()
+}
+
+/// NEW-5: stripping `np` from a mid-note cursor must be rejected — never
+/// silently resumed with both guards deactivated.
+#[test]
+fn stripped_mid_note_cursor_is_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let file = dir.path().join("multi.um");
+    write_multi_note(&file);
+
+    let first = run_json(&[
+        "tree",
+        file.to_string_lossy().as_ref(),
+        "--max-bytes",
+        "700",
+    ]);
+    let token = first["notes"][0]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut decoded = decode_cursor_json(&token);
+    assert!(
+        decoded["bi"].as_u64() > Some(0),
+        "fixture: first page is mid-note"
+    );
+    decoded["np"] = Value::Null;
+    let stripped = base64url_encode(decoded.to_string().as_bytes());
+
+    let out = insum()
+        .args([
+            "tree",
+            file.to_string_lossy().as_ref(),
+            "--max-bytes",
+            "700",
+            "--cursor",
+            &stripped,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stripped np → CURSOR_STALE, not a resume"
+    );
+    let message = stderr_json(&out)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    assert!(
+        message.contains("pointer"),
+        "phrased about the missing pointer: {message}"
     );
 }

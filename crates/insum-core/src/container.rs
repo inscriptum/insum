@@ -2,7 +2,7 @@
 //! note payload access. Read-only — nothing here writes (spec §2.1, §12).
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -20,6 +20,12 @@ use crate::model::{Manifest, NoteDescriptor, NoteDoc};
 /// central directory + manifest without unpacking payload).
 pub struct UmContainer {
     archive: ZipArchive<File>,
+    /// NEW-6: held open since container open — `file_rev` streams through
+    /// THIS descriptor (seek 0 + read), never re-opens the path, so a
+    /// concurrent file replacement cannot mix generations between payload
+    /// reads and the file hash.
+    file_handle: File,
+    /// Kept for error messages only (never re-opened).
     path: PathBuf,
     pub manifest: Manifest,
     /// Computed on demand (review P-05: consumers that never output it never
@@ -56,8 +62,10 @@ impl UmContainer {
         parts.sort();
         parts.dedup();
 
+        let file_handle = File::open(path).map_err(|err| path_error(path, err))?;
         Ok(Self {
             archive,
+            file_handle,
             path: path.to_owned(),
             manifest,
             file_rev_cache: None,
@@ -67,10 +75,29 @@ impl UmContainer {
     }
 
     /// `file_rev` — SHA-256 of all file bytes (spec §5.4), computed on first
-    /// request and cached.
+    /// request through the descriptor held since open (NEW-6: no re-open,
+    /// seek(0) + read), then cached.
     pub fn file_rev(&mut self) -> Result<String, UmError> {
         if self.file_rev_cache.is_none() {
-            self.file_rev_cache = Some(format_rev(hash_file(&self.path)?));
+            let mut handle = &self.file_handle;
+            handle
+                .seek(SeekFrom::Start(0))
+                .map_err(|err| path_error(&self.path, err))?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = handle.read(&mut buffer).map_err(|err| {
+                    UmError::new(
+                        ErrorCode::IoError,
+                        format!("cannot hash {}: {err}", self.path.display()),
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            self.file_rev_cache = Some(format_rev(hex(&hasher.finalize())));
         }
         Ok(self.file_rev_cache.clone().expect("just cached"))
     }
@@ -287,24 +314,6 @@ fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
         )));
     }
     Ok(buffer)
-}
-
-/// Stream-hash the whole file — `file_rev` covers every byte (spec §5.4)
-/// without holding the file in memory.
-fn hash_file(path: &Path) -> Result<String, UmError> {
-    let mut file = File::open(path).map_err(|err| path_error(path, err))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|err| path_error(path, err))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex(&hasher.finalize()))
 }
 
 fn hex(digest: &[u8]) -> String {

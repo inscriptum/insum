@@ -36,30 +36,19 @@ pub fn run(
     let filters = if note.is_empty() { None } else { Some(note) };
     let mut reader = SourceReader::open(path, filters, limits, Revs::Compute)?;
 
-    // A cursor with next_pointer resumes INSIDE a note (bound to its
-    // revision); a cursor without one sits on a note boundary — there is no
-    // intra-note position to protect, so the rev check would only produce a
-    // false CURSOR_STALE there (the second NEW-1 flavor) and is skipped.
+    // NEW-5: mid-note is determined by the POSITION (block_index > 0), never
+    // by the optional np field — a stripped np cannot deactivate the guards.
+    // validate() enforces the bi⇔np invariant and the unconditional rev
+    // binding (NEW-4) after the pinned note is read; paginate_note keeps the
+    // pointer match against the resumed position (S-04).
     let resume_pointer = cursor.as_ref().and_then(|c| c.next_pointer.clone());
-    let mid_note = resume_pointer.is_some();
     let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
     let budget = limits.output_bytes(max_bytes);
 
-    if let Some(cursor) = &cursor {
-        if start_note >= reader.len() {
-            return Err(stale_cursor(
-                "cursor points past the last note of this response",
-            ));
-        }
-        // cheap checks (kind/path/options) run before any payload read
-        cursor.validate(
-            "tree",
-            &rendered,
-            reader.note_id(start_note).as_deref(),
-            None,
-            depth,
-            text_limit,
-        )?;
+    if cursor.is_some() && start_note >= reader.len() {
+        return Err(stale_cursor(
+            "cursor points past the last note of this response",
+        ));
     }
 
     // P-01: the budget is per response. Page shape: the first note may be
@@ -74,15 +63,13 @@ pub fn run(
     if pos < reader.len() {
         let view = reader.read_at(pos)?;
         if let Some(cursor) = &cursor {
+            // NEW-4: rev binding is unconditional — the pinned/target note is
+            // read here anyway, so boundary resumes check it too
             cursor.validate(
                 "tree",
                 &rendered,
                 view.note_id.as_deref(),
-                if mid_note {
-                    Some(view.note_rev.as_str())
-                } else {
-                    None
-                },
+                view.note_rev.as_str(),
                 depth,
                 text_limit,
             )?;
@@ -122,14 +109,13 @@ pub fn run(
             pos += 1;
             continue;
         }
-        // boundary cursor: continue with this note on the next page
+        // boundary cursor: continue with this note on the next page.
+        // NEW-4: it binds to the TARGET note's revision — the note is already
+        // parsed for the size check, so no extra work is needed.
         let cursor = Cursor::tree(
             rendered.clone(),
-            reader.note_id(pos),
-            notes_out
-                .last()
-                .and_then(|n: &Value| n["note_rev"].as_str().map(str::to_owned))
-                .unwrap_or_default(),
+            view.note_id.clone(),
+            view.note_rev.clone(),
             pos,
             0,
             depth,

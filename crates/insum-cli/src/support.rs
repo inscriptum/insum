@@ -181,6 +181,11 @@ pub enum Revs {
 
 /// Open a `.um`/`.note` path and read the requested notes in manifest order.
 /// `filters` selects notes by id (repeatable `--note`); `None` reads all.
+///
+/// NEW-8 (documented): repeated `--note` flags select WHICH notes are read,
+/// but the output order always follows the manifest (order, then id) — not
+/// the order of the flags. That keeps every response deterministic per §3.11
+/// regardless of argument order.
 pub fn read_notes(
     path: &Path,
     filters: Option<&[String]>,
@@ -295,8 +300,15 @@ pub struct SourceReader {
     container: Option<UmContainer>,
     order: Vec<NoteDescriptor>,
     cache: Vec<Option<NoteView>>,
-    note_file: Option<NoteFile>,
+    /// NEW-7: light metadata only — the document lives exclusively in
+    /// `single`, never cloned.
+    note_meta: Option<NoteMeta>,
     single: Option<NoteView>,
+}
+
+/// File-level metadata of a `.note` document (no document copy).
+struct NoteMeta {
+    file_rev: String,
 }
 
 impl SourceReader {
@@ -327,7 +339,7 @@ impl SourceReader {
                     container: Some(container),
                     order,
                     cache,
-                    note_file: None,
+                    note_meta: None,
                     single: None,
                 })
             }
@@ -337,7 +349,8 @@ impl SourceReader {
                         "--note is not allowed for a .note file (it holds a single document)",
                     ));
                 }
-                // single note: eager open is the lazy path
+                // single note: eager open is the lazy path; the document is
+                // MOVED into `single` (NEW-7: no second copy)
                 let note_file = NoteFile::open(path, limits, revs == Revs::Compute)?;
                 let features = note_file.note.features.clone();
                 let block_ids_enabled = features
@@ -349,18 +362,20 @@ impl SourceReader {
                     note_id: None,
                     note_title: note_title(None, &note_file.note.doc),
                     note_rev: note_file.note_rev.clone(),
-                    doc: note_file.note.doc.clone(),
+                    doc: note_file.note.doc,
                     features,
                     block_ids_enabled,
                 };
-                let note_file = Some(note_file);
+                let note_meta = NoteMeta {
+                    file_rev: note_file.file_rev,
+                };
                 Ok(Self {
                     limits: *limits,
                     revs,
                     container: None,
                     order: Vec::new(),
                     cache: Vec::new(),
-                    note_file,
+                    note_meta: Some(note_meta),
                     single: Some(single),
                 })
             }
@@ -372,20 +387,14 @@ impl SourceReader {
     }
 
     /// Number of exposed notes (filtered sequence, manifest order).
+    ///
+    /// NEW-8 (documented): repeated `--note` flags select which notes are
+    /// exposed; the order stays manifest (order, then id), not flag order.
     pub fn len(&self) -> usize {
         if self.container.is_some() {
             self.order.len()
         } else {
             1
-        }
-    }
-
-    /// Cheap note identity (manifest descriptor) without parsing the payload.
-    pub fn note_id(&self, pos: usize) -> Option<String> {
-        if self.container.is_some() {
-            self.order.get(pos).map(|note| note.id.clone())
-        } else {
-            None // .note files have no note id
         }
     }
 
@@ -415,16 +424,20 @@ impl SourceReader {
     /// that never output it never pay for it).
     pub fn file_rev(&mut self) -> Result<String, UmError> {
         if let Some(container) = self.container.as_mut() {
-            container.file_rev()
-        } else {
-            let note_file = self.note_file.as_mut().expect("note file");
-            if note_file.file_rev.is_empty() {
-                // light path was taken; the file hash is needed only now
-                let refreshed = NoteFile::open(&note_file.path, &self.limits, true)?;
-                note_file.file_rev = refreshed.file_rev;
-                note_file.note_rev = refreshed.note_rev;
-            }
-            Ok(note_file.file_rev.clone())
+            // NEW-6: the hash streams through the descriptor held since open
+            // — no second open, no TOCTOU window between payload reads and
+            // the file hash.
+            return container.file_rev();
         }
+        let meta = self.note_meta.as_ref().expect("note meta");
+        // NEW-6: the re-open trap is removed — the rev was computed from the
+        // same bytes as the document (§5.4: both `.note` revs hash one read).
+        // A Skip-path consumer (search/validate) never calls this.
+        if meta.file_rev.is_empty() {
+            return Err(UmError::internal(
+                "file revision was not computed (light read path)",
+            ));
+        }
+        Ok(meta.file_rev.clone())
     }
 }
