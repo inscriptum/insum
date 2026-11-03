@@ -366,6 +366,58 @@ fn render_block(
         "horizontalRule" => {
             out.push_str("---\n");
         }
+        "table" => {
+            // markdown table: rows of cells; a cell is paragraphs — their
+            // inline text, newlines as <br>, pipes escaped
+            let rows: Vec<&BlockEntry> = children
+                .iter()
+                .filter(|row| row.node_type == "tableRow")
+                .copied()
+                .collect();
+            if rows.is_empty() {
+                out.push_str(&format!(
+                    "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->\n",
+                    block.node_type, block.pointer
+                ));
+            } else {
+                for (index, row) in rows.iter().enumerate() {
+                    let cells = children_of
+                        .get(row.pointer.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let texts: Vec<String> = cells
+                        .iter()
+                        .map(|cell| {
+                            let paragraphs: Vec<String> = children_of
+                                .get(cell.pointer.as_str())
+                                .map(|cs| {
+                                    cs.iter()
+                                        .filter(|p| p.node_type == "paragraph")
+                                        .filter_map(|p| p.text.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let text = if paragraphs.is_empty() {
+                                cell.text.clone().unwrap_or_default()
+                            } else {
+                                paragraphs.join(" ")
+                            };
+                            let text = text.replace('\n', "<br>").replace('|', "\\|");
+                            if text.trim().is_empty() {
+                                " ".to_owned()
+                            } else {
+                                text
+                            }
+                        })
+                        .collect();
+                    out.push_str(&format!("| {} |\n", texts.join(" | ")));
+                    if index == 0 {
+                        let separator: Vec<&str> = texts.iter().map(|_| "---").collect();
+                        out.push_str(&format!("| {} |\n", separator.join(" | ")));
+                    }
+                }
+            }
+        }
         _ => {
             // known-but-unrendered or unknown nodes stay explicit (spec §6.5)
             out.push_str(&format!(

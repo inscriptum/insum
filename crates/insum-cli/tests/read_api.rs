@@ -2131,3 +2131,52 @@ fn stripped_mid_note_cursor_is_rejected() {
         "phrased about the missing pointer: {message}"
     );
 }
+
+/// Annotated projection renders tables as markdown (needed for the KB's
+/// table-heavy pages, e.g. kanban boards).
+#[test]
+fn annotated_renders_tables_as_markdown() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "table", "attrs": {"data": {"rowsCount": 2, "colsCount": 2}}, "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableHeader", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "Data"}]}
+                    ]},
+                    {"type": "tableHeader", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "Issue"}]}
+                    ]}
+                ]},
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "2026-11-03"}]}
+                    ]},
+                    {"type": "tableCell", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "re|ad"}, {"type": "hardBreak"}, {"type": "text", "text": "next"}]}
+                    ]}
+                ]}
+            ]}
+        ]
+    });
+    let file = dir.path().join("table.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("| Data | Issue |"), "header row: {text}");
+    assert!(text.contains("| --- | --- |"), "separator: {text}");
+    assert!(text.contains("2026-11-03"), "data row");
+    assert!(
+        text.contains("re\\|ad<br>next"),
+        "pipes escaped, newlines as <br>: {text}"
+    );
+}

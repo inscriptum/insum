@@ -7,6 +7,8 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- Annotated reading (`read --format annotated`) renders tables as markdown —
+  kanban-style pages stay readable with cell text and escaped pipes.
 - Read API — six commands over any `.um`/`.note` knowledge base: `ls`,
   `search`, `tree`, `block get`, `read`, `validate`. Agents get a safe JSON
   view with pointers, revisions, paging and stable error codes; files are
