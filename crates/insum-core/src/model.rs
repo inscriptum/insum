@@ -1,5 +1,5 @@
 //! Data model: manifests, note documents, block traversal (spec §4.2, §4.6,
-//! and the on-disk dictionary `~/insum/.instruments/um-format.md`).
+//! and the node types observed in real on-disk Inscriptum documents).
 
 use serde_json::{Map, Value};
 
@@ -13,9 +13,9 @@ pub const INLINE_NODE_TYPES: [&str; 2] = ["text", "hardBreak"];
 /// (spec §4.4); it is reported separately, not inside `attrs`.
 pub const ID_ATTR: &str = "id";
 
-/// The node dictionary from `~/insum/.instruments/um-format.md` (observed
-/// on-disk types). Types outside it are preserved but reported as unknown
-/// (warnings) — and their text cannot be extracted (§4.7).
+/// The node dictionary observed in real on-disk Inscriptum documents.
+/// Types outside it are preserved but reported as unknown (warnings) — and
+/// their text cannot be extracted (§4.7).
 pub const KNOWN_NODE_TYPES: [&str; 27] = [
     "noteDoc",
     "doc",

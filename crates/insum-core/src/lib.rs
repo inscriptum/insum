@@ -5,8 +5,7 @@
 //! JSON Pointers, note/file revisions, limits, and the error registry
 //! (spec §5–§6, §11–§12). CLI commands must not duplicate this logic.
 //!
-//! The specification canon lives in the Inscriptum knowledge base
-//! (`DEVELOPMENT/insum.um`, pages `spec-*`), not in this repository.
+//! The public behavior contract is summarized in `docs/insum-spec.md`.
 
 pub mod canon;
 pub mod container;

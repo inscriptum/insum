@@ -1,7 +1,7 @@
 //! insum-test-utils — generation of `.um` / `.note` fixtures for insum tests.
 //!
 //! Fixtures follow the UM Document Container Format 1.0 (spec §4.2/§4.6) and
-//! the observed on-disk dictionary (`~/insum/.instruments/um-format.md`):
+//! the node types observed in real on-disk Inscriptum documents:
 //! a `.um` file is a ZIP with `manifest.json` and `notes/<ULID>.json` entries;
 //! a `.note` file is a raw ProseMirror-like `noteDoc` JSON (legacy) or an
 //! `inscriptum-note` envelope.
@@ -79,7 +79,7 @@ pub fn ulid_seq(index: u32) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// noteDoc builders (dictionary: ~/insum/.instruments/um-format.md)
+// noteDoc builders (the on-disk node-type dictionary)
 // ---------------------------------------------------------------------------
 
 /// A `text` inline node.
@@ -179,7 +179,7 @@ impl FixtureNote {
     }
 }
 
-/// Manifest JSON for the given notes, in order (spec §4.6 / um-format.md).
+/// Manifest JSON for the given notes, in order (spec §4.6).
 pub fn manifest(notes: &[FixtureNote]) -> Value {
     let entries: Vec<Value> = notes
         .iter()
