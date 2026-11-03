@@ -2180,3 +2180,57 @@ fn annotated_renders_tables_as_markdown() {
         "pipes escaped, newlines as <br>: {text}"
     );
 }
+
+/// wikiLink (inline atom, label in attrs.text) is a known node: no
+/// UNKNOWN_NODE_TYPE warning, label participates in text and search,
+/// annotated renders it as a markdown link.
+#[test]
+fn wikilink_is_known_and_searchable() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "см. "},
+                {"type": "wikiLink", "attrs": {"path": "notes/plan.um", "text": "план"}},
+                {"type": "text", "text": " развертывания"}
+            ]}
+        ]
+    });
+    let file = dir.path().join("links.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+
+    // validate: no warnings (the pre-2026-11-04 dictionary warned 1× here)
+    let validation = run_json(&["validate", file.to_string_lossy().as_ref()]);
+    let warnings = validation["files"][0]["notes"][0]["warnings"]
+        .as_array()
+        .unwrap();
+    assert!(warnings.is_empty(), "no wikiLink warnings: {warnings:?}");
+
+    // tree: label participates in the paragraph text
+    let tree = run_json(&["tree", file.to_string_lossy().as_ref()]);
+    let block = &tree["notes"][0]["blocks"][0];
+    assert_eq!(block["text"], "см. план развертывания");
+    assert_eq!(block.get("text_incomplete"), None);
+
+    // search: the label is searchable, completeness holds
+    let hits = run_json(&["search", "-F", "план", file.to_string_lossy().as_ref()]);
+    assert_eq!(hits["complete"], json_true());
+    assert_eq!(hits["matches"][0]["text"], "см. план развертывания");
+
+    // annotated: markdown link with label and target
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let body = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        body.contains("[план](notes/plan.um)"),
+        "link projection: {body}"
+    );
+}

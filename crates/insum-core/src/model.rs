@@ -7,7 +7,9 @@ use crate::error::{ErrorCode, UmError};
 
 /// Node types whose content is inline (text-level), per the observed
 /// dictionary. Every other node found in a `content` array is a block.
-pub const INLINE_NODE_TYPES: [&str; 2] = ["text", "hardBreak"];
+/// `wikiLink` is an inline ATOM: no content, the displayed label lives in
+/// `attrs.text` (um-format dictionary, plugin 0.13).
+pub const INLINE_NODE_TYPES: [&str; 3] = ["text", "hardBreak", "wikiLink"];
 
 /// Reserved attr that holds the block ID once migration/annotation happened
 /// (spec §4.4); it is reported separately, not inside `attrs`.
@@ -16,7 +18,7 @@ pub const ID_ATTR: &str = "id";
 /// The node dictionary observed in real on-disk Inscriptum documents.
 /// Types outside it are preserved but reported as unknown (warnings) — and
 /// their text cannot be extracted (§4.7).
-pub const KNOWN_NODE_TYPES: [&str; 27] = [
+pub const KNOWN_NODE_TYPES: [&str; 28] = [
     "noteDoc",
     "doc",
     "noteTitle",
@@ -28,6 +30,7 @@ pub const KNOWN_NODE_TYPES: [&str; 27] = [
     "paragraph",
     "text",
     "hardBreak",
+    "wikiLink",
     "bulletList",
     "orderedList",
     "taskList",
@@ -445,6 +448,17 @@ fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
                 None => return (None, true),
             },
             "hardBreak" => text.push('\n'),
+            // the wiki link displays as its label: the label IS the visible
+            // text of the paragraph (um-format dictionary, plugin 0.13)
+            "wikiLink" => match child
+                .get("attrs")
+                .and_then(|attrs| attrs.get("text"))
+                .and_then(Value::as_str)
+            {
+                Some(label) => text.push_str(label),
+                // no label: the display text is unknown — withhold
+                None => return (None, true),
+            },
             // a known structural child: this node is a container and has no
             // text of its own (normal, not a loss)
             t if KNOWN_NODE_TYPES.contains(&t) => return (None, false),
@@ -572,6 +586,37 @@ mod tests {
         assert!(blocks[2].text.is_none());
         // paragraph keeps its full inline text including marked parts
         assert_eq!(blocks[4].text.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn wikilink_label_is_visible_text() {
+        let doc = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "см. "},
+                    {"type": "wikiLink", "attrs": {"path": "notes/plan.um", "text": "план"}},
+                    {"type": "text", "text": " и дальше"}
+                ]}
+            ]
+        });
+        let traversal = traverse(&doc, None, 128);
+        assert!(!traversal.unknown_inline, "wikiLink is a known inline atom");
+        let paragraph = &traversal.blocks[0];
+        assert_eq!(paragraph.text.as_deref(), Some("см. план и дальше"));
+        // a wikiLink without a label withholds the paragraph text
+        let broken = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "see "},
+                    {"type": "wikiLink", "attrs": {"path": "x"}}
+                ]}
+            ]
+        });
+        let t2 = traverse(&broken, None, 128);
+        assert!(t2.unknown_inline);
+        assert_eq!(t2.blocks[0].text, None);
     }
 
     #[test]

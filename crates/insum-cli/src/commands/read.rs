@@ -469,6 +469,19 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
                     out.push_str(&wrapped);
                 }
                 "hardBreak" => out.push('\n'),
+                "wikiLink" => {
+                    // renders as its label; keep the link target explicit
+                    let attrs = child.get("attrs");
+                    let label = attrs
+                        .and_then(|a| a.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let path = attrs
+                        .and_then(|a| a.get("path"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    out.push_str(&format!("[{label}]({path})"));
+                }
                 other => {
                     if !INLINE_NODE_TYPES.contains(&other) {
                         out.push_str(&format!("<!-- um:unrendered-inline type=\"{other}\" -->"));
