@@ -28,6 +28,11 @@ until then this document is the reference for consumers (agents and scripts).
 | `insum read <file> [--note <id>] [--format json\|annotated]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors |
 | `insum validate [--strict] [--hidden] <paths>...` | Structural validation (`validation_level: "structural"`) |
 
+`--note <value>` resolves the value as the note id (ULID) first, then as an
+exact note title; a title matching several notes fails with their ids listed
+(no silent first match), and every response still carries the canonical ULID
+`note_id` — cursors and future write CAS remain id-bound.
+
 ## Output conventions
 
 - Success: exactly one JSON document on stdout, trailing newline; every

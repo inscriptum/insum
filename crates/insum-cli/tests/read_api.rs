@@ -2234,3 +2234,90 @@ fn wikilink_is_known_and_searchable() {
         "link projection: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Agent feedback read-note-title-lookup — --note resolves id or exact title
+// ---------------------------------------------------------------------------
+
+#[test]
+fn note_lookup_accepts_exact_title() {
+    let corpus = Corpus::new();
+    let file = corpus.path("regular.um");
+
+    // read: title resolves to the canonical ULID note_id
+    let read = run_json(&["read", "--note", "Развёртывание", &file]);
+    assert_eq!(
+        read["notes"][0]["note_id"],
+        Value::String(fixtures::ulid_seq(1))
+    );
+    // tree: the same resolver
+    let tree = run_json(&[
+        "tree",
+        "--note",
+        "Инструкция по deployment приложения",
+        &file,
+    ]);
+    assert_eq!(
+        tree["notes"][0]["note_id"],
+        Value::String(fixtures::ulid_seq(2))
+    );
+    // ids still win (precedence: exact ULID first)
+    let by_id = run_json(&["read", "--note", &fixtures::ulid_seq(1).to_string(), &file]);
+    assert_eq!(
+        by_id["notes"][0]["note_id"],
+        Value::String(fixtures::ulid_seq(1))
+    );
+}
+
+#[test]
+fn ambiguous_title_fails_with_matching_ids() {
+    let dir = TempDir::new().expect("tempdir");
+    let notes = [
+        fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(1),
+            "Same Title",
+            &[fixtures::paragraph(&[fixtures::text("first")])],
+        ),
+        fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(2),
+            "Same Title",
+            &[fixtures::paragraph(&[fixtures::text("second")])],
+        ),
+    ];
+    let file = dir.path().join("dupe.um");
+    fixtures::write_um(&file, &notes).expect("fixture");
+
+    let out = insum()
+        .args([
+            "read",
+            "--note",
+            "Same Title",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "ambiguous title exits 3");
+    let error = stderr_json(&out);
+    assert_eq!(error["error"]["code"], "NOTE_NOT_FOUND");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("ambiguous"), "{message}");
+    assert!(
+        message.contains(&fixtures::ulid_seq(1)) && message.contains(&fixtures::ulid_seq(2)),
+        "both matching ids listed: {message}"
+    );
+}
+
+#[test]
+fn note_miss_hints_how_to_list_notes() {
+    let corpus = Corpus::new();
+    let out = insum()
+        .args(["read", "--note", "no-such-note", &corpus.path("regular.um")])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let error = stderr_json(&out);
+    assert_eq!(error["error"]["code"], "NOTE_NOT_FOUND");
+    let hint = error["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("insum ls"), "hint points to ls: {hint}");
+    assert!(hint.contains("title"), "hint mentions titles: {hint}");
+}

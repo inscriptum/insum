@@ -179,8 +179,52 @@ pub enum Revs {
     Skip,
 }
 
+/// Resolve a `--note` value to a manifest note (agent feedback
+/// read-note-title-lookup): exact id (ULID) first, then an exact title
+/// match. An ambiguous title fails with the matching ids — never a silent
+/// first match; a miss explains what `--note` accepts. The response always
+/// carries the canonical ULID id, so cursors and the future write CAS stay
+/// id-bound.
+fn resolve_note<'a>(
+    container: &'a UmContainer,
+    value: &str,
+) -> Result<&'a NoteDescriptor, UmError> {
+    if let Ok(descriptor) = container.find_note(value) {
+        return Ok(descriptor);
+    }
+    let matches: Vec<&NoteDescriptor> = container
+        .notes_in_order()
+        .into_iter()
+        .filter(|note| note.title.as_deref() == Some(value))
+        .collect();
+    match matches.as_slice() {
+        [descriptor] => Ok(descriptor),
+        [] => Err(UmError::new(
+            ErrorCode::NoteNotFound,
+            format!("note {value:?} is not in the manifest"),
+        )
+        .with_hint(
+            "`--note` takes a note id (ULID) or an exact note title; list notes with `insum ls <file>`",
+        )),
+        many => Err(UmError::new(
+            ErrorCode::NoteNotFound,
+            format!(
+                "note title {value:?} is ambiguous: {} notes match (ids: {})",
+                many.len(),
+                many
+                    .iter()
+                    .map(|note| note.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .with_hint("Pass the note id (ULID) instead of the title.")),
+    }
+}
+
 /// Open a `.um`/`.note` path and read the requested notes in manifest order.
-/// `filters` selects notes by id (repeatable `--note`); `None` reads all.
+/// `filters` selects notes by id or exact title (repeatable `--note`); `None`
+/// reads all.
 ///
 /// NEW-8 (documented): repeated `--note` flags select WHICH notes are read,
 /// but the output order always follows the manifest (order, then id) — not
@@ -198,7 +242,7 @@ pub fn read_notes(
             if let Some(filters) = filters {
                 let mut views = Vec::with_capacity(filters.len());
                 for filter in filters {
-                    let descriptor = container.find_note(filter)?.clone();
+                    let descriptor = resolve_note(&container, filter)?.clone();
                     views.push(read_view(&mut container, &descriptor, limits, revs)?);
                 }
                 return Ok(SourceRead { views });
@@ -324,13 +368,16 @@ impl SourceReader {
                 let mut order: Vec<NoteDescriptor> =
                     container.notes_in_order().into_iter().cloned().collect();
                 if let Some(filters) = filters {
-                    // manifest order preserved (§5.3); unknown ids are errors
+                    // manifest order preserved (§5.3); each filter resolves by
+                    // id or exact title (NEW-8: flag order does not matter)
+                    let mut resolved: Vec<String> = Vec::with_capacity(filters.len());
                     for filter in filters {
-                        if !order.iter().any(|note| &note.id == filter) {
-                            return Err(container.find_note(filter).unwrap_err());
+                        let id = resolve_note(&container, filter)?.id.clone();
+                        if !resolved.contains(&id) {
+                            resolved.push(id);
                         }
                     }
-                    order.retain(|note| filters.contains(&note.id));
+                    order.retain(|note| resolved.contains(&note.id));
                 }
                 let cache: Vec<Option<NoteView>> = (0..order.len()).map(|_| None).collect();
                 Ok(Self {
