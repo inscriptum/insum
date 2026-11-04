@@ -97,7 +97,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         ) {
             Ok(source) => source.views,
             Err(err) => {
-                // S-01: search is best-effort — ANY per-file error lands in
+                // Search is best-effort — ANY per-file error lands in
                 // skipped and lowers complete (§11); one broken file must not
                 // kill the whole run
                 if err.code == ErrorCode::NoteNotFound {
@@ -125,7 +125,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                 let Some(text) = &block.text else {
                     continue;
                 };
-                // K-10: the §6.4 text window is defined around the FIRST
+                // The §6.4 text window is defined around the FIRST
                 // match of the block; all hits in this block share it
                 let mut block_window: Option<String> = None;
                 for found in regex.find_iter(text) {
@@ -148,7 +148,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                         "context": context_blocks(blocks, block_index, context),
                     });
                     // budget: whole matches only, no silent truncation —
-                    // the first match is subject to the budget too (S-03)
+                    // the first match is subject to the budget too
                     let hit_size = serde_json::to_string(&hit).map_or(256, |s| s.len() + 1);
                     if matches_size + hit_size > budget {
                         truncated = true;
@@ -161,7 +161,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         }
     }
 
-    // NOTE_NOT_FOUND is only an error when the note exists nowhere (S-01)
+    // NOTE_NOT_FOUND is only an error when the note exists nowhere
     if let Some(note_id) = note
         && matches.is_empty()
         && not_found_files > 0
@@ -174,7 +174,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         ));
     }
 
-    // K-05: notes with unknown inline types cannot prove the absence of data
+    // Notes with unknown inline types cannot prove the absence of data
     let complete = !truncated && skipped.is_empty() && unknown_inline_files.is_empty();
     let mut response = json!({
         "api_version": 1,
@@ -232,7 +232,7 @@ fn context_blocks(blocks: &[insum_core::BlockEntry], index: usize, context: usiz
                 "type": neighbor.node_type,
             });
             if let Some(text) = &neighbor.text {
-                // S-03: neighbors get a window too — a 5MB sibling paragraph
+                // Neighbors get a window too — a 5MB sibling paragraph
                 // must not leak into the response whole
                 let chars: Vec<char> = text.chars().collect();
                 if chars.len() > DEFAULT_WINDOW {

@@ -21,7 +21,7 @@ pub struct Cursor {
     pub text_limit: usize,
     /// Pointer of the first block of the resumed page (when the resume
     /// starts inside a note). Detects tampering with the block position
-    /// (review S-04): a mismatch is CURSOR_STALE, not a silent skip.
+    /// A mismatch is CURSOR_STALE, not a silent skip.
     pub next_pointer: Option<String>,
 }
 
@@ -205,7 +205,7 @@ impl Cursor {
                 "cursor was issued for another note".to_owned(),
             ));
         }
-        // NEW-5: the position/pointer invariant — mid-note (block_index > 0)
+        // The position/pointer invariant — mid-note (block_index > 0)
         // must carry its pointer anchor, boundary must not. Without it,
         // stripping np from a mid-note token deactivates both guards at once.
         match (self.block_index > 0, &self.next_pointer) {
@@ -221,7 +221,7 @@ impl Cursor {
             }
             (true, Some(_)) | (false, None) => {}
         }
-        // NEW-4: the revision comparison is unconditional — boundary cursors
+        // The revision comparison is unconditional — boundary cursors
         // bind to the target note's revision, so a rewrite between pages is
         // CURSOR_STALE on every resume shape (§6.2, §15.1 №7)
         if self.note_rev != note_rev {

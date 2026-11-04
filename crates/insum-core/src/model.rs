@@ -210,7 +210,7 @@ pub struct NoteDoc {
 
 impl NoteDoc {
     /// Consume the parsed payload (ownership — no deep copies on the read
-    /// path, review P-03). Envelope version is checked (review K-11).
+    /// path). Envelope version is checked.
     pub fn parse(payload: Value) -> Result<Self, UmError> {
         let envelope_format = payload
             .get("format")

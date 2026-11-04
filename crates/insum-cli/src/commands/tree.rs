@@ -12,7 +12,7 @@ use crate::support::{NoteView, Revs, SourceReader, render_path};
 
 /// Serialized `attrs` are capped: a hostile document can carry megabytes in
 /// attributes, and the response budget must not be broken by one entry
-/// (review S-02).
+///.
 const ATTRS_CAP: usize = 2048;
 
 pub fn run(
@@ -30,17 +30,17 @@ pub fn run(
         None => None,
     };
 
-    // NEW-1: the exposed sequence is NOT narrowed by the cursor — pagination
+    // The exposed sequence is NOT narrowed by the cursor — pagination
     // must reach every note (§6.2). The reader parses payloads lazily, so the
-    // P-02 win (a page only pays for the notes it emits) is preserved.
+    // lazy-read win (a page only pays for the notes it emits) is preserved.
     let filters = if note.is_empty() { None } else { Some(note) };
     let mut reader = SourceReader::open(path, filters, limits, Revs::Compute)?;
 
-    // NEW-5: mid-note is determined by the POSITION (block_index > 0), never
+    // Mid-note is determined by the POSITION (block_index > 0), never
     // by the optional np field — a stripped np cannot deactivate the guards.
     // validate() enforces the bi⇔np invariant and the unconditional rev
-    // binding (NEW-4) after the pinned note is read; paginate_note keeps the
-    // pointer match against the resumed position (S-04).
+    // binding after the pinned note is read; paginate_note keeps the
+    // pointer match against the resumed position.
     let resume_pointer = cursor.as_ref().and_then(|c| c.next_pointer.clone());
     let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
     let budget = limits.output_bytes(max_bytes);
@@ -51,9 +51,9 @@ pub fn run(
         ));
     }
 
-    // P-01: the budget is per response. Page shape: the first note may be
+    // The budget is per response. Page shape: the first note may be
     // partial (mid-note cursor); every following note is emitted whole or the
-    // page stops on the note boundary with a cursor to it (NEW-1: the walk
+    // page stops on the note boundary with a cursor to it (the walk
     // reaches every note instead of silently ending).
     let mut used: usize = 256; // envelope overhead estimate
     let mut notes_out = Vec::new();
@@ -63,7 +63,7 @@ pub fn run(
     if pos < reader.len() {
         let view = reader.read_at(pos)?;
         if let Some(cursor) = &cursor {
-            // NEW-4: rev binding is unconditional — the pinned/target note is
+            // Rev binding is unconditional — the pinned/target note is
             // read here anyway, so boundary resumes check it too
             cursor.validate(
                 "tree",
@@ -110,7 +110,7 @@ pub fn run(
             continue;
         }
         // boundary cursor: continue with this note on the next page.
-        // NEW-4: it binds to the TARGET note's revision — the note is already
+        // It binds to the TARGET note's revision — the note is already
         // parsed for the size check, so no extra work is needed.
         let cursor = Cursor::tree(
             rendered.clone(),
@@ -171,7 +171,7 @@ fn paginate_note(
             "cursor block position is past the end of the note",
         ));
     }
-    // S-04: the pointer recorded with the cursor must match the block at the
+    // The pointer recorded with the cursor must match the block at the
     // resumed position — tampering is stale, not a silent skip
     if let Some(expected) = resume_pointer
         && start_block > 0
@@ -232,7 +232,7 @@ fn paginate_note(
         "next_cursor": next_cursor,
     });
     if traversal.unknown_inline {
-        // K-05: text of unknown inline nodes is withheld — no silent losses
+        // Text of unknown inline nodes is withheld — no silent losses
         note_json["warnings"] = json!([{
             "code": "UNKNOWN_NODE_TYPE",
             "message": "some blocks contain unknown inline node types; their text is not extracted",
@@ -314,7 +314,7 @@ fn block_json(block: &BlockEntry, text_limit: usize) -> Value {
 }
 
 /// Copy attrs key by key until the serialized size hits the cap; the marker
-/// `attrs_truncated` rides on the block entry (review S-02).
+/// `attrs_truncated` rides on the block entry.
 fn capped_attrs(block: &BlockEntry) -> (Value, bool) {
     let Value::Object(attrs) = &block.attrs else {
         return (block.attrs.clone(), false);

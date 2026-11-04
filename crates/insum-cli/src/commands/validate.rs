@@ -99,7 +99,7 @@ fn validate_file(path: &Path, strict: bool, limits: &Limits) -> Result<Value, Um
     let mut file_valid = true;
 
     for view in views {
-        // validation logic lives in insum-core (§14, review K-13); the CLI
+        // validation logic lives in insum-core (§14); the CLI
         // only shapes the output
         let validation = insum_core::validate_note_doc(&view.doc, view.block_ids_enabled, limits)?;
         if !validation.valid() {

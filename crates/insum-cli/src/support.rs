@@ -82,7 +82,7 @@ pub fn collect_files(
     let mut files = Vec::new();
     let mut walk_errors = Vec::new();
     for path in paths {
-        // follow symlinks for the argument itself (ls parity, review C-04)
+        // follow symlinks for the argument itself (ls parity)
         let metadata = std::fs::metadata(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 UmError::new(
@@ -116,7 +116,7 @@ pub fn collect_files(
                         let entry_path = entry.path();
                         // the skip rules compare against the WALK root (the
                         // canonicalized one): the argument itself is user-
-                        // provided and never filtered (review C-04 fallout —
+                        // provided and never filtered (fallout —
                         // /var → /private/var and hidden temp dirs otherwise
                         // filtered the whole corpus)
                         if hidden_below(&walk_root, entry_path, hidden) {
@@ -170,7 +170,7 @@ pub struct SourceRead {
     pub views: Vec<NoteView>,
 }
 
-/// Whether to compute note revisions while reading (review P-05: search
+/// Whether to compute note revisions while reading (search
 /// matches text and never uses revisions — hashing every payload is pure
 /// overhead there).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -179,8 +179,8 @@ pub enum Revs {
     Skip,
 }
 
-/// Resolve a `--note` value to a manifest note (agent feedback
-/// read-note-title-lookup): exact id (ULID) first, then an exact title
+/// Resolve a `--note` value to a manifest note (agent feedback): exact id
+/// (ULID) first, then an exact title
 /// match. An ambiguous title fails with the matching ids — never a silent
 /// first match; a miss explains what `--note` accepts. The response always
 /// carries the canonical ULID id, so cursors and the future write CAS stay
@@ -226,7 +226,7 @@ fn resolve_note<'a>(
 /// `filters` selects notes by id or exact title (repeatable `--note`); `None`
 /// reads all.
 ///
-/// NEW-8 (documented): repeated `--note` flags select WHICH notes are read,
+/// Documented: repeated `--note` flags select WHICH notes are read,
 /// but the output order always follows the manifest (order, then id) — not
 /// the order of the flags. That keeps every response deterministic per §3.11
 /// regardless of argument order.
@@ -287,7 +287,7 @@ pub fn read_notes(
 }
 
 /// Read one note into a view; revisions are computed in the same
-/// decompression pass when requested (review P-02/P-05).
+/// decompression pass when requested.
 fn read_view(
     container: &mut UmContainer,
     descriptor: &NoteDescriptor,
@@ -304,7 +304,7 @@ fn read_view(
             ))
         }
         Revs::Skip => {
-            // P-05: the light path — parse only, no SHA-256/canonical_json
+            // The light path — parse only, no SHA-256/canonical_json
             let note_doc = container.read_note(descriptor, limits)?;
             Ok(NoteView::from_descriptor(
                 descriptor,
@@ -336,15 +336,14 @@ pub enum Output {
 
 /// Lazy note reader over one document path: the container/manifest opens
 /// once, payloads are parsed on demand — a pagination page only pays for the
-/// notes it actually emits (review P-02) while multi-note walks stay
-/// complete (review NEW-1/NEW-2).
+/// notes it actually emits while multi-note walks stay complete.
 pub struct SourceReader {
     limits: Limits,
     revs: Revs,
     container: Option<UmContainer>,
     order: Vec<NoteDescriptor>,
     cache: Vec<Option<NoteView>>,
-    /// NEW-7: light metadata only — the document lives exclusively in
+    /// Light metadata only — the document lives exclusively in
     /// `single`, never cloned.
     note_meta: Option<NoteMeta>,
     single: Option<NoteView>,
@@ -369,7 +368,7 @@ impl SourceReader {
                     container.notes_in_order().into_iter().cloned().collect();
                 if let Some(filters) = filters {
                     // manifest order preserved (§5.3); each filter resolves by
-                    // id or exact title (NEW-8: flag order does not matter)
+                    // id or exact title (flag order does not matter)
                     let mut resolved: Vec<String> = Vec::with_capacity(filters.len());
                     for filter in filters {
                         let id = resolve_note(&container, filter)?.id.clone();
@@ -397,7 +396,7 @@ impl SourceReader {
                     ));
                 }
                 // single note: eager open is the lazy path; the document is
-                // MOVED into `single` (NEW-7: no second copy)
+                // MOVED into `single` (no second copy)
                 let note_file = NoteFile::open(path, limits, revs == Revs::Compute)?;
                 let features = note_file.note.features.clone();
                 let block_ids_enabled = features
@@ -435,7 +434,7 @@ impl SourceReader {
 
     /// Number of exposed notes (filtered sequence, manifest order).
     ///
-    /// NEW-8 (documented): repeated `--note` flags select which notes are
+    /// Documented: repeated `--note` flags select which notes are
     /// exposed; the order stays manifest (order, then id), not flag order.
     pub fn len(&self) -> usize {
         if self.container.is_some() {
@@ -467,17 +466,17 @@ impl SourceReader {
         }
     }
 
-    /// The file-level revision, computed on demand (review P-05: consumers
+    /// The file-level revision, computed on demand (consumers
     /// that never output it never pay for it).
     pub fn file_rev(&mut self) -> Result<String, UmError> {
         if let Some(container) = self.container.as_mut() {
-            // NEW-6: the hash streams through the descriptor held since open
+            // The hash streams through the descriptor held since open
             // — no second open, no TOCTOU window between payload reads and
             // the file hash.
             return container.file_rev();
         }
         let meta = self.note_meta.as_ref().expect("note meta");
-        // NEW-6: the re-open trap is removed — the rev was computed from the
+        // The re-open trap is removed — the rev was computed from the
         // same bytes as the document (§5.4: both `.note` revs hash one read).
         // A Skip-path consumer (search/validate) never calls this.
         if meta.file_rev.is_empty() {

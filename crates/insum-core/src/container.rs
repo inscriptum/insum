@@ -20,7 +20,7 @@ use crate::model::{Manifest, NoteDescriptor, NoteDoc};
 /// central directory + manifest without unpacking payload).
 pub struct UmContainer {
     archive: ZipArchive<File>,
-    /// NEW-6: held open since container open — `file_rev` streams through
+    /// Held open since container open — `file_rev` streams through
     /// THIS descriptor (seek 0 + read), never re-opens the path, so a
     /// concurrent file replacement cannot mix generations between payload
     /// reads and the file hash.
@@ -28,7 +28,7 @@ pub struct UmContainer {
     /// Kept for error messages only (never re-opened).
     path: PathBuf,
     pub manifest: Manifest,
-    /// Computed on demand (review P-05: consumers that never output it never
+    /// Computed on demand (consumers that never output it never
     /// pay for the full-file hash).
     file_rev_cache: Option<String>,
     pub bytes: u64,
@@ -75,7 +75,7 @@ impl UmContainer {
     }
 
     /// `file_rev` — SHA-256 of all file bytes (spec §5.4), computed on first
-    /// request through the descriptor held since open (NEW-6: no re-open,
+    /// request through the descriptor held since open (no re-open,
     /// seek(0) + read), then cached.
     pub fn file_rev(&mut self) -> Result<String, UmError> {
         if self.file_rev_cache.is_none() {
@@ -124,7 +124,7 @@ impl UmContainer {
 
     /// Read and parse one note payload. The entry size is checked against
     /// the limit before decompression (spec §12). No revision is computed —
-    /// the light path for consumers that never output revisions (review P-05).
+    /// the light path for consumers that never output revisions.
     pub fn read_note(
         &mut self,
         note: &NoteDescriptor,
@@ -441,7 +441,7 @@ fn path_error(path: &Path, err: std::io::Error) -> UmError {
 pub struct NoteFile {
     pub note: NoteDoc,
     /// Envelope metadata (spec §4.6) — extracted point-wise so the whole
-    /// payload is never cloned on the read path (review P-03).
+    /// payload is never cloned on the read path.
     pub envelope_format: Option<String>,
     pub features: Option<Value>,
     pub schema: Option<Value>,
@@ -459,7 +459,7 @@ impl NoteFile {
         let raw = read_bounded(path, limits)?;
         let bytes = raw.len() as u64;
         // §5.4: for .note both revisions hash the whole file — one digest
-        // serves both; skipped entirely on the light path (review P-05)
+        // serves both; skipped entirely on the light path
         let (file_rev, note_rev) = if with_revs {
             let digest = format_rev(sha256_hex(&raw));
             (digest.clone(), digest)
@@ -473,7 +473,7 @@ impl NoteFile {
             )
         })?;
         let value = parse_json_limited(&text, limits.max_depth, ErrorCode::NoteJsonInvalid)?;
-        // envelope metadata extracted point-wise (no whole-payload clone, P-03)
+        // envelope metadata extracted point-wise (no whole-payload clone)
         let envelope_format = value
             .get("format")
             .and_then(Value::as_str)

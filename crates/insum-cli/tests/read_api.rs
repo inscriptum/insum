@@ -296,7 +296,7 @@ fn pagination_resumes_and_detects_stale_revisions() {
             // dedup key is (note_id, pointer)
             let nid = page_note["note_id"].as_str().unwrap_or("").to_owned();
             for block in page_note["blocks"].as_array().unwrap() {
-                // T-13: strict extraction — a broken entry must fail loudly
+                // Strict extraction — a broken entry must fail loudly
                 let pointer = block["pointer"]
                     .as_str()
                     .expect("block carries a pointer")
@@ -309,7 +309,7 @@ fn pagination_resumes_and_detects_stale_revisions() {
         let page_note = &page["notes"][0];
         // termination = no next_cursor; note.complete describes the note
         // itself (a boundary page ends with complete:true + a cursor to the
-        // next note — NEW-1 semantics)
+        // next note — boundary-cursor semantics)
         match page_note["next_cursor"].as_str() {
             Some(next) => cursor = next.to_owned(),
             None => {
@@ -320,7 +320,7 @@ fn pagination_resumes_and_detects_stale_revisions() {
     }
     assert!(complete, "pagination terminates");
 
-    // T-01: the note_rev branch specifically — rewrite the SAME path with
+    // The note_rev branch specifically — rewrite the SAME path with
     // the SAME note id but different content, so only note_rev diverges
     let note_id = note["note_id"].as_str().unwrap().to_owned();
     let notes = [fixtures::FixtureNote::plain_page(
@@ -1053,7 +1053,7 @@ fn search_in_a_note_file_and_directory_work() {
 }
 
 // ---------------------------------------------------------------------------
-// Review round 2 — contract fixes (K-01..K-06, S-01..S-03, C-04, T-02/T-03)
+// Contract fixes: revisions, structural validation, best-effort search, budgets, symlinks
 // ---------------------------------------------------------------------------
 
 /// §8.6 formula computed INDEPENDENTLY in the test (raw payload bytes from
@@ -1068,7 +1068,7 @@ fn note_rev_matches_spec_8_6_formula() {
     let cli_rev = tree["notes"][0]["note_rev"].as_str().unwrap();
     assert!(
         cli_rev.starts_with("sha256:"),
-        "wire format is sha256:<hex> (K-02)"
+        "wire format is sha256:<hex>"
     );
 
     // raw payload bytes straight from the archive
@@ -1155,7 +1155,7 @@ fn revisions_carry_the_sha256_prefix() {
     assert!(note_ls["note_rev"].as_str().unwrap().starts_with("sha256:"));
 }
 
-/// §10.1 structural checks: attrs/text/content/marks shape errors (K-04).
+/// §10.1 structural checks: attrs/text/content/marks shape errors.
 #[test]
 fn validate_catches_broken_structures() {
     let dir = TempDir::new().expect("tempdir");
@@ -1241,7 +1241,7 @@ fn annotated_covers_nested_blocks_and_marks() {
         .output()
         .unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
-    // nested anchors: the list item and its paragraph are addressable (K-06)
+    // nested anchors: the list item and its paragraph are addressable
     assert!(
         text.contains("<!-- um:pointer=\"/content/3/content/0\" -->"),
         "listItem anchor present"
@@ -1252,7 +1252,7 @@ fn annotated_covers_nested_blocks_and_marks() {
     );
     assert!(text.contains("- Установить зависимости"));
 
-    // marks (K-08): bold projects to **
+    // marks: bold projects to **
     let dir = TempDir::new().expect("tempdir");
     let doc = serde_json::json!({
         "type": "noteDoc",
@@ -1283,7 +1283,7 @@ fn annotated_covers_nested_blocks_and_marks() {
     );
 }
 
-/// §11: one broken file must not kill search (S-01) — best-effort with
+/// One broken file must not kill search — best-effort with
 /// skipped + complete:false; NOTE_NOT_FOUND only when the note is nowhere.
 #[test]
 fn search_is_best_effort_over_broken_files() {
@@ -1325,7 +1325,7 @@ fn search_is_best_effort_over_broken_files() {
     assert_eq!(stderr_json(&output)["error"]["code"], "NOTE_NOT_FOUND");
 }
 
-/// §6.2/§5.5: UM_MAX_OUTPUT_BYTES bounds the WHOLE response (P-01).
+/// UM_MAX_OUTPUT_BYTES bounds the WHOLE response.
 #[test]
 fn tree_budget_covers_the_whole_response() {
     let corpus = Corpus::new();
@@ -1347,7 +1347,7 @@ fn tree_budget_covers_the_whole_response() {
     );
 }
 
-/// Hostile attrs must not break the budget (S-02).
+/// Hostile attrs must not break the budget.
 #[test]
 fn tree_caps_hostile_attrs() {
     let dir = TempDir::new().expect("tempdir");
@@ -1372,7 +1372,7 @@ fn tree_caps_hostile_attrs() {
     assert_eq!(block["attrs_truncated"], Value::Bool(true));
 }
 
-/// --context neighbors get windows; the budget includes the first match (S-03).
+/// --context neighbors get windows; the budget includes the first match.
 #[test]
 fn search_context_is_windowed_and_budgeted() {
     let dir = TempDir::new().expect("tempdir");
@@ -1411,7 +1411,7 @@ fn search_context_is_windowed_and_budgeted() {
     );
 }
 
-/// Explicit symlinked directories are followed (C-04): no silent empty sweep.
+/// Explicit symlinked directories are followed: no silent empty sweep.
 #[test]
 fn search_follows_symlinked_directories() {
     let corpus = Corpus::new();
@@ -1429,7 +1429,7 @@ fn search_follows_symlinked_directories() {
 }
 
 /// №3/№4 proven black-box: ls reads manifest only; payload corruption does
-/// not affect ls but fails tree (T-02).
+/// not affect ls but fails tree.
 #[test]
 fn ls_does_not_decompress_payload() {
     let dir = TempDir::new().expect("tempdir");
@@ -1464,7 +1464,7 @@ fn ls_does_not_decompress_payload() {
     assert_eq!(stderr_json(&tree)["error"]["code"], "NOTE_JSON_INVALID");
 }
 
-/// Hostile inputs hit LIMIT_EXCEEDED, not crashes (T-03).
+/// Hostile inputs hit LIMIT_EXCEEDED, not crashes.
 #[test]
 fn hostile_limits_are_enforced() {
     // deep JSON nesting in a payload → exit 5, not a stack overflow
@@ -1518,7 +1518,7 @@ fn hostile_limits_are_enforced() {
     assert!(hits["matches"].as_array().unwrap().len() <= 2);
 }
 
-/// Unsafe archive entry names are rejected (§12, T-04).
+/// Unsafe archive entry names are rejected (§12).
 #[test]
 fn unsafe_zip_entry_names_are_rejected() {
     let dir = TempDir::new().expect("tempdir");
@@ -1542,7 +1542,7 @@ fn unsafe_zip_entry_names_are_rejected() {
     );
 }
 
-/// read / block get work on .note files (T-07).
+/// read / block get work on .note files.
 #[test]
 fn read_and_block_get_on_note_files() {
     let corpus = Corpus::new();
@@ -1559,7 +1559,7 @@ fn read_and_block_get_on_note_files() {
     assert_eq!(out.status.code(), Some(2));
 }
 
-/// --depth truncates levels and marks parents (T-08).
+/// --depth truncates levels and marks parents.
 #[test]
 fn tree_depth_truncates_and_marks() {
     let corpus = Corpus::new();
@@ -1579,7 +1579,7 @@ fn tree_depth_truncates_and_marks() {
     assert!(!cut.is_empty(), "parents at the cut are marked");
 }
 
-/// C-08: read --format json rejects --cursor instead of ignoring it.
+/// read --format json rejects --cursor instead of ignoring it.
 #[test]
 fn read_json_rejects_cursor() {
     let corpus = Corpus::new();
@@ -1591,7 +1591,7 @@ fn read_json_rejects_cursor() {
 }
 
 // ---------------------------------------------------------------------------
-// Delta round 2 — mandatory gate: multi-note pagination (NEW-1/NEW-2)
+// Mandatory regression gate: multi-note pagination
 // ---------------------------------------------------------------------------
 
 /// A 4-note container with sizable notes: forces mid-note pages AND note
@@ -1647,7 +1647,7 @@ fn decode_cursor_json(token: &str) -> Value {
     serde_json::from_slice(&bytes).expect("cursor is base64url JSON")
 }
 
-/// Mandatory regression gate (review NEW-1): a full tree pagination walk of
+/// Mandatory regression gate: a full tree pagination walk of
 /// a multi-note container reaches EVERY note, emits each block exactly once,
 /// resumes cleanly from note-boundary cursors, and terminates complete.
 #[test]
@@ -1718,14 +1718,14 @@ fn tree_pagination_walks_all_notes_of_multi_note_container() {
     }
     assert!(
         boundary_resumes >= 1,
-        "walk exercises note-boundary cursors (NEW-1 flavor 2)"
+        "walk exercises note-boundary cursors"
     );
     assert!(mid_note_resumes >= 1, "walk exercises mid-note cursors");
     // full coverage: 4 notes × 8 blocks = 32 blocks
     assert_eq!(seen_keys.len(), 32);
 }
 
-/// Mandatory regression gate (review NEW-2): annotated pagination covers all
+/// Mandatory regression gate: annotated pagination covers all
 /// notes, carries um:incomplete markers including at note boundaries, and
 /// the final page ends without a marker.
 #[test]
@@ -1796,11 +1796,11 @@ fn annotated_pagination_walks_all_notes_and_marks_boundaries() {
     }
     assert!(
         boundary_markers >= 1,
-        "um:incomplete appears at note boundaries (NEW-2)"
+        "um:incomplete appears at note boundaries"
     );
 }
 
-/// P-02 preserved: a resume page parses only the pinned note — observable as
+/// A resume page parses only the pinned note — observable as
 /// a page whose cost is dominated by one note even in a big container. The
 /// behavioral proof: the resume emits the pinned note's blocks and continues.
 #[test]
@@ -1837,7 +1837,7 @@ fn tree_resume_page_reads_beyond_pinned_note() {
     );
 }
 
-/// C-10: a deep manifest fails as LIMIT_EXCEEDED (exit 5), UM_MAX_DEPTH respected.
+/// A deep manifest fails as LIMIT_EXCEEDED (exit 5), UM_MAX_DEPTH respected.
 #[test]
 fn deep_manifest_hits_limit_exceeded() {
     let dir = TempDir::new().expect("tempdir");
@@ -1870,7 +1870,7 @@ fn deep_manifest_hits_limit_exceeded() {
     assert_eq!(stderr_json(&out)["error"]["code"], "LIMIT_EXCEEDED");
 }
 
-/// K-11: an inscriptum-note envelope with version != 1 → UNSUPPORTED_VERSION.
+/// An inscriptum-note envelope with version != 1 → UNSUPPORTED_VERSION.
 #[test]
 fn envelope_version_is_checked() {
     let dir = TempDir::new().expect("tempdir");
@@ -1891,7 +1891,7 @@ fn envelope_version_is_checked() {
     assert_eq!(stderr_json(&out)["error"]["code"], "UNSUPPORTED_VERSION");
 }
 
-/// NEW-3: the list marker survives a first child that is not a paragraph.
+/// The list marker survives a first child that is not a paragraph.
 #[test]
 fn list_marker_survives_non_paragraph_first_child() {
     let dir = TempDir::new().expect("tempdir");
@@ -1936,10 +1936,10 @@ fn list_marker_survives_non_paragraph_first_child() {
 }
 
 // ---------------------------------------------------------------------------
-// Delta round 4 — NEW-4/NEW-5: boundary staleness + np invariant
+// Boundary cursor staleness + np invariant
 // ---------------------------------------------------------------------------
 
-/// NEW-4: a boundary cursor binds the TARGET note's revision. Rewrite that
+/// A boundary cursor binds the TARGET note's revision. Rewrite that
 /// note between pages (same id, new content) → the resume is CURSOR_STALE,
 /// phrased about the revision — never a silent new edition (§6.2, §15.1 №7).
 #[test]
@@ -2003,7 +2003,7 @@ fn tree_boundary_cursor_detects_target_note_rewrite() {
     );
 }
 
-/// NEW-4 on annotated: the same scenario via `read --format annotated`.
+/// The same scenario via `read --format annotated`.
 #[test]
 fn annotated_boundary_cursor_detects_target_note_rewrite() {
     let dir = TempDir::new().expect("tempdir");
@@ -2080,7 +2080,7 @@ fn file_arg_of(file: &Path) -> String {
     file.to_string_lossy().into_owned()
 }
 
-/// NEW-5: stripping `np` from a mid-note cursor must be rejected — never
+/// Stripping `np` from a mid-note cursor must be rejected — never
 /// silently resumed with both guards deactivated.
 #[test]
 fn stripped_mid_note_cursor_is_rejected() {
@@ -2236,7 +2236,7 @@ fn wikilink_is_known_and_searchable() {
 }
 
 // ---------------------------------------------------------------------------
-// Agent feedback read-note-title-lookup — --note resolves id or exact title
+// Agent feedback — --note resolves id or exact title
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -30,7 +30,7 @@ pub fn run(
         }
     }
     if format == "json" && cursor_token.is_some() {
-        // C-08: --cursor was silently ignored on json output — reject instead
+        // --cursor was silently ignored on json output — reject instead
         return Err(
             UmError::usage("--cursor applies to --format annotated only in this release")
                 .with_hint(
@@ -44,8 +44,8 @@ pub fn run(
         Some(token) => Some(Cursor::decode(token)?),
         None => None,
     };
-    // NEW-2: no cursor-based narrowing — a multi-note container is read
-    // across notes; the lazy reader keeps the per-page cost bounded (P-02).
+    // No cursor-based narrowing — a multi-note container is read
+    // across notes; the lazy reader keeps the per-page cost bounded.
     let filters = note.map(|n| vec![n.to_owned()]);
     let mut reader = SourceReader::open(path, filters.as_deref(), limits, Revs::Compute)?;
     let start_note = cursor.as_ref().map_or(0, |c| c.note_index);
@@ -58,7 +58,7 @@ pub fn run(
     }
 
     if format == "json" {
-        // P-01: the budget is per response — no silent oversize; the command
+        // The budget is per response — no silent oversize; the command
         // names the required size instead of exceeding it
         let mut notes = Vec::new();
         let mut used: usize = 256;
@@ -98,7 +98,7 @@ pub fn run(
     // annotated: paginate by top-level blocks across notes (spec §6.5).
     // Page shape mirrors tree: the first note may be partial (mid-note
     // cursor); every following note is emitted whole or the page stops on
-    // the note boundary with um:incomplete + cursor to it (NEW-2).
+    // the note boundary with um:incomplete + cursor to it.
     let mut out = String::new();
     let mut pos = start_note;
 
@@ -106,7 +106,7 @@ pub fn run(
     if pos < reader.len() {
         let view = reader.read_at(pos)?;
         if let Some(cursor) = &cursor {
-            // NEW-4: unconditional rev binding; NEW-5: the bi⇔np invariant
+            // Unconditional rev binding; the bi⇔np invariant
             // is enforced inside validate
             cursor.validate(
                 "read",
@@ -132,10 +132,10 @@ pub fn run(
                 format!("document deeper than UM_MAX_DEPTH ({})", limits.max_depth),
             ));
         }
-        // P-06: children are indexed once per note instead of O(B²) scans
+        // Children are indexed once per note instead of O(B²) scans
         let children_of = children_index(&blocks.blocks);
         let top_level: Vec<&BlockEntry> = blocks.blocks.iter().filter(|b| b.depth == 0).collect();
-        // S-04 parity with tree: a mid-note resume pointer must match the
+        // Parity with tree: a mid-note resume pointer must match the
         // block at the resumed position
         if let Some(expected) = cursor.as_ref().and_then(|c| c.next_pointer.clone())
             && start_block > 0
@@ -209,7 +209,7 @@ pub fn run(
             pos += 1;
             continue;
         }
-        // NEW-2: boundary marker + cursor to this note
+        // Boundary marker + cursor to this note
         let cursor = Cursor::read(
             rendered.clone(),
             view.note_id.clone(),
@@ -247,8 +247,8 @@ fn children_index(blocks: &[BlockEntry]) -> HashMap<&str, Vec<&BlockEntry>> {
 }
 
 /// Render a block with its anchor; anchors are emitted for EVERY structural
-/// block — nested paragraphs inside lists are addressable too (review K-06,
-/// spec §6.5 «перед каждым блоком»).
+/// block — nested paragraphs inside lists are addressable too (spec §6.5
+/// «перед каждым блоком»).
 fn render_block(
     block: &BlockEntry,
     doc: &Value,
@@ -429,7 +429,7 @@ fn render_block(
 }
 
 /// Render the inline content of a paragraph-like block with markdown marks
-/// (review K-08: known marks are projected; unknown marks get an explicit
+/// (known marks are projected; unknown marks get an explicit
 /// trailing marker instead of a silent loss, spec §6.5).
 fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
     let raw_node = insum_core::resolve(doc, &block.pointer)
@@ -501,9 +501,9 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
     out
 }
 
-/// NEW-3: the list marker / checkbox survives a first child that is not a
+/// The list marker / checkbox survives a first child that is not a
 /// paragraph — the marker line is always emitted, non-paragraph children
-/// render as indented blocks (review C-09 stays: the first paragraph joins
+/// render as indented blocks (the first paragraph joins
 /// the marker line instead of duplicating).
 fn render_list_item(
     item: &BlockEntry,
@@ -513,7 +513,7 @@ fn render_list_item(
     indent: &str,
     out: &mut String,
 ) {
-    // K-06: the item is a block and gets its own anchor
+    // The item is a block and gets its own anchor
     out.push_str(&format!("<!-- um:pointer=\"{}\" -->\n", item.pointer));
     let children = children_of
         .get(item.pointer.as_str())
@@ -533,14 +533,14 @@ fn render_list_item(
         .first()
         .is_some_and(|first| first.node_type == "paragraph");
     if !tight_first {
-        // NEW-3: keep the marker even without a leading paragraph
+        // Keep the marker even without a leading paragraph
         out.push_str(&first_line);
         out.push('\n');
     }
     for (position, child) in children.iter().enumerate() {
         if position == 0 && tight_first {
-            // C-09: only the first *paragraph* contributes to the marker
-            // line; its anchor precedes that line (K-06)
+            // Only the first *paragraph* contributes to the marker
+            // line; its anchor precedes that line
             out.push_str(&format!("<!-- um:pointer=\"{}\" -->\n", child.pointer));
             let text = render_inline_nodes(child, doc);
             first_line.push_str(text.trim_end_matches('\n'));
