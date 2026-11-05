@@ -147,6 +147,7 @@ pub fn run(
                 "cursor block position does not match the recorded pointer",
             ));
         }
+        let mut oversized: Vec<&BlockEntry> = Vec::new();
         for (block_position, block) in top_level.iter().enumerate().skip(start_block) {
             let mut rendered_block = String::new();
             render_block(block, &view.doc, &children_of, &mut rendered_block);
@@ -170,8 +171,19 @@ pub fn run(
                 ));
                 return Ok(Output::Text(out));
             }
+            // PR review: a single block larger than the whole budget is still
+            // emitted whole (documented exception) — but explicitly marked.
+            if used + chunk.len() > budget {
+                oversized.push(block);
+            }
             used += chunk.len();
             out.push_str(&chunk);
+        }
+        for block in oversized {
+            out.push_str(&format!(
+                "\n<!-- um:oversized-block pointer=\"{}\" budget=\"{}\" -->\n",
+                block.pointer, budget
+            ));
         }
         pos += 1;
     }
@@ -367,53 +379,75 @@ fn render_block(
             out.push_str("---\n");
         }
         "table" => {
-            // markdown table: rows of cells; a cell is paragraphs — their
-            // inline text, newlines as <br>, pipes escaped
+            // markdown table: rows of cells. Every structural level (row,
+            // cell, cell paragraph) carries an inline pointer anchor — a
+            // standalone comment line would split the markdown table, so
+            // anchors ride inside the cells. Cell content is rendered with
+            // the same fidelity as top-level blocks: paragraphs go through
+            // the inline projection (marks, markers), non-paragraph children
+            // are inlined recursively, anything unrenderable gets an
+            // explicit marker — no silent losses.
             let rows: Vec<&BlockEntry> = children
                 .iter()
                 .filter(|row| row.node_type == "tableRow")
                 .copied()
                 .collect();
             if rows.is_empty() {
-                out.push_str(&format!(
-                    "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->\n",
-                    block.node_type, block.pointer
-                ));
+                out.push_str(&unrendered_marker(block));
+                for child in children {
+                    out.push_str(&unrendered_marker(child));
+                }
             } else {
                 for (index, row) in rows.iter().enumerate() {
                     let cells = children_of
                         .get(row.pointer.as_str())
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let texts: Vec<String> = cells
+                    let rendered_cells: Vec<String> = cells
                         .iter()
-                        .map(|cell| {
-                            let paragraphs: Vec<String> = children_of
+                        .enumerate()
+                        .map(|(cell_index, cell)| {
+                            let mut cell_out = String::new();
+                            // the row anchor rides in the first cell
+                            if cell_index == 0 {
+                                cell_out.push_str(&anchor_comment(row));
+                            }
+                            cell_out.push_str(&anchor_comment(cell));
+                            for grandchild in children_of
                                 .get(cell.pointer.as_str())
-                                .map(|cs| {
-                                    cs.iter()
-                                        .filter(|p| p.node_type == "paragraph")
-                                        .filter_map(|p| p.text.clone())
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let text = if paragraphs.is_empty() {
-                                cell.text.clone().unwrap_or_default()
-                            } else {
-                                paragraphs.join(" ")
-                            };
-                            let text = text.replace('\n', "<br>").replace('|', "\\|");
-                            if text.trim().is_empty() {
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[])
+                            {
+                                if grandchild.node_type == "paragraph" {
+                                    cell_out.push_str(&anchor_comment(grandchild));
+                                    cell_out.push_str(&render_inline_nodes(grandchild, doc));
+                                } else {
+                                    cell_out.push_str(&anchor_comment(grandchild));
+                                    cell_out.push_str(&cell_child_inline(
+                                        grandchild,
+                                        doc,
+                                        children_of,
+                                    ));
+                                }
+                            }
+                            if cell_out.trim().is_empty() {
                                 " ".to_owned()
                             } else {
-                                text
+                                escape_cell(&cell_out)
                             }
                         })
                         .collect();
-                    out.push_str(&format!("| {} |\n", texts.join(" | ")));
+                    out.push_str(&format!("| {} |\n", rendered_cells.join(" | ")));
                     if index == 0 {
-                        let separator: Vec<&str> = texts.iter().map(|_| "---").collect();
+                        let separator: Vec<&str> = rendered_cells.iter().map(|_| "---").collect();
                         out.push_str(&format!("| {} |\n", separator.join(" | ")));
+                    }
+                }
+                // table children that are not rows: explicit markers after
+                // the table (a standalone comment inside it would split it)
+                for child in children {
+                    if child.node_type != "tableRow" {
+                        out.push_str(&unrendered_marker(child));
                     }
                 }
             }
@@ -505,6 +539,121 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
 /// paragraph — the marker line is always emitted, non-paragraph children
 /// render as indented blocks (the first paragraph joins
 /// the marker line instead of duplicating).
+/// Inline pointer anchor for a block (used inside table cells, where a
+/// standalone comment line would split the markdown table).
+fn anchor_comment(block: &BlockEntry) -> String {
+    format!("<!-- um:pointer=\"{}\" -->", block.pointer)
+}
+
+/// Unrendered marker for a block.
+fn unrendered_marker(block: &BlockEntry) -> String {
+    format!(
+        "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->\n",
+        block.node_type, block.pointer
+    )
+}
+
+/// Cell-safe rendering: newlines become <br>, pipes are escaped — composed
+/// after the content so the anchors themselves stay intact.
+fn escape_cell(text: &str) -> String {
+    text.replace('\n', "<br>").replace('|', "\\|")
+}
+
+/// Inline rendering of a non-paragraph cell child: lists flatten to
+/// marker-prefixed lines (marks preserved via the inline projection),
+/// nested tables and unknown nodes stay explicit.
+fn cell_child_inline(
+    child: &BlockEntry,
+    doc: &Value,
+    children_of: &HashMap<&str, Vec<&BlockEntry>>,
+) -> String {
+    match child.node_type.as_str() {
+        "bulletList" | "taskList" | "orderedList" => {
+            let mut parts = Vec::new();
+            inline_list_lines(child, doc, children_of, "- ", &mut parts);
+            if parts.is_empty() {
+                format!(
+                    "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->",
+                    child.node_type, child.pointer
+                )
+            } else {
+                parts.join("<br>")
+            }
+        }
+        "table" => format!(
+            "<!-- um:unrendered type=\"table\" pointer=\"{}\" -->",
+            child.pointer
+        ),
+        _ => {
+            let text = child.text.clone().unwrap_or_default();
+            format!(
+                "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->{}",
+                child.node_type, child.pointer, text
+            )
+        }
+    }
+}
+
+/// Flatten a list into cell-safe lines: markers/checkboxes, inline marks,
+/// nested lists indented one level deeper.
+fn inline_list_lines(
+    list: &BlockEntry,
+    doc: &Value,
+    children_of: &HashMap<&str, Vec<&BlockEntry>>,
+    indent: &str,
+    parts: &mut Vec<String>,
+) {
+    let start = list.attrs.get("start").and_then(Value::as_u64).unwrap_or(1);
+    for (offset, item) in children_of
+        .get(list.pointer.as_str())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let marker = match list.node_type.as_str() {
+            "orderedList" => format!("{indent}{}. ", start + offset as u64),
+            "taskList" => {
+                let checked = item
+                    .attrs
+                    .get("checked")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                format!("{indent}[{}] ", if checked { "x" } else { " " })
+            }
+            _ => format!("{indent}- "),
+        };
+        for item_child in children_of
+            .get(item.pointer.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            if item_child.node_type == "paragraph" {
+                let text = render_inline_nodes(item_child, doc);
+                for (line_index, line) in text.split('\n').enumerate() {
+                    let nested = format!("{indent}  ");
+                    let lead: &str = if line_index == 0 {
+                        marker.as_str()
+                    } else {
+                        nested.as_str()
+                    };
+                    parts.push(format!("{lead}{line}"));
+                }
+            } else if matches!(
+                item_child.node_type.as_str(),
+                "bulletList" | "taskList" | "orderedList"
+            ) {
+                inline_list_lines(item_child, doc, children_of, &format!("{indent}  "), parts);
+            } else {
+                let text = item_child.text.clone().unwrap_or_default();
+                if !text.is_empty() {
+                    parts.push(format!("{marker}{text}"));
+                }
+            }
+        }
+    }
+}
+
 fn render_list_item(
     item: &BlockEntry,
     doc: &Value,

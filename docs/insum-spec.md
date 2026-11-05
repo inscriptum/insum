@@ -63,6 +63,11 @@ opaque `next_cursor` token; pass it back via `--cursor`. Cursors are bound to
 the query options and the revision of the note they continue; a stale cursor
 fails with exit 7 instead of silently resuming.
 
+Documented exception: a single block larger than the whole remaining budget
+is still emitted whole rather than cut — `read --format annotated` appends an
+explicit `<!-- um:oversized-block pointer="..." budget="..." -->` marker and
+`tree` reports the affected pointers in the note's `oversized_blocks` field.
+
 ## Limits
 
 Configured via environment variables with safe defaults, enforced on actual

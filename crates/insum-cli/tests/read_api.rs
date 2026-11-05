@@ -1412,15 +1412,13 @@ fn search_context_is_windowed_and_budgeted() {
 }
 
 /// Explicit symlinked directories are followed: no silent empty sweep.
+/// Unix-only: creating directory symlinks needs privileges on Windows.
+#[cfg(unix)]
 #[test]
 fn search_follows_symlinked_directories() {
     let corpus = Corpus::new();
     let link = corpus.dir.path().join("kb-link");
-    #[cfg(unix)]
     std::os::unix::fs::symlink(corpus.dir.path(), &link).expect("symlink");
-    #[cfg(not(unix))]
-    panic!("symlink test requires unix");
-
     let hits = run_json(&["search", "-F", "Legacy", link.to_string_lossy().as_ref()]);
     assert!(
         !hits["matches"].as_array().unwrap().is_empty(),
@@ -2172,12 +2170,33 @@ fn annotated_renders_tables_as_markdown() {
         .output()
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("| Data | Issue |"), "header row: {text}");
+    // header/data lines start with the pipe; anchors ride inside the cells
+    let header = text
+        .lines()
+        .find(|l| l.contains("Data") && l.contains("Issue"))
+        .expect("header line");
+    assert!(header.starts_with("| "), "table line: {header}");
     assert!(text.contains("| --- | --- |"), "separator: {text}");
-    assert!(text.contains("2026-11-03"), "data row");
+    let data_line = text
+        .lines()
+        .find(|l| l.contains("2026-11-03"))
+        .expect("data line");
     assert!(
-        text.contains("re\\|ad<br>next"),
-        "pipes escaped, newlines as <br>: {text}"
+        data_line.contains("re\\|ad<br>next"),
+        "pipes escaped, newlines as <br>: {data_line}"
+    );
+    // §6.5 anchors ride inline inside the cells: row, cell, paragraph
+    assert!(
+        text.contains("um:pointer=\"/content/0/content/1\""),
+        "row anchor"
+    );
+    assert!(
+        text.contains("um:pointer=\"/content/0/content/1/content/1\""),
+        "cell anchor"
+    );
+    assert!(
+        text.contains("um:pointer=\"/content/0/content/1/content/1/content/0\""),
+        "cell paragraph anchor"
     );
 }
 
@@ -2320,4 +2339,230 @@ fn note_miss_hints_how_to_list_notes() {
     let hint = error["error"]["hint"].as_str().unwrap();
     assert!(hint.contains("insum ls"), "hint points to ls: {hint}");
     assert!(hint.contains("title"), "hint mentions titles: {hint}");
+}
+
+// ---------------------------------------------------------------------------
+// PR #150 review — table fidelity, oversized blocks, search ambiguity
+// ---------------------------------------------------------------------------
+
+/// No silent content loss in the table projection: lists in cells flatten
+/// with markers, marks survive, unknown inline nodes get explicit markers,
+/// anchors cover row/cell/paragraph levels.
+#[test]
+fn table_projection_preserves_cell_content() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "content": [
+                        {"type": "bulletList", "content": [
+                            {"type": "listItem", "content": [
+                                {"type": "paragraph", "content": [{"type": "text", "text": "check first"}]}
+                            ]},
+                            {"type": "listItem", "content": [
+                                {"type": "paragraph", "content": [{"type": "text", "text": "check second"}]}
+                            ]}
+                        ]}
+                    ]},
+                    {"type": "tableCell", "content": [
+                        {"type": "paragraph", "content": [
+                            {"type": "text", "text": "plain "},
+                            {"type": "text", "marks": [{"type": "bold"}], "text": "bold"},
+                            {"type": "wikiLink", "attrs": {"path": "notes/x.um", "text": "link"}}
+                        ]}
+                    ]}
+                ]}
+            ]}
+        ]
+    });
+    let file = dir.path().join("cells.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+
+    // bulletList in a cell flattens with markers — no bare empty cell
+    assert!(
+        text.contains("check first") && text.contains("check second"),
+        "list items preserved: {text}"
+    );
+    assert!(text.contains("- check first"), "list markers present");
+    // marks survive in cells
+    assert!(text.contains("**bold**"), "bold projected in cell: {text}");
+    // wikiLink projects as a link
+    assert!(
+        text.contains("[link](notes/x.um)"),
+        "wikiLink projected: {text}"
+    );
+    // §6.5 anchors for row/cell levels
+    assert!(
+        text.contains("um:pointer=\"/content/0/content/0\""),
+        "row anchor"
+    );
+    assert!(
+        text.contains("um:pointer=\"/content/0/content/0/content/1\""),
+        "cell anchor"
+    );
+    // unknown inline in a cell paragraph gets the explicit marker (parity
+    // with top-level paragraphs)
+    let doc2 = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "content": [
+                        {"type": "paragraph", "content": [
+                            {"type": "text", "text": "a"},
+                            {"type": "fancyMention", "content": [{"type": "text", "text": "@x"}]}
+                        ]}
+                    ]}
+                ]}
+            ]}
+        ]
+    });
+    let file2 = dir.path().join("cells2.note");
+    fixtures::write_legacy_note(&file2, &doc2).expect("write");
+    let out2 = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file2.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text2 = String::from_utf8(out2.stdout).unwrap();
+    assert!(
+        text2.contains("um:unrendered-inline"),
+        "unknown inline marked: {text2}"
+    );
+}
+
+/// A single block larger than the whole budget is emitted whole (documented
+/// exception) — but explicitly, with an um:oversized-block marker.
+#[test]
+fn annotated_marks_oversized_first_block() {
+    let dir = TempDir::new().expect("tempdir");
+    let huge = "x".repeat(40_000);
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": huge}]}
+        ]
+    });
+    let file = dir.path().join("huge.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            "--max-bytes",
+            "2000",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "single oversized block still emitted");
+    let stdout_len = out.stdout.len();
+    assert!(stdout_len > 20_000, "block emitted whole: {stdout_len}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("um:oversized-block"),
+        "explicit marker present"
+    );
+
+    // tree reports the same via a field
+    let tree = run_json(&[
+        "tree",
+        "--max-bytes",
+        "500",
+        file.to_string_lossy().as_ref(),
+    ]);
+    let oversized = tree["notes"][0]["oversized_blocks"]
+        .as_array()
+        .expect("field present");
+    assert_eq!(oversized.len(), 1);
+    assert_eq!(oversized[0], tree["notes"][0]["blocks"][0]["pointer"]);
+}
+
+/// Ambiguous --note titles are surfaced with matching ids in search, never
+/// masked as "not found in any searched container".
+#[test]
+fn search_surfaces_ambiguous_title_with_ids() {
+    let dir = TempDir::new().expect("tempdir");
+    let dup = dir.path().join("dup.um");
+    let notes = [
+        fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(1),
+            "Dup",
+            &[fixtures::paragraph(&[fixtures::text("needle in first")])],
+        ),
+        fixtures::FixtureNote::plain_page(
+            &fixtures::ulid_seq(2),
+            "Dup",
+            &[fixtures::paragraph(&[fixtures::text("needle in second")])],
+        ),
+    ];
+    fixtures::write_um(&dup, &notes).expect("fixture");
+
+    // only the ambiguous container: the ambiguity error wins with both ids
+    let out = insum()
+        .args([
+            "search",
+            "-F",
+            "needle",
+            "--note",
+            "Dup",
+            dup.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "ambiguity exits 3");
+    let error = stderr_json(&out);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("ambiguous"), "{message}");
+    assert!(
+        message.contains(&fixtures::ulid_seq(1)) && message.contains(&fixtures::ulid_seq(2)),
+        "both ids listed: {message}"
+    );
+
+    // a healthy container with a unique "Dup" note still yields matches:
+    // the ambiguity is reported in skipped, not swallowed
+    let good = dir.path().join("good.um");
+    let good_notes = [fixtures::FixtureNote::plain_page(
+        &fixtures::ulid_seq(3),
+        "Dup",
+        &[fixtures::paragraph(&[fixtures::text("needle in third")])],
+    )];
+    fixtures::write_um(&good, &good_notes).expect("fixture");
+    let hits = run_json(&[
+        "search",
+        "-F",
+        "needle",
+        "--note",
+        "Dup",
+        dir.path().to_string_lossy().as_ref(),
+    ]);
+    assert!(
+        !hits["matches"].as_array().unwrap().is_empty(),
+        "healthy file matched"
+    );
+    assert_eq!(hits["complete"], Value::Bool(false));
+    let skipped_ambiguous = hits["skipped"].as_array().unwrap().iter().any(|s| {
+        s["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous")
+    });
+    assert!(skipped_ambiguous, "ambiguity surfaces in skipped");
 }

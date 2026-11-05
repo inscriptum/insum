@@ -188,6 +188,9 @@ fn paginate_note(
     let mut blocks_out: Vec<Value> = Vec::new();
     let mut used: usize = 384; // note envelope + blocks array overhead
     let mut has_more = false;
+    // a single block larger than the whole page budget is emitted whole
+    // (documented exception) and reported explicitly
+    let mut oversized: Vec<String> = Vec::new();
 
     for block in traversal.blocks.iter().skip(start_block) {
         let entry = block_json(block, text_limit);
@@ -195,6 +198,9 @@ fn paginate_note(
         if !blocks_out.is_empty() && used + entry_size > budget {
             has_more = true;
             break;
+        }
+        if blocks_out.is_empty() && used + entry_size > budget {
+            oversized.push(block.pointer.clone());
         }
         used += entry_size;
         blocks_out.push(entry);
@@ -231,6 +237,9 @@ fn paginate_note(
         "complete": complete,
         "next_cursor": next_cursor,
     });
+    if !oversized.is_empty() {
+        note_json["oversized_blocks"] = json!(oversized);
+    }
     if traversal.unknown_inline {
         // Text of unknown inline nodes is withheld — no silent losses
         note_json["warnings"] = json!([{

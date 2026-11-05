@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 
 use insum_core::{ErrorCode, Limits, UmError};
 
-use crate::support::{Revs, collect_files, error_value, read_notes, render_path};
+use crate::support::{
+    AMBIGUOUS_NOTE_PREFIX, Revs, collect_files, error_value, read_notes, render_path,
+};
 
 const DEFAULT_WINDOW: usize = 160;
 
@@ -65,6 +67,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     let mut skipped: Vec<Value> = Vec::new();
     let mut unknown_inline_files: Vec<Value> = Vec::new();
     let mut not_found_files = 0usize;
+    let mut ambiguous_errors: Vec<UmError> = Vec::new();
     let mut truncated = false;
 
     // locations that could not be enumerated count into `skipped` (§11)
@@ -99,9 +102,15 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
             Err(err) => {
                 // Search is best-effort — ANY per-file error lands in
                 // skipped and lowers complete (§11); one broken file must not
-                // kill the whole run
-                if err.code == ErrorCode::NoteNotFound {
+                // kill the whole run. An ambiguous --note title is NOT a
+                // plain absence: it is surfaced with its ids (PR #150 review).
+                if err.code == ErrorCode::NoteNotFound
+                    && !err.message.starts_with(AMBIGUOUS_NOTE_PREFIX)
+                {
                     not_found_files += 1;
+                }
+                if err.message.starts_with(AMBIGUOUS_NOTE_PREFIX) {
+                    ambiguous_errors.push(err.clone());
                 }
                 skipped.push(json!({
                     "path": render_path(file),
@@ -159,6 +168,15 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                 }
             }
         }
+    }
+
+    // matches exist → they win, the ambiguity rides in skipped; nothing
+    // matched anywhere → the ambiguity error itself wins (it carries the
+    // matching ids) instead of a masked absence
+    if matches.is_empty()
+        && let Some(ambiguity) = ambiguous_errors.first()
+    {
+        return Err(ambiguity.clone());
     }
 
     // NOTE_NOT_FOUND is only an error when the note exists nowhere

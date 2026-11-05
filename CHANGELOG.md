@@ -5,6 +5,19 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ## [Unreleased]
 
+### Fixed
+
+- Table projection in annotated reading no longer silently drops cell
+  content: lists in cells flatten with their markers, bold/italic/code
+  survive, unknown inline nodes get explicit markers, and row/cell/paragraph
+  anchors are emitted inline (§6.5 inside tables).
+- `search --note <title>` no longer masks an ambiguous title as "not found":
+  the ambiguity error now lists the matching note ids.
+- A block larger than the whole page budget is emitted whole with an explicit
+  oversized marker (documented exception), instead of silently exceeding the
+  budget.
+- CI: skip a unix-only symlink test on Windows (was red under `-D warnings`).
+
 ### Added
 
 - `wikiLink` is a known node: no unknown-type warnings, its label
