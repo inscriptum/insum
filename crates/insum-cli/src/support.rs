@@ -179,11 +179,6 @@ pub enum Revs {
     Skip,
 }
 
-/// Stable prefix of the ambiguity message: lets best-effort commands tell a
-/// "title matches several notes" miss from a plain absence (the §11 registry
-/// has no dedicated code for it).
-pub const AMBIGUOUS_NOTE_PREFIX: &str = "ambiguous note title";
-
 /// Resolve a `--note` value to a manifest note (agent feedback): exact id
 /// (ULID) first, then an exact title
 /// match. An ambiguous title fails with the matching ids — never a silent
@@ -211,20 +206,21 @@ fn resolve_note<'a>(
         .with_hint(
             "`--note` takes a note id (ULID) or an exact note title; list notes with `insum ls <file>`",
         )),
-        many => Err(UmError::new(
-            ErrorCode::NoteNotFound,
-            format!(
-                "{} {value:?}: {} notes match (ids: {})",
-                AMBIGUOUS_NOTE_PREFIX,
-                many.len(),
-                many
-                    .iter()
-                    .map(|note| note.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )
-        .with_hint("Pass the note id (ULID) instead of the title.")),
+        many => {
+            // W-09: ambiguity is signalled STRUCTURALLY (details field), not
+            // via the message text — §11 says messages may change.
+            let ids: Vec<&str> = many.iter().map(|note| note.id.as_str()).collect();
+            Err(UmError::new(
+                ErrorCode::NoteNotFound,
+                format!(
+                    "note title {value:?} is ambiguous: {} notes match (ids: {})",
+                    ids.len(),
+                    ids.join(", ")
+                ),
+            )
+            .with_hint("Pass the note id (ULID) instead of the title.")
+            .with_details(json!({ "ambiguous": true, "ids": ids })))
+        }
     }
 }
 

@@ -153,7 +153,16 @@ pub fn run(
             render_block(block, &view.doc, &children_of, &mut rendered_block);
             let chunk = format!("\n{rendered_block}");
             if used + chunk.len() > budget && block_position > start_block {
-                // whole blocks only — no silent or partial truncation
+                // whole blocks only — no silent or partial truncation.
+                // W-01: flush the oversized markers collected so far BEFORE
+                // the incomplete return — they belong to blocks already
+                // emitted, whatever follows them.
+                for pending in &oversized {
+                    out.push_str(&format!(
+                        "\n<!-- um:oversized-block pointer=\"{}\" budget=\"{}\" -->\n",
+                        pending.pointer, budget
+                    ));
+                }
                 let next_pointer = top_level.get(block_position).map(|b| b.pointer.clone());
                 let cursor = Cursor::read(
                     rendered.clone(),
@@ -294,7 +303,7 @@ fn render_block(
             out.push_str(&format!(
                 "{} {}\n",
                 "#".repeat(level),
-                inline.unwrap_or_default()
+                neutralize_marker_syntax(inline.as_deref().unwrap_or(""))
             ));
         }
         "paragraph" => {
@@ -303,22 +312,27 @@ fn render_block(
             out.push('\n');
         }
         "noteTitle" => {
-            out.push_str(&format!("# {}\n", inline.unwrap_or_default()));
+            out.push_str(&format!(
+                "# {}\n",
+                neutralize_marker_syntax(inline.as_deref().unwrap_or(""))
+            ));
         }
         "noteSummary" => {
-            out.push_str(&inline.unwrap_or_default());
+            out.push_str(&neutralize_marker_syntax(inline.as_deref().unwrap_or("")));
             out.push('\n');
         }
         "noteProperty" => {
-            let name = children
-                .iter()
-                .find(|child| child.node_type == "notePropertyName")
-                .and_then(|child| child.text.clone())
-                .unwrap_or_default();
+            let name = neutralize_marker_syntax(
+                &children
+                    .iter()
+                    .find(|child| child.node_type == "notePropertyName")
+                    .and_then(|child| child.text.clone())
+                    .unwrap_or_default(),
+            );
             let value: Vec<String> = children
                 .iter()
                 .filter(|child| child.node_type == "notePropertyValue")
-                .filter_map(|child| child.text.clone())
+                .filter_map(|child| child.text.clone().map(|t| neutralize_marker_syntax(&t)))
                 .collect();
             out.push_str(&format!("{name}: {}\n", value.join(" ")));
         }
@@ -361,7 +375,7 @@ fn render_block(
             out.push('\n');
             for child in children {
                 if let Some(text) = &child.text {
-                    out.push_str(text);
+                    out.push_str(&neutralize_marker_syntax(text));
                     out.push('\n');
                 }
             }
@@ -370,7 +384,7 @@ fn render_block(
         "mermaid" => {
             out.push_str("```mermaid\n");
             if let Some(code) = block.attrs.get("code").and_then(Value::as_str) {
-                out.push_str(code);
+                out.push_str(&neutralize_marker_syntax(code));
                 out.push('\n');
             }
             out.push_str("```\n");
@@ -403,6 +417,12 @@ fn render_block(
                         .get(row.pointer.as_str())
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
+                    if cells.is_empty() {
+                        // W-06: an empty row keeps its own anchor — block get
+                        // by this pointer must be explainable in the output
+                        out.push_str(&format!("| {} |\n", anchor_comment(row)));
+                        continue;
+                    }
                     let rendered_cells: Vec<String> = cells
                         .iter()
                         .enumerate()
@@ -413,12 +433,19 @@ fn render_block(
                                 cell_out.push_str(&anchor_comment(row));
                             }
                             cell_out.push_str(&anchor_comment(cell));
+                            let mut paragraph_seen = false;
                             for grandchild in children_of
                                 .get(cell.pointer.as_str())
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[])
                             {
+                                // W-05: paragraphs are separated (the old
+                                // renderer joined them with a space)
+                                if paragraph_seen {
+                                    cell_out.push(' ');
+                                }
                                 if grandchild.node_type == "paragraph" {
+                                    paragraph_seen = true;
                                     cell_out.push_str(&anchor_comment(grandchild));
                                     cell_out.push_str(&render_inline_nodes(grandchild, doc));
                                 } else {
@@ -476,9 +503,11 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
             let child_type = child.get("type").and_then(Value::as_str).unwrap_or("");
             match child_type {
                 "text" => {
-                    let text = child.get("text").and_then(Value::as_str).unwrap_or("");
+                    let text = neutralize_marker_syntax(
+                        child.get("text").and_then(Value::as_str).unwrap_or(""),
+                    );
                     let marks = child.get("marks").and_then(Value::as_array);
-                    let mut wrapped = text.to_owned();
+                    let mut wrapped = text;
                     if let Some(marks) = marks {
                         for mark in marks {
                             let mark_type = mark.get("type").and_then(Value::as_str).unwrap_or("");
@@ -541,6 +570,14 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
 /// the marker line instead of duplicating).
 /// Inline pointer anchor for a block (used inside table cells, where a
 /// standalone comment line would split the markdown table).
+/// Neutralize the comment-opener sequence in document-sourced text: it must
+/// not forge CLI markers or anchors in the annotated projection (review
+/// W-02/V-06). `<!--` becomes `<! --` — readable, visibly altered, and
+/// impossible to reassemble into `<!--` without editing.
+fn neutralize_marker_syntax(text: &str) -> String {
+    text.replace("<!--", "<! --")
+}
+
 fn anchor_comment(block: &BlockEntry) -> String {
     format!("<!-- um:pointer=\"{}\" -->", block.pointer)
 }
@@ -585,7 +622,7 @@ fn cell_child_inline(
             child.pointer
         ),
         _ => {
-            let text = child.text.clone().unwrap_or_default();
+            let text = neutralize_marker_syntax(&child.text.clone().unwrap_or_default());
             format!(
                 "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->{}",
                 child.node_type, child.pointer, text
@@ -645,10 +682,13 @@ fn inline_list_lines(
             ) {
                 inline_list_lines(item_child, doc, children_of, &format!("{indent}  "), parts);
             } else {
-                let text = item_child.text.clone().unwrap_or_default();
-                if !text.is_empty() {
-                    parts.push(format!("{marker}{text}"));
-                }
+                // parity with the top-level renderer: anything unrenderable
+                // gets an explicit marker — empty text is still a loss marker
+                let text = neutralize_marker_syntax(&item_child.text.clone().unwrap_or_default());
+                parts.push(format!(
+                    "{marker}<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->{text}",
+                    item_child.node_type, item_child.pointer
+                ));
             }
         }
     }

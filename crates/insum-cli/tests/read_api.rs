@@ -2566,3 +2566,157 @@ fn search_surfaces_ambiguous_title_with_ids() {
     });
     assert!(skipped_ambiguous, "ambiguity surfaces in skipped");
 }
+
+// ---------------------------------------------------------------------------
+// Round 5 — W-01/W-10 (oversized flush + tail), W-11 (cell edges),
+// W-12 (--note strictness)
+// ---------------------------------------------------------------------------
+
+/// W-01/W-10: the oversized marker is flushed BEFORE the incomplete return,
+/// with its attributes (pointer, budget) — and the tail continues on the
+/// resume page, where a second oversized block is marked again.
+#[test]
+fn annotated_oversized_marker_survives_tail_and_resume() {
+    let dir = TempDir::new().expect("tempdir");
+    let huge = "x".repeat(40_000);
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": huge}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "tail one"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "x".repeat(40_000)}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "tail two"}]}
+        ]
+    });
+    let file = dir.path().join("oversized-tail.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+
+    // walk pages until complete; collect every oversized marker and its
+    // attributes — the W-01 regression lost the marker whenever a tail
+    // followed the oversized block
+    let file_arg = file_arg_of(&file);
+    let mut cursor: Option<String> = None;
+    let mut markers: Vec<(String, String)> = Vec::new();
+    let mut tails = 0usize;
+    let mut pages = 0usize;
+    loop {
+        let mut args = vec![
+            "read",
+            "--format",
+            "annotated",
+            "--max-bytes",
+            "2000",
+            file_arg.as_str(),
+        ];
+        if let Some(c) = &cursor {
+            args.push("--cursor");
+            args.push(c);
+        }
+        let page = insum().args(&args).output().unwrap();
+        pages += 1;
+        assert!(pages < 20, "walk does not terminate");
+        let text = String::from_utf8(page.stdout.clone()).unwrap();
+        tails += text.matches("tail one").count() + text.matches("tail two").count();
+        for chunk in text.split("um:oversized-block pointer=\"").skip(1) {
+            let pointer: String = chunk.chars().take_while(|c| *c != '"').collect();
+            let budget: String = chunk
+                .split("budget=\"")
+                .nth(1)
+                .map(|chunk| chunk.chars().take_while(|c| *c != '"').collect())
+                .unwrap_or_default();
+            markers.push((pointer, budget));
+        }
+        let next = text
+            .split("um:incomplete next_cursor=\"")
+            .nth(1)
+            .map(|chunk| chunk.chars().take_while(|c| *c != '"').collect::<String>());
+        match next {
+            Some(token) => cursor = Some(token),
+            None => break,
+        }
+    }
+
+    // both oversized blocks marked, with attributes
+    assert_eq!(
+        markers.len(),
+        2,
+        "both oversized blocks marked: {markers:?}"
+    );
+    assert!(
+        markers
+            .iter()
+            .any(|(p, b)| p == "/content/0" && b == "2000")
+    );
+    assert!(
+        markers
+            .iter()
+            .any(|(p, b)| p == "/content/2" && b == "2000")
+    );
+    // both tails emitted exactly once across pages
+    assert_eq!(tails, 2, "tails preserved through the walk");
+}
+
+/// W-11: cell edges — multi-paragraph cells are separated, an empty row
+/// keeps its own pointer anchor.
+#[test]
+fn table_cell_edges_are_explicit() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "para one"}]},
+                        {"type": "paragraph", "content": [{"type": "text", "text": "para two"}]}
+                    ]}
+                ]},
+                {"type": "tableRow", "content": []}
+            ]}
+        ]
+    });
+    let file = dir.path().join("edges.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    // W-05 regression: paragraphs separated, not concatenated
+    assert!(text.contains("para one") && text.contains("para two"));
+    assert!(
+        !text.contains("para onepara"),
+        "paragraphs are separated: {text}"
+    );
+    // W-06 regression: the empty row keeps its anchor
+    assert!(
+        text.contains("um:pointer=\"/content/0/content/1\""),
+        "empty row anchor present: {text}"
+    );
+}
+
+/// W-12: title lookup is strict — case and prefix differences are misses
+/// (the hint explains what --note accepts and how to list notes).
+#[test]
+fn note_title_lookup_is_strict() {
+    let corpus = Corpus::new();
+    for probe in ["развёртывание", "РАЗВЁРТЫВАНИЕ", "Развёрт"] {
+        let out = insum()
+            .args(["read", "--note", probe, &corpus.path("regular.um")])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "probe {probe:?} must miss");
+        let error = stderr_json(&out);
+        assert_eq!(error["error"]["code"], "NOTE_NOT_FOUND");
+        let hint = error["error"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("insum ls") && hint.contains("title"),
+            "hint: {hint}"
+        );
+    }
+}

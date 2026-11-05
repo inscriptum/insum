@@ -11,9 +11,7 @@ use serde_json::{Value, json};
 
 use insum_core::{ErrorCode, Limits, UmError};
 
-use crate::support::{
-    AMBIGUOUS_NOTE_PREFIX, Revs, collect_files, error_value, read_notes, render_path,
-};
+use crate::support::{Revs, collect_files, error_value, read_notes, render_path};
 
 const DEFAULT_WINDOW: usize = 160;
 
@@ -67,7 +65,8 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     let mut skipped: Vec<Value> = Vec::new();
     let mut unknown_inline_files: Vec<Value> = Vec::new();
     let mut not_found_files = 0usize;
-    let mut ambiguous_errors: Vec<UmError> = Vec::new();
+    // W-07: ids of every ambiguous-title container, in search order
+    let mut ambiguous_ids: Vec<String> = Vec::new();
     let mut truncated = false;
 
     // locations that could not be enumerated count into `skipped` (§11)
@@ -104,14 +103,11 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                 // skipped and lowers complete (§11); one broken file must not
                 // kill the whole run. An ambiguous --note title is NOT a
                 // plain absence: it is surfaced with its ids (PR #150 review).
-                if err.code == ErrorCode::NoteNotFound
-                    && !err.message.starts_with(AMBIGUOUS_NOTE_PREFIX)
-                {
+                let ambiguous_ids_here = ambiguous_note_ids(&err);
+                if err.code == ErrorCode::NoteNotFound && ambiguous_ids_here.is_empty() {
                     not_found_files += 1;
                 }
-                if err.message.starts_with(AMBIGUOUS_NOTE_PREFIX) {
-                    ambiguous_errors.push(err.clone());
-                }
+                ambiguous_ids.extend(ambiguous_ids_here);
                 skipped.push(json!({
                     "path": render_path(file),
                     "error": error_value(&err),
@@ -171,12 +167,18 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     }
 
     // matches exist → they win, the ambiguity rides in skipped; nothing
-    // matched anywhere → the ambiguity error itself wins (it carries the
-    // matching ids) instead of a masked absence
-    if matches.is_empty()
-        && let Some(ambiguity) = ambiguous_errors.first()
-    {
-        return Err(ambiguity.clone());
+    // matched anywhere → the ambiguity error itself wins, aggregating the ids
+    // of EVERY ambiguous container (W-07: not just the first one)
+    if matches.is_empty() && !ambiguous_ids.is_empty() {
+        return Err(UmError::new(
+            ErrorCode::NoteNotFound,
+            format!(
+                "note title {query:?} is ambiguous: {} notes match (ids: {})",
+                ambiguous_ids.len(),
+                ambiguous_ids.join(", ")
+            ),
+        )
+        .with_hint("Pass the note id (ULID) instead of the title."));
     }
 
     // NOTE_NOT_FOUND is only an error when the note exists nowhere
@@ -208,6 +210,21 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
         response["warnings"] = json!(unknown_inline_files);
     }
     Ok(response)
+}
+
+/// Structured ambiguity probe: the resolver marks ambiguity in the error
+/// details (W-09 — message text is not a stable contract).
+fn ambiguous_note_ids(err: &UmError) -> Vec<String> {
+    err.details
+        .as_ref()
+        .and_then(|details| details.get("ids"))
+        .and_then(|ids| ids.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A window of up to `DEFAULT_WINDOW` characters around the first match,

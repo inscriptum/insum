@@ -58,15 +58,17 @@ exact note title; a title matching several notes fails with their ids listed
 ## Pagination
 
 Responses respect `UM_MAX_OUTPUT_BYTES` / `--max-bytes` and never cut a JSON
-record in half. An incomplete response carries `complete: false` and an
-opaque `next_cursor` token; pass it back via `--cursor`. Cursors are bound to
-the query options and the revision of the note they continue; a stale cursor
-fails with exit 7 instead of silently resuming.
+record in half — with the single-oversized-block exception documented below.
+An incomplete response carries `complete: false` and an opaque `next_cursor`
+token; pass it back via `--cursor`. Cursors are bound to the query options
+and the revision of the note they continue; a stale cursor fails with exit 7
+instead of silently resuming.
 
-Documented exception: a single block larger than the whole remaining budget
-is still emitted whole rather than cut — `read --format annotated` appends an
-explicit `<!-- um:oversized-block pointer="..." budget="..." -->` marker and
-`tree` reports the affected pointers in the note's `oversized_blocks` field.
+Documented exception: a single block that does not fit into the remaining
+budget is still emitted whole rather than cut — `read --format annotated`
+appends an explicit `<!-- um:oversized-block pointer="..." budget="..." -->`
+marker (the marker records the page budget, not the remainder) and `tree`
+reports the affected pointers in the note's `oversized_blocks` field.
 
 ## Limits
 
@@ -83,5 +85,9 @@ data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
   unknown inline node is withheld (`text_incomplete`) rather than partially
   extracted — search lowers `complete` accordingly, so "zero matches with
   `complete: true`" stays a trustworthy absence proof.
+- Annotated projection: document text containing the comment-opener sequence
+  `<!--` is neutralized to `<! --` so it cannot forge CLI anchors or markers;
+  inside tables, row/cell/paragraph anchors are emitted inline within the
+  cells, and anything unrenderable in a cell is marked explicitly.
 - No stage-A command modifies input files, creates temp files, executes
   document content, or performs network access.

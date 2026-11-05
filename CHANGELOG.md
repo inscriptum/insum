@@ -7,6 +7,17 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Fixed
 
+- Annotated reading neutralizes the `<!--` sequence coming from document
+  text — document content can no longer forge CLI anchors or markers.
+- The oversized-block marker is no longer lost when content follows the
+  oversized block on the same page.
+- Empty table rows keep their pointer anchors; multi-paragraph cells are
+  separated; list items inside table cells with nested blocks stay explicit.
+- `search --note <title>` with an ambiguous title aggregates the matching
+  note ids across all searched files instead of reporting only the first.
+- A `--note` title lookup is strictly exact: case and prefix variants miss
+  (with a hint pointing to `insum ls`).
+
 - Table projection in annotated reading no longer silently drops cell
   content: lists in cells flatten with their markers, bold/italic/code
   survive, unknown inline nodes get explicit markers, and row/cell/paragraph
