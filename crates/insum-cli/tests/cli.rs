@@ -59,7 +59,7 @@ fn no_arguments_print_help_and_exit_zero() {
 #[test]
 fn unknown_command_is_json_usage_error() {
     let output = insum().arg("frobnicate").output().unwrap();
-    assert_eq!(output.status.code, Some(2), "USAGE exits 2");
+    assert_eq!(output.status.code(), Some(2), "USAGE exits 2");
     assert!(output.stdout.is_empty(), "stdout stays empty on error");
     let stderr = String::from_utf8(output.stderr).unwrap();
     let value: Value = serde_json::from_str(&stderr).expect("stderr is one JSON error object");
