@@ -120,7 +120,7 @@ pub fn run(
         let start_block = cursor.as_ref().map_or(0, |c| c.block_index);
         let header = format!(
             "<!-- um:api_version=1 note_id=\"{}\" note_rev=\"{}\" -->\n",
-            view.note_id.clone().unwrap_or_default(),
+            escape_comment_value(&view.note_id.clone().unwrap_or_default()),
             view.note_rev
         );
         out.push_str(&header);
@@ -372,7 +372,9 @@ fn render_block(
                     .and_then(Value::as_str)
                     .and_then(|class| class.strip_prefix("language-"))
                     .unwrap_or(""),
-            );
+            )
+            .replace('\n', " ")
+            .replace('`', "");
             out.push_str("```");
             out.push_str(&language);
             out.push('\n');
@@ -496,9 +498,16 @@ fn render_block(
 /// Escape a document-controlled value interpolated into a CLI comment
 /// template: both comment delimiters are broken so the value can neither
 /// open a forged comment nor close the CLI's own one early (review X-01
-/// class 3).
+/// class 3). Double quotes and newlines are also neutralized (review
+/// Y-01/Y-02): a quote cannot terminate an attribute to inject a new one,
+/// and a newline cannot split the header into a separate forged line.
 fn escape_comment_value(value: &str) -> String {
-    value.replace("<!--", "<! --").replace("-->", "-- >")
+    value
+        .replace("<!--", "<! --")
+        .replace("-->", "-- >")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
+        .replace('\r', "")
 }
 
 /// Apply projection marks to a text piece; unknown mark types are collected
