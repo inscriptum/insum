@@ -206,7 +206,7 @@ pub fn run(
         }
         scratch.push_str(&format!(
             "<!-- um:api_version=1 note_id=\"{}\" note_rev=\"{}\" -->\n",
-            view.note_id.clone().unwrap_or_default(),
+            escape_comment_value(&view.note_id.clone().unwrap_or_default()),
             view.note_rev
         ));
         let blocks = insum_core::traverse(&view.doc, None, limits.max_depth);
@@ -503,11 +503,14 @@ fn render_block(
 /// and a newline cannot split the header into a separate forged line.
 fn escape_comment_value(value: &str) -> String {
     value
+        // deletions first: no later step can reassemble what was removed
+        .replace('\r', "")
+        // structural escapes: backslash before quote (Z-05), then delimiters
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
         .replace("<!--", "<! --")
         .replace("-->", "-- >")
-        .replace('"', "\\\"")
         .replace('\n', " ")
-        .replace('\r', "")
 }
 
 /// Apply projection marks to a text piece; unknown mark types are collected
@@ -618,7 +621,9 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
 /// W-02/V-06). `<!--` becomes `<! --` — readable, visibly altered, and
 /// impossible to reassemble into `<!--` without editing.
 fn neutralize_marker_syntax(text: &str) -> String {
-    text.replace("<!--", "<! --")
+    // CR removal first (Z-03): a CR-stripping consumer cannot reassemble
+    // delimiters from text that had its CR removed before neutralization
+    text.replace('\r', "").replace("<!--", "<! --")
 }
 
 fn anchor_comment(block: &BlockEntry) -> String {
