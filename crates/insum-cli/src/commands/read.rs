@@ -282,10 +282,11 @@ fn render_block(
         .unwrap_or(&[]);
     let inline = block.text.clone();
 
+    // attrs.id is document-controlled — escaped for the comment template
     let id_suffix = block
         .id
         .as_deref()
-        .map(|id| format!(" um:id=\"{id}\""))
+        .map(|id| format!(" um:id=\"{}\"", escape_comment_value(id)))
         .unwrap_or_default();
     out.push_str(&format!(
         "<!-- um:pointer=\"{}\"{} -->\n",
@@ -364,14 +365,16 @@ fn render_block(
             }
         }
         "hljsCodeBlock" => {
-            let language = block
-                .attrs
-                .get("class")
-                .and_then(Value::as_str)
-                .and_then(|class| class.strip_prefix("language-"))
-                .unwrap_or("");
+            let language = escape_comment_value(
+                block
+                    .attrs
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .and_then(|class| class.strip_prefix("language-"))
+                    .unwrap_or(""),
+            );
             out.push_str("```");
-            out.push_str(language);
+            out.push_str(&language);
             out.push('\n');
             for child in children {
                 if let Some(text) = &child.text {
@@ -483,57 +486,75 @@ fn render_block(
             // known-but-unrendered or unknown nodes stay explicit (spec §6.5)
             out.push_str(&format!(
                 "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->\n",
-                block.node_type, block.pointer
+                escape_comment_value(&block.node_type),
+                block.pointer
             ));
         }
     }
 }
 
+/// Escape a document-controlled value interpolated into a CLI comment
+/// template: both comment delimiters are broken so the value can neither
+/// open a forged comment nor close the CLI's own one early (review X-01
+/// class 3).
+fn escape_comment_value(value: &str) -> String {
+    value.replace("<!--", "<! --").replace("-->", "-- >")
+}
+
+/// Apply projection marks to a text piece; unknown mark types are collected
+/// for the trailing marker.
+fn apply_inline_marks(text: &str, marks: Option<&Vec<Value>>, unknown: &mut Vec<String>) -> String {
+    let mut wrapped = text.to_owned();
+    if let Some(marks) = marks {
+        for mark in marks {
+            match mark.get("type").and_then(Value::as_str).unwrap_or("") {
+                "bold" | "strong" => wrapped = format!("**{wrapped}**"),
+                "italic" | "em" => wrapped = format!("*{wrapped}*"),
+                "code" => wrapped = format!("`{wrapped}`"),
+                "strike" => wrapped = format!("~~{wrapped}~~"),
+                "" => {}
+                other => unknown.push(other.to_owned()),
+            }
+        }
+    }
+    wrapped
+}
+
 /// Render the inline content of a paragraph-like block with markdown marks
-/// (known marks are projected; unknown marks get an explicit
-/// trailing marker instead of a silent loss, spec §6.5).
+/// (known marks are projected; unknown marks get an explicit trailing
+/// marker instead of a silent loss, spec §6.5).
+///
+/// Boundary-based neutralization (review X-01): document-sourced pieces
+/// (text runs, hard breaks, wikiLink projections) accumulate into a run
+/// that is neutralized AS A WHOLE on flush — a forged `<!--` split across
+/// adjacent text nodes forms (and is broken) inside the composed run, so
+/// per-node neutralization cannot be bypassed. CLI-emitted markers
+/// (unrendered-inline) are interleaved between runs and never pass through
+/// the neutralizer.
 fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
     let raw_node = insum_core::resolve(doc, &block.pointer)
         .cloned()
         .unwrap_or(Value::Null);
     let mut out = String::new();
-    let mut unknown_marks: Vec<&str> = Vec::new();
+    let mut doc_run = String::new();
+    let mut unknown_marks: Vec<String> = Vec::new();
     if let Some(children) = raw_node.get("content").and_then(Value::as_array) {
         for child in children {
             let child_type = child.get("type").and_then(Value::as_str).unwrap_or("");
             match child_type {
                 "text" => {
-                    let text = neutralize_marker_syntax(
-                        child.get("text").and_then(Value::as_str).unwrap_or(""),
-                    );
-                    let marks = child.get("marks").and_then(Value::as_array);
-                    let mut wrapped = text;
-                    if let Some(marks) = marks {
-                        for mark in marks {
-                            let mark_type = mark.get("type").and_then(Value::as_str).unwrap_or("");
-                            match mark_type {
-                                "bold" | "strong" => {
-                                    wrapped = format!("**{wrapped}**");
-                                }
-                                "italic" | "em" => {
-                                    wrapped = format!("*{wrapped}*");
-                                }
-                                "code" => {
-                                    wrapped = format!("`{wrapped}`");
-                                }
-                                "strike" => {
-                                    wrapped = format!("~~{wrapped}~~");
-                                }
-                                "" => {}
-                                other => unknown_marks.push(other),
-                            }
-                        }
-                    }
-                    out.push_str(&wrapped);
+                    let text = child.get("text").and_then(Value::as_str).unwrap_or("");
+                    doc_run.push_str(&apply_inline_marks(
+                        text,
+                        child.get("marks").and_then(Value::as_array),
+                        &mut unknown_marks,
+                    ));
                 }
-                "hardBreak" => out.push('\n'),
+                "hardBreak" => doc_run.push('\n'),
                 "wikiLink" => {
-                    // renders as its label; keep the link target explicit
+                    // renders as its label; keep the link target explicit.
+                    // label/path are document-controlled — they join the run
+                    // and are neutralized with it (X-01 class 2).
                     let attrs = child.get("attrs");
                     let label = attrs
                         .and_then(|a| a.get("text"))
@@ -543,22 +564,35 @@ fn render_inline_nodes(block: &BlockEntry, doc: &Value) -> String {
                         .and_then(|a| a.get("path"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    out.push_str(&format!("[{label}]({path})"));
+                    doc_run.push_str(&format!("[{label}]({path})"));
                 }
                 other => {
                     if !INLINE_NODE_TYPES.contains(&other) {
-                        out.push_str(&format!("<!-- um:unrendered-inline type=\"{other}\" -->"));
+                        // flush the document run BEFORE the CLI marker: the
+                        // neutralization applies to the composed run, the
+                        // marker template stays intact
+                        out.push_str(&neutralize_marker_syntax(&doc_run));
+                        doc_run.clear();
+                        out.push_str(&format!(
+                            "<!-- um:unrendered-inline type=\"{}\" -->",
+                            escape_comment_value(other)
+                        ));
                     }
                 }
             }
         }
     }
+    out.push_str(&neutralize_marker_syntax(&doc_run));
     unknown_marks.sort();
     unknown_marks.dedup();
     if !unknown_marks.is_empty() {
+        let escaped: Vec<String> = unknown_marks
+            .iter()
+            .map(|mark| escape_comment_value(mark))
+            .collect();
         out.push_str(&format!(
             " <!-- um:unrendered-marks=\"{}\" -->",
-            unknown_marks.join(",")
+            escaped.join(",")
         ));
     }
     out
@@ -582,11 +616,13 @@ fn anchor_comment(block: &BlockEntry) -> String {
     format!("<!-- um:pointer=\"{}\" -->", block.pointer)
 }
 
-/// Unrendered marker for a block.
+/// Unrendered marker for a block. The type is document-controlled and
+/// escaped (X-01 class 3); the pointer is CLI-computed.
 fn unrendered_marker(block: &BlockEntry) -> String {
     format!(
         "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->\n",
-        block.node_type, block.pointer
+        escape_comment_value(&block.node_type),
+        block.pointer
     )
 }
 
@@ -611,7 +647,8 @@ fn cell_child_inline(
             if parts.is_empty() {
                 format!(
                     "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->",
-                    child.node_type, child.pointer
+                    escape_comment_value(&child.node_type),
+                    child.pointer
                 )
             } else {
                 parts.join("<br>")
@@ -625,7 +662,9 @@ fn cell_child_inline(
             let text = neutralize_marker_syntax(&child.text.clone().unwrap_or_default());
             format!(
                 "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->{}",
-                child.node_type, child.pointer, text
+                escape_comment_value(&child.node_type),
+                child.pointer,
+                text
             )
         }
     }
@@ -687,7 +726,8 @@ fn inline_list_lines(
                 let text = neutralize_marker_syntax(&item_child.text.clone().unwrap_or_default());
                 parts.push(format!(
                     "{marker}<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->{text}",
-                    item_child.node_type, item_child.pointer
+                    escape_comment_value(&item_child.node_type),
+                    item_child.pointer
                 ));
             }
         }

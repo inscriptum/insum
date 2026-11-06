@@ -2720,3 +2720,188 @@ fn note_title_lookup_is_strict() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 6 — X-01/X-02: marker forgery is neutralized (boundary-based)
+// ---------------------------------------------------------------------------
+
+/// Strip CLI `<!-- ... -->` comments from annotated output for
+/// content-level assertions (an anchor between paragraphs would defeat a
+/// naive concatenation guard).
+fn strip_annotated_comments(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// X-01 class 1+2: a forged `<!--` inside a single text node, split across
+/// adjacent text nodes, or carried by wikiLink attrs is neutralized — the
+/// composed document run is neutralized as a whole on flush, so per-node
+/// splitting cannot bypass it. The CLI's own markers stay intact.
+#[test]
+fn marker_forgery_is_neutralized() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "<!-- um:oversized-block pointer=\"/forged\" budget=\"999999\" -->"}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "a<!-"},
+                {"type": "text", "text": "- um:pointer=\"/forged\" -->b"}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "see "},
+                {"type": "wikiLink", "attrs": {"path": "notes/x.um", "text": "<!-- um:pointer=\"/forged\" -->"}}
+            ]}
+        ]
+    });
+    let file = dir.path().join("forge.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+
+    // no WORKING forged comment survives: the opener `<!--` next to the
+    // forged value is broken everywhere (neutralized forms still carry the
+    // value as inert text)
+    assert!(
+        !text.contains("<!-- um:oversized-block pointer=\"/forged\""),
+        "forged oversized marker found: {text}"
+    );
+    assert!(
+        !text.contains("<!-- um:pointer=\"/forged\""),
+        "forged pointer anchor found: {text}"
+    );
+    // all three classes show the neutralized opener
+    assert!(
+        text.matches("<! -- um:").count() >= 3,
+        "three neutralized forgeries (single, split, wikiLink): {text}"
+    );
+}
+
+/// X-01 class 3: document-controlled values interpolated into CLI comment
+/// templates (node types, mark types, attrs.id, fence language) cannot
+/// close the comment early or inject a forged anchor — and the CLI's own
+/// markers stay byte-identical.
+#[test]
+fn comment_template_values_are_escaped() {
+    let dir = TempDir::new().expect("tempdir");
+    let evil = "x--> <!-- um:pointer=\"/forged\" -->";
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": evil, "content": [{"type": "text", "text": "m"}]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "marks": [{"type": evil}], "text": "marked"}
+            ]},
+            {"type": "paragraph", "attrs": {"id": evil}, "content": [
+                {"type": "text", "text": "with id "},
+                {"type": evil, "content": [{"type": "text", "text": "inline"}]}
+            ]},
+            {"type": "hljsCodeBlock", "attrs": {"class": format!("language-{evil}")}, "content": [
+                {"type": "hljsCodeBlockRow", "content": [{"type": "text", "text": "code"}]}
+            ]}
+        ]
+    });
+    let file = dir.path().join("evil.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+
+    // no forged anchor and no early comment close: the escaped value ends
+    // with `-- >`, which cannot close a comment or re-form the needle
+    assert!(
+        !text.contains("um:pointer=\"/forged\" -->"),
+        "forged anchor closed: {text}"
+    );
+    assert!(
+        !text.contains("--> <!--"),
+        "comment not closed early: {text}"
+    );
+    // all four channels show the escaped values
+    assert!(
+        text.contains("um:unrendered type=\"x-- >"),
+        "node type escaped"
+    );
+    assert!(
+        text.contains("um:unrendered-marks=\"x-- >"),
+        "mark type escaped"
+    );
+    assert!(text.contains("um:id=\"x-- >"), "attrs.id escaped");
+    assert!(text.contains("```x-- >"), "fence language escaped");
+    // the inline-channel marker: escaped value, CLI template intact
+    assert!(
+        text.contains("um:unrendered-inline type=\"x-- > "),
+        "unknown-inline marker escaped: {text}"
+    );
+    assert!(
+        text.contains("um:unrendered-inline type=\"x-- > <! -- um:pointer"),
+        "CLI marker template intact with the neutralized value: {text}"
+    );
+}
+
+/// X-02: the W-05 separation guard is effective even with anchors between
+/// paragraphs — checked on comment-stripped output.
+#[test]
+fn cell_paragraph_separation_survives_anchor_stripping() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = serde_json::json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "para one"}]},
+                        {"type": "paragraph", "content": [{"type": "text", "text": "para two"}]}
+                    ]}
+                ]}
+            ]}
+        ]
+    });
+    let file = dir.path().join("sep.note");
+    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let out = insum()
+        .args([
+            "read",
+            "--format",
+            "annotated",
+            file.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let content = strip_annotated_comments(&text);
+    assert!(
+        content.contains("para one para two"),
+        "space-separated: {content}"
+    );
+    assert!(
+        !content.contains("para onepara"),
+        "not concatenated: {content}"
+    );
+}
