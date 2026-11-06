@@ -1,8 +1,8 @@
-//! `insum search` — full-text search over inline content (spec §6.4).
+//! `insum search` — full-text search over inline content.
 //!
 //! Matches live on the block that directly contains the inline text — never
-//! aggregated on ancestors (§15.1 №8). Best-effort over directories: unread
-//! files are reported in `skipped` and lower `complete` (§11).
+//! aggregated on ancestors. Best-effort over directories: unread
+//! files are reported in `skipped` and lower `complete`.
 
 use std::path::PathBuf;
 
@@ -15,7 +15,7 @@ use crate::support::{Revs, collect_files, error_value, read_notes, render_path};
 
 const DEFAULT_WINDOW: usize = 160;
 
-/// Options of one `search` invocation (spec §6.4).
+/// Options of one `search` invocation.
 pub struct SearchOptions<'a> {
     pub fixed_strings: bool,
     pub ignore_case: bool,
@@ -69,7 +69,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
     let mut ambiguous_ids: Vec<String> = Vec::new();
     let mut truncated = false;
 
-    // locations that could not be enumerated count into `skipped` (§11)
+    // locations that could not be enumerated count into `skipped`
     for walk_error in &walk_errors {
         skipped.push(json!({
             "path": walk_error.path,
@@ -100,7 +100,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
             Ok(source) => source.views,
             Err(err) => {
                 // Search is best-effort — ANY per-file error lands in
-                // skipped and lowers complete (§11); one broken file must not
+                // skipped and lowers complete; one broken file must not
                 // kill the whole run. An ambiguous --note title is NOT a
                 // plain absence: it is surfaced with its ids (PR #150 review).
                 let ambiguous_ids_here = ambiguous_note_ids(&err);
@@ -130,7 +130,7 @@ pub fn run(query: &str, options: &SearchOptions, limits: &Limits) -> Result<Valu
                 let Some(text) = &block.text else {
                     continue;
                 };
-                // The §6.4 text window is defined around the FIRST
+                // The text window is defined around the FIRST
                 // match of the block; all hits in this block share it
                 let mut block_window: Option<String> = None;
                 for found in regex.find_iter(text) {
@@ -228,7 +228,7 @@ fn ambiguous_note_ids(err: &UmError) -> Vec<String> {
 }
 
 /// A window of up to `DEFAULT_WINDOW` characters around the first match,
-/// with `…` on cut edges (spec §6.4).
+/// with `…` on cut edges.
 fn window(text: &str, start: usize, end: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let match_start = text[..start].chars().count();
@@ -251,7 +251,7 @@ fn window(text: &str, start: usize, end: usize) -> String {
     out
 }
 
-/// Neighboring structural blocks for `--context > 0` (spec §6.4).
+/// Neighboring structural blocks for `--context > 0`.
 fn context_blocks(blocks: &[insum_core::BlockEntry], index: usize, context: usize) -> Vec<Value> {
     if context == 0 {
         return Vec::new();

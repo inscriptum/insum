@@ -1,4 +1,4 @@
-//! Opaque pagination cursors (spec §6.2): base64url-encoded JSON bound to
+//! Opaque pagination cursors: base64url-encoded JSON bound to
 //! the path, note, note revision, and the last returned position.
 
 use serde_json::{Value, json};
@@ -180,7 +180,7 @@ impl Cursor {
     }
 
     /// A cursor only resumes the exact same query position and options
-    /// (spec §6.2: bound to path, note, note_rev, depth and the last
+    /// bound to path, note, note_rev, depth and the last
     /// returned position).
     pub fn validate(
         &self,
@@ -223,7 +223,7 @@ impl Cursor {
         }
         // The revision comparison is unconditional — boundary cursors
         // bind to the target note's revision, so a rewrite between pages is
-        // CURSOR_STALE on every resume shape (§6.2, §15.1 №7)
+        // CURSOR_STALE on every resume shape
         if self.note_rev != note_rev {
             return Err(cursor_stale(
                 "the note revision changed since the cursor was issued".to_owned(),

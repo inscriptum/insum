@@ -1,4 +1,4 @@
-//! Error registry — spec §11 (codes) and §5.6 (exit codes).
+//! Error registry — (codes) and (exit codes).
 //!
 //! `code` is a stable contract; `message` and `hint` are English, human-facing
 //! and may change. Errors are rendered as a single JSON object on stderr with
@@ -6,7 +6,7 @@
 
 use serde::{Serialize, Serializer};
 
-/// Stable error codes from the spec §11 registry.
+/// Stable error codes from the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
@@ -60,7 +60,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Wire representation of the code, spec §11.
+    /// Wire representation of the code,
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::Usage => "USAGE",
@@ -103,7 +103,7 @@ impl ErrorCode {
         }
     }
 
-    /// Process exit code for the code, spec §5.6.
+    /// Process exit code for the code,
     pub fn exit_code(self) -> i32 {
         match self {
             // 2 — invalid arguments / option combination
@@ -157,7 +157,7 @@ impl Serialize for ErrorCode {
     }
 }
 
-/// A structured error: one JSON object on stderr, empty stdout (spec §11).
+/// A structured error: one JSON object on stderr, empty stdout.
 #[derive(Debug, Clone, Serialize)]
 pub struct UmError {
     pub code: ErrorCode,
@@ -205,7 +205,7 @@ impl std::fmt::Display for UmError {
 
 impl std::error::Error for UmError {}
 
-/// The JSON envelope printed to stderr on failure (spec §11).
+/// The JSON envelope printed to stderr on failure.
 #[derive(Serialize)]
 pub struct ErrorEnvelope<'a> {
     pub api_version: u32,
@@ -231,7 +231,7 @@ impl From<std::io::Error> for UmError {
 mod tests {
     use super::*;
 
-    /// Spec §11 — the minimal registry: every code keeps its exit code.
+    /// Spec — the minimal registry: every code keeps its exit code.
     #[test]
     fn exit_codes_match_spec() {
         let cases: &[(ErrorCode, i32)] = &[

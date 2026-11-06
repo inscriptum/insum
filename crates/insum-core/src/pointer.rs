@@ -1,4 +1,4 @@
-//! JSON Pointer (RFC 6901) — block addressing on stage A (spec §4.3).
+//! JSON Pointer (RFC 6901) — block addressing on stage A.
 
 use crate::error::{ErrorCode, UmError};
 use serde_json::Value;

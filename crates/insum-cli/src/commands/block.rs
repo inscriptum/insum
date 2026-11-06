@@ -1,7 +1,7 @@
-//! `insum block get` — full subtree of one block (spec §6.3).
+//! `insum block get` — full subtree of one block.
 //!
 //! Stage A addresses blocks by `--pointer`; `--id` arrives with the migration
-//! stage (§2.3) and is rejected here.
+//! stage and is rejected here.
 
 use std::path::Path;
 
@@ -24,7 +24,7 @@ pub fn run(
         return Err(UmError::usage(
             "--id is not available on stage A: block IDs are not guaranteed until migration",
         )
-        .with_hint("Address the block with --pointer for now (spec §4.3)."));
+        .with_hint("Address the block with --pointer for now."));
     }
     let Some(pointer) = pointer else {
         return Err(UmError::usage(
@@ -67,7 +67,7 @@ pub fn run(
             .with_hint("Run `insum tree` to get valid pointers for this note revision.")
         })?;
 
-    // Full node JSON at the pointer, with `attrs.id` lifted out (spec §8.2);
+    // Full node JSON at the pointer, with `attrs.id` lifted out;
     // `--raw` keeps the original document form.
     let node = pointer::resolve(&view.doc, pointer).map_err(|_| {
         UmError::new(

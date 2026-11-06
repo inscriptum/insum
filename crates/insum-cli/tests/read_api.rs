@@ -1,5 +1,5 @@
-//! Stage A acceptance tests — the 13 criteria of spec §15.1 plus the error
-//! contract of §5.6/§11. Fixtures come from `insum-test-utils` and are
+//! Stage A acceptance tests — the 13 criteria of plus the error
+//! contract of/ Fixtures come from `insum-test-utils` and are
 //! generated into a temp directory per test; nothing outside it is touched.
 
 use std::fs;
@@ -28,15 +28,12 @@ fn run_json(args: &[&str]) -> Value {
 }
 
 fn stderr_json(output: &ProcessOutput) -> Value {
-    assert!(
-        output.stdout.is_empty(),
-        "stdout stays empty on error (§5.3)"
-    );
+    assert!(output.stdout.is_empty(), "stdout stays empty on error");
     serde_json::from_slice(&output.stderr).expect("stderr is one JSON error object")
 }
 
 /// A full corpus: three containers (minimal, empty, regular), two `.note`
-/// flavors and broken inputs, in one directory (§15.1 №1–2, №10).
+/// flavors and broken inputs, in one directory.
 struct Corpus {
     dir: TempDir,
 }
@@ -112,7 +109,7 @@ fn all_commands_read_minimal_empty_and_regular_containers() {
         }
 
         run_json(&["read", &file]);
-        // annotated output is a text projection, not JSON (§6.5)
+        // annotated output is a text projection, not JSON
         let annotated = insum()
             .args(["read", "--format", "annotated", &file])
             .output()
@@ -383,7 +380,7 @@ fn search_matches_inline_blocks_without_ancestor_duplicates() {
         "one entry per match, no duplicates"
     );
 
-    // regex mode with case-insensitivity (§6.4)
+    // regex mode with case-insensitivity
     let regex = run_json(&[
         "search",
         "-i",
@@ -476,10 +473,7 @@ fn read_only_and_deterministic() {
         let _ = run_json(&["search", "-F", "the", &corpus.path(name)]);
     }
     let after = corpus.hash_all();
-    assert_eq!(
-        before, after,
-        "stage A never modifies input files (§15.1 №11)"
-    );
+    assert_eq!(before, after, "stage A never modifies input files");
 
     // determinism (№13): same input, same JSON — twice
     for args in [
@@ -500,7 +494,7 @@ fn read_only_and_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
-// Limits (§5.5), errors (§11), exit codes (§5.6)
+// Limits, errors, exit codes
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -577,13 +571,13 @@ fn limits_and_error_codes_are_enforced() {
 }
 
 // ---------------------------------------------------------------------------
-// validate: block ID rules for marked documents (§6.6)
+// validate: block ID rules for marked documents
 // ---------------------------------------------------------------------------
 
 #[test]
 fn validate_checks_block_ids_only_when_marked() {
     let corpus = Corpus::new();
-    // legacy documents without the marker are fine without IDs (§2.1)
+    // legacy documents without the marker are fine without IDs
     let ok = run_json(&["validate", &corpus.path("regular.um")]);
     assert_eq!(ok["validation_level"], "structural");
     assert_eq!(ok["valid"], json_true());
@@ -705,7 +699,7 @@ fn ls_respects_hidden_and_node_modules() {
 // Review-driven regressions
 // ---------------------------------------------------------------------------
 
-/// §5.4: note_rev hashes the RAW payload bytes — re-archiving the same
+/// note_rev hashes the RAW payload bytes — re-archiving the same
 /// semantic document with different payload whitespace changes the revision.
 #[test]
 fn note_rev_follows_raw_payload_bytes() {
@@ -801,7 +795,7 @@ fn run_json_env(args: &[&str], key: &str, value: &str) -> Value {
         .unwrap_or_else(|err| panic!("stdout of {args:?} is one JSON document: {err}"))
 }
 
-/// §12: duplicate archive entries are rejected (zip 9 collapses them in
+/// duplicate archive entries are rejected (zip 9 collapses them in
 /// lookups, so the explicit probe is the only reliable guard).
 #[test]
 fn duplicate_archive_entries_are_rejected() {
@@ -879,7 +873,7 @@ fn write_zip_with_duplicate(path: &Path) {
     std::fs::write(path, out).expect("write raw zip");
 }
 
-/// §6.2: a cursor issued with other --depth/--text-limit options is stale.
+/// a cursor issued with other --depth/--text-limit options is stale.
 #[test]
 fn cursor_rejects_changed_query_options() {
     let corpus = Corpus::new();
@@ -907,7 +901,7 @@ fn cursor_rejects_changed_query_options() {
     assert_eq!(stderr_json(&output)["error"]["code"], "CURSOR_STALE");
 }
 
-/// §6.2: a cursor position past the document is stale, not an empty page.
+/// a cursor position past the document is stale, not an empty page.
 #[test]
 fn cursor_past_the_end_is_stale() {
     let corpus = Corpus::new();
@@ -987,7 +981,7 @@ fn base64url_decode(text: &str) -> Vec<u8> {
     out
 }
 
-/// §6.4: search honors --max-bytes by truncating at whole matches.
+/// search honors --max-bytes by truncating at whole matches.
 #[test]
 fn search_respects_max_bytes_budget() {
     let corpus = Corpus::new();
@@ -1005,7 +999,7 @@ fn search_respects_max_bytes_budget() {
     assert!(!result["matches"].as_array().unwrap().is_empty());
 }
 
-/// §6.6: --strict turns warnings into errors and flips `valid`.
+/// --strict turns warnings into errors and flips `valid`.
 #[test]
 fn validate_strict_turns_warnings_into_errors() {
     let dir = TempDir::new().expect("tempdir");
@@ -1056,7 +1050,7 @@ fn search_in_a_note_file_and_directory_work() {
 // Contract fixes: revisions, structural validation, best-effort search, budgets, symlinks
 // ---------------------------------------------------------------------------
 
-/// §8.6 formula computed INDEPENDENTLY in the test (raw payload bytes from
+/// formula computed INDEPENDENTLY in the test (raw payload bytes from
 /// the archive, BE64 lengths, NUL-terminated domain) — not via insum-core.
 #[test]
 fn note_rev_matches_spec_8_6_formula() {
@@ -1091,7 +1085,7 @@ fn note_rev_matches_spec_8_6_formula() {
         .clone();
     let canonical = canonical_json_str(descriptor);
 
-    // literal §8.6: "UM-NOTE-REV-1\x00" + BE64 + payload + BE64 + descriptor
+    // literal: "UM-NOTE-REV-1\x00" + BE64 + payload + BE64 + descriptor
     let mut hasher = Sha256::new();
     hasher.update(b"UM-NOTE-REV-1\x00");
     hasher.update((payload.len() as u64).to_be_bytes());
@@ -1099,7 +1093,7 @@ fn note_rev_matches_spec_8_6_formula() {
     hasher.update((canonical.len() as u64).to_be_bytes());
     hasher.update(canonical.as_bytes());
     let expected = format!("sha256:{}", hex(&hasher.finalize()));
-    assert_eq!(cli_rev, expected, "note_rev follows §8.6 (BE, NUL domain)");
+    assert_eq!(cli_rev, expected, "note_rev follows (BE, NUL domain)");
 }
 
 fn read_zip_entry_bytes(path: &str, name: &str) -> Vec<u8> {
@@ -1155,7 +1149,7 @@ fn revisions_carry_the_sha256_prefix() {
     assert!(note_ls["note_rev"].as_str().unwrap().starts_with("sha256:"));
 }
 
-/// §10.1 structural checks: attrs/text/content/marks shape errors.
+/// structural checks: attrs/text/content/marks shape errors.
 #[test]
 fn validate_catches_broken_structures() {
     let dir = TempDir::new().expect("tempdir");
@@ -1200,7 +1194,7 @@ fn validate_catches_broken_structures() {
     assert!(warn_codes.contains(&"UNKNOWN_NODE_TYPE"));
 }
 
-/// §4.7: unknown inline nodes withhold text and lower search completeness.
+/// unknown inline nodes withhold text and lower search completeness.
 #[test]
 fn unknown_inline_nodes_are_not_silent() {
     let dir = TempDir::new().expect("tempdir");
@@ -1232,7 +1226,7 @@ fn unknown_inline_nodes_are_not_silent() {
     assert_eq!(search["warnings"].as_array().unwrap().len(), 1);
 }
 
-/// §6.5: anchors precede nested blocks; known marks project to markdown.
+/// anchors precede nested blocks; known marks project to markdown.
 #[test]
 fn annotated_covers_nested_blocks_and_marks() {
     let corpus = Corpus::new();
@@ -1516,7 +1510,7 @@ fn hostile_limits_are_enforced() {
     assert!(hits["matches"].as_array().unwrap().len() <= 2);
 }
 
-/// Unsafe archive entry names are rejected (§12).
+/// Unsafe archive entry names are rejected.
 #[test]
 fn unsafe_zip_entry_names_are_rejected() {
     let dir = TempDir::new().expect("tempdir");
@@ -1939,7 +1933,7 @@ fn list_marker_survives_non_paragraph_first_child() {
 
 /// A boundary cursor binds the TARGET note's revision. Rewrite that
 /// note between pages (same id, new content) → the resume is CURSOR_STALE,
-/// phrased about the revision — never a silent new edition (§6.2, §15.1 №7).
+/// phrased about the revision — never a silent new edition.
 #[test]
 fn tree_boundary_cursor_detects_target_note_rewrite() {
     let dir = TempDir::new().expect("tempdir");
@@ -2185,7 +2179,7 @@ fn annotated_renders_tables_as_markdown() {
         data_line.contains("re\\|ad<br>next"),
         "pipes escaped, newlines as <br>: {data_line}"
     );
-    // §6.5 anchors ride inline inside the cells: row, cell, paragraph
+    // anchors ride inline inside the cells: row, cell, paragraph
     assert!(
         text.contains("um:pointer=\"/content/0/content/1\""),
         "row anchor"
@@ -2403,7 +2397,7 @@ fn table_projection_preserves_cell_content() {
         text.contains("[link](notes/x.um)"),
         "wikiLink projected: {text}"
     );
-    // §6.5 anchors for row/cell levels
+    // anchors for row/cell levels
     assert!(
         text.contains("um:pointer=\"/content/0/content/0\""),
         "row anchor"

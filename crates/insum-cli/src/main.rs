@@ -1,9 +1,9 @@
 //! `insum` — CLI for reading and writing Inscriptum knowledge bases.
 //!
-//! Global conventions: spec §5. Every command outputs exactly one JSON
+//! Global conventions: Every command outputs exactly one JSON
 //! document on stdout (terminated by a newline); on failure stdout stays
 //! empty and a single JSON error object goes to stderr with the exit code
-//! from the §11 registry. The stage A read API commands live in `commands/`.
+//! from the registry. The stage A read API commands live in `commands/`.
 
 mod commands;
 mod cursor;
@@ -16,10 +16,10 @@ use insum_core::UmError;
 
 use crate::support::Output;
 
-/// Versions reported by `insum --version` (spec §4.1).
+/// Versions reported by `insum --version`.
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const API_VERSION: u32 = 1;
-/// Supported UM Document Container Format versions (spec §4.2).
+/// Supported UM Document Container Format versions.
 const UM_VERSIONS: [u32; 1] = [1];
 
 #[derive(Parser, Debug)]
@@ -29,15 +29,15 @@ const UM_VERSIONS: [u32; 1] = [1];
     disable_version_flag = true
 )]
 struct Cli {
-    /// Print version information as JSON (spec §4.1) and exit.
+    /// Print version information as JSON and exit.
     #[arg(long)]
     version: bool,
 
-    /// Format JSON output with a two-space indent (spec §5.1).
+    /// Format JSON output with a two-space indent.
     #[arg(long, global = true)]
     pretty: bool,
 
-    /// Explicit schema artifact for commands that support it (spec §5.1).
+    /// Explicit schema artifact for commands that support it.
     #[arg(long, global = true, value_name = "PATH")]
     schema: Option<PathBuf>,
 
@@ -47,15 +47,15 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Command {
-    /// List files and notes (spec §6.1).
+    /// List files and notes.
     Ls {
-        /// Include hidden files (§5.2).
+        /// Include hidden files.
         #[arg(long)]
         hidden: bool,
         /// Directory or file; defaults to `.`.
         path: Option<String>,
     },
-    /// Compact block structure with JSON Pointers (spec §6.2).
+    /// Compact block structure with JSON Pointers.
     Tree {
         /// A .um container or a .note file.
         file: PathBuf,
@@ -75,12 +75,12 @@ enum Command {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Full subtree of one block (spec §6.3).
+    /// Full subtree of one block.
     Block {
         #[command(subcommand)]
         action: BlockAction,
     },
-    /// Full-text search over inline content (spec §6.4).
+    /// Full-text search over inline content.
     Search {
         /// Literal search instead of a Rust `regex` pattern.
         #[arg(short = 'F')]
@@ -91,7 +91,7 @@ enum Command {
         /// Maximum number of matches (default 50, cap UM_MAX_SEARCH_MATCHES).
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Include hidden files (§5.2).
+        /// Include hidden files.
         #[arg(long)]
         hidden: bool,
         /// Restrict to one note id.
@@ -108,7 +108,7 @@ enum Command {
         /// Files or directories to search; defaults to `.`.
         paths: Vec<PathBuf>,
     },
-    /// Read whole notes: JSON envelope or annotated projection (spec §6.5).
+    /// Read whole notes: JSON envelope or annotated projection.
     Read {
         /// A .um container or a .note file.
         file: PathBuf,
@@ -125,12 +125,12 @@ enum Command {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Read-only structural validation (spec §6.6).
+    /// Read-only structural validation.
     Validate {
         /// Turn warnings into errors.
         #[arg(long)]
         strict: bool,
-        /// Include hidden files (§5.2).
+        /// Include hidden files.
         #[arg(long)]
         hidden: bool,
         /// Files or directories to validate.
@@ -140,17 +140,17 @@ enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 enum BlockAction {
-    /// Get the full subtree of one block (spec §6.3).
+    /// Get the full subtree of one block.
     Get {
         /// A .um container or a .note file.
         file: PathBuf,
         /// Note id — required for .um, forbidden for .note.
         #[arg(long)]
         note: Option<String>,
-        /// JSON Pointer of the block (stage A addressing, spec §4.3).
+        /// JSON Pointer of the block (stage A addressing).
         #[arg(long)]
         pointer: Option<String>,
-        /// Block ID — available after the migration stage (§2.3).
+        /// Block ID — available after the migration stage.
         #[arg(long)]
         id: Option<String>,
         /// Return the original node JSON with `attrs.id` kept.
@@ -170,7 +170,7 @@ fn main() {
         std::process::exit(0);
     }
 
-    // --schema is accepted globally but only validate knows it (§5.1); say
+    // --schema is accepted globally but only validate knows it; say
     // so before running anything
     if !matches!(cli.command, Some(Command::Validate { .. })) && cli.schema.is_some() {
         let err = UmError::usage("--schema is supported by `insum validate` only in this release");
@@ -265,7 +265,7 @@ fn main() {
             hidden,
             paths,
         }) => {
-            // --schema is accepted globally but only validate knows it (§5.1)
+            // --schema is accepted globally but only validate knows it
             commands::validate::run(paths, *strict, cli.schema.as_deref(), *hidden, &limits)
                 .map(Output::Json)
         }
@@ -279,7 +279,7 @@ fn main() {
 }
 
 /// The `--version` payload: `cli_version`, supported `api_versions`, UM
-/// versions (spec §4.1). `api_version` is included per §5.3.
+/// versions. `api_version` is included per
 fn version_json() -> serde_json::Value {
     serde_json::json!({
         "api_version": API_VERSION,
@@ -289,7 +289,7 @@ fn version_json() -> serde_json::Value {
     })
 }
 
-/// Print exactly one JSON document plus a newline to stdout (spec §5.3).
+/// Print exactly one JSON document plus a newline to stdout.
 fn print_json(value: &serde_json::Value, pretty: bool) {
     if pretty {
         println!("{value:#}");
@@ -298,7 +298,7 @@ fn print_json(value: &serde_json::Value, pretty: bool) {
     }
 }
 
-/// Print the error envelope to stderr, stdout stays empty, exit per §11.
+/// Print the error envelope to stderr, stdout stays empty, exit per
 fn fail(err: &UmError, pretty: bool) -> ! {
     let envelope = err.envelope();
     let rendered = if pretty {
@@ -311,7 +311,7 @@ fn fail(err: &UmError, pretty: bool) -> ! {
 }
 
 /// clap-level failures: help goes to stdout (exit 0), argument errors become
-/// JSON USAGE errors on stderr (exit 2, spec §5.6/§11).
+/// JSON USAGE errors on stderr (exit 2,/).
 fn exit_with_clap_error(err: clap::Error) -> ! {
     use clap::error::ErrorKind::*;
 
@@ -325,7 +325,7 @@ fn exit_with_clap_error(err: clap::Error) -> ! {
             std::process::exit(0);
         }
         _ => {
-            // Honor --pretty even on a failed parse (spec §5.3: it only
+            // Honor --pretty even on a failed parse (it only
             // changes formatting).
             let pretty = std::env::args_os().any(|arg| arg == "--pretty");
             let usage = UmError::usage(err.to_string().trim_end());

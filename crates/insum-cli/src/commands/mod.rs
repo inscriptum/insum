@@ -1,4 +1,4 @@
-//! CLI command modules — one file per read API command (spec §6).
+//! CLI command modules — one file per read API command.
 
 pub mod block;
 pub mod ls;

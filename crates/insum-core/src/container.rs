@@ -1,5 +1,5 @@
 //! Reading `.um` containers and `.note` documents: ZIP safety, revisions,
-//! note payload access. Read-only — nothing here writes (spec §2.1, §12).
+//! note payload access. Read-only — nothing here writes.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -16,7 +16,7 @@ use crate::limits::Limits;
 use crate::model::{Manifest, NoteDescriptor, NoteDoc};
 
 /// A `.um` container opened for reading. `file_rev` is computed from the
-/// file bytes; note payloads are decompressed on demand only (spec §6.1:
+/// file bytes; note payloads are decompressed on demand only (
 /// central directory + manifest without unpacking payload).
 pub struct UmContainer {
     archive: ZipArchive<File>,
@@ -74,7 +74,7 @@ impl UmContainer {
         })
     }
 
-    /// `file_rev` — SHA-256 of all file bytes (spec §5.4), computed on first
+    /// `file_rev` — SHA-256 of all file bytes, computed on first
     /// request through the descriptor held since open (no re-open,
     /// seek(0) + read), then cached.
     pub fn file_rev(&mut self) -> Result<String, UmError> {
@@ -102,7 +102,7 @@ impl UmContainer {
         Ok(self.file_rev_cache.clone().expect("just cached"))
     }
 
-    /// Note descriptors sorted by `order`, then `id` (spec §5.3).
+    /// Note descriptors sorted by `order`, then `id`.
     pub fn notes_in_order(&self) -> Vec<&NoteDescriptor> {
         let mut notes: Vec<&NoteDescriptor> = self.manifest.notes.iter().collect();
         notes.sort_by_key(|note| (note.order, note.id.clone()));
@@ -123,7 +123,7 @@ impl UmContainer {
     }
 
     /// Read and parse one note payload. The entry size is checked against
-    /// the limit before decompression (spec §12). No revision is computed —
+    /// the limit before decompression. No revision is computed —
     /// the light path for consumers that never output revisions.
     pub fn read_note(
         &mut self,
@@ -135,7 +135,7 @@ impl UmContainer {
 
     /// Read one note payload and compute its `note_rev` in the same pass.
     ///
-    /// `note_rev` per spec §5.4: SHA-256 over length-prefixed components —
+    /// `note_rev` per: SHA-256 over length-prefixed components —
     /// the domain `UM-NOTE-REV-1`, the RAW uncompressed payload bytes (not a
     /// re-serialization) and the canonical (RFC 8785-style) JSON of the
     /// note's manifest descriptor.
@@ -266,17 +266,17 @@ fn json_depth_exceeds(text: &str, max_depth: usize) -> bool {
     false
 }
 
-/// The wire format of every revision (§5.4/§6.2/§8.5 examples: `sha256:` +
+/// The wire format of every revision (// examples: `sha256:` +
 /// 64 hex characters). Internal hashing stays on raw bytes.
 pub fn format_rev(hex: String) -> String {
     format!("sha256:{hex}")
 }
 
-/// `note_rev` per spec §8.6 — the normative formula:
+/// `note_rev` per — the normative formula:
 /// `SHA-256("UM-NOTE-REV-1\x00" + BE64(len) + payload + BE64(len) + descriptor)`
 /// where the descriptor is the canonical (RFC 8785-style) JSON of the note's
-/// manifest entry. §5.4's "length before value" wording does not fix the byte
-/// order; §8.6 does (big-endian) and wins as the more precise contract.
+/// manifest entry.'s "length before value" wording does not fix the byte
+/// order; does (big-endian) and wins as the more precise contract.
 pub fn note_rev_hex(payload_bytes: &[u8], canonical_descriptor: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"UM-NOTE-REV-1\x00");
@@ -288,7 +288,7 @@ pub fn note_rev_hex(payload_bytes: &[u8], canonical_descriptor: &[u8]) -> String
 }
 
 /// `note_rev` for a `.note` file: SHA-256 of the whole file bytes
-/// (legacy document or full envelope, spec §5.4).
+/// (legacy document or full envelope).
 pub fn note_rev_for_file_bytes(file_bytes: &[u8]) -> String {
     format_rev(sha256_hex(file_bytes))
 }
@@ -297,7 +297,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-/// Read a file with a hard byte cap (spec §12: limits are enforced on the
+/// Read a file with a hard byte cap (limits are enforced on the
 /// actual bytes, races with growing files included).
 fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
     let file = File::open(path).map_err(|err| path_error(path, err))?;
@@ -343,7 +343,7 @@ fn read_manifest_value(archive: &mut ZipArchive<File>, limits: &Limits) -> Resul
     parse_json_limited(&text, limits.max_depth, ErrorCode::ManifestInvalid)
 }
 
-/// ZIP safety per spec §12: unsafe or duplicate entry names are rejected;
+/// ZIP safety per: unsafe or duplicate entry names are rejected;
 /// entry sizes and totals are checked against the actual central directory.
 fn check_archive_safety(archive: &mut ZipArchive<File>, limits: &Limits) -> Result<(), UmError> {
     if archive.len() > limits.max_archive_entries {
@@ -354,7 +354,7 @@ fn check_archive_safety(archive: &mut ZipArchive<File>, limits: &Limits) -> Resu
         )));
     }
     // zip 9 keeps entries in a name-keyed map, so duplicates collapse during
-    // lookup — the explicit probe is the only reliable rejection (§12)
+    // lookup — the explicit probe is the only reliable rejection
     if archive.has_duplicate_names() {
         return Err(UmError::new(
             ErrorCode::ArchiveDuplicateEntry,
@@ -362,7 +362,7 @@ fn check_archive_safety(archive: &mut ZipArchive<File>, limits: &Limits) -> Resu
         ));
     }
     // entry names, sizes and the uncompressed total — all from the actual
-    // central directory data (spec §12)
+    // central directory data
     let mut total: u64 = 0;
     for index in 0..archive.len() {
         let entry = archive.by_index_raw(index).map_err(|err| {
@@ -440,14 +440,14 @@ fn path_error(path: &Path, err: std::io::Error) -> UmError {
 /// A `.note` document opened for reading (legacy raw doc or envelope).
 pub struct NoteFile {
     pub note: NoteDoc,
-    /// Envelope metadata (spec §4.6) — extracted point-wise so the whole
+    /// Envelope metadata — extracted point-wise so the whole
     /// payload is never cloned on the read path.
     pub envelope_format: Option<String>,
     pub features: Option<Value>,
     pub schema: Option<Value>,
     pub path: PathBuf,
     pub file_rev: String,
-    /// `note_rev` for `.note` is the hash of the whole file (spec §5.4).
+    /// `note_rev` for `.note` is the hash of the whole file.
     pub note_rev: String,
     pub bytes: u64,
 }
@@ -455,10 +455,10 @@ pub struct NoteFile {
 impl NoteFile {
     pub fn open(path: &Path, limits: &Limits, with_revs: bool) -> Result<Self, UmError> {
         // Read with a hard cap instead of stat-then-read: a FIFO or a file
-        // growing between stat and read cannot inflate the allocation (§12).
+        // growing between stat and read cannot inflate the allocation.
         let raw = read_bounded(path, limits)?;
         let bytes = raw.len() as u64;
-        // §5.4: for .note both revisions hash the whole file — one digest
+        //: for.note both revisions hash the whole file — one digest
         // serves both; skipped entirely on the light path
         let (file_rev, note_rev) = if with_revs {
             let digest = format_rev(sha256_hex(&raw));
@@ -496,7 +496,7 @@ impl NoteFile {
 
 /// Read a `.um` container's manifest without computing `file_rev` and
 /// without touching note payloads — the fast path for directory listing
-/// (spec §6.1, acceptance §15.1 №3, №12).
+///.
 pub fn peek_um_manifest(path: &Path, limits: &Limits) -> Result<(Manifest, Vec<String>), UmError> {
     let mut archive = ZipArchive::new(File::open(path).map_err(|err| path_error(path, err))?)
         .map_err(|err| {
@@ -520,7 +520,7 @@ pub fn peek_um_manifest(path: &Path, limits: &Limits) -> Result<(Manifest, Vec<S
 }
 
 /// Classify a path for `ls`/traversal: `.um` and `.note` (case-insensitive),
-/// per spec §5.2.
+/// per
 pub fn classify_extension(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "um" => Some("um"),

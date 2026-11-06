@@ -1,4 +1,4 @@
-//! `insum tree` — compact block structure with JSON Pointers (spec §6.2).
+//! `insum tree` — compact block structure with JSON Pointers.
 
 use std::path::Path;
 
@@ -31,7 +31,7 @@ pub fn run(
     };
 
     // The exposed sequence is NOT narrowed by the cursor — pagination
-    // must reach every note (§6.2). The reader parses payloads lazily, so the
+    // must reach every note. The reader parses payloads lazily, so the
     // lazy-read win (a page only pays for the notes it emits) is preserved.
     let filters = if note.is_empty() { None } else { Some(note) };
     let mut reader = SourceReader::open(path, filters, limits, Revs::Compute)?;
@@ -165,7 +165,7 @@ fn paginate_note(
         ));
     }
     // a cursor position past the document would silently produce an empty
-    // `complete` page — treat it as stale instead (§6.2)
+    // `complete` page — treat it as stale instead
     if start_block >= traversal.blocks.len() && start_block > 0 {
         return Err(stale_cursor(
             "cursor block position is past the end of the note",

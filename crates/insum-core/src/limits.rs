@@ -1,10 +1,10 @@
-//! Safety limits — spec §5.5. Configured via environment variables, checked
-//! against actual data (spec §12), not just headers.
+//! Safety limits for untrusted input. Configured via environment variables, checked
+//! against actual data, not just headers.
 
 use std::env;
 
 /// One limit: default value, absolute safety ceiling, and the env var name.
-/// The ceiling is the "absolute safety cap" of §5.5: environment values above
+/// The ceiling is the absolute safety cap: environment values above
 /// it fall back to the default, and per-command options are clamped to it.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitSpec {
@@ -80,7 +80,7 @@ pub struct Limits {
 impl Limits {
     /// Read limits from the environment. Values that are absent, unparsable
     /// or above the absolute safety cap fall back to the default; a stricter
-    /// configured value is honored (spec §5.5).
+    /// configured value is honored.
     pub fn from_env() -> Self {
         let mut limits = Self::defaults();
         for (slot, spec) in [
@@ -116,7 +116,7 @@ impl Limits {
     }
 
     /// The output budget for one response: `--max-bytes` override or the
-    /// default, clamped to the absolute ceiling (spec §5.5: options refine
+    /// default, clamped to the absolute ceiling (options refine
     /// the limit but never break the safety cap).
     pub fn output_bytes(&self, requested: Option<usize>) -> usize {
         match requested {

@@ -1,7 +1,7 @@
-//! `insum ls` — listing of files and notes (spec §6.1).
+//! `insum ls` — listing of files and notes.
 //!
 //! A directory listing classifies files without computing `file_rev` and
-//! without opening note payloads (§15.1 №3, №12); a `.um` file listing reads
+//! without opening note payloads; a `.um` file listing reads
 //! the central directory and the manifest, but never decompresses payload.
 
 use std::path::{Path, PathBuf};
@@ -58,7 +58,7 @@ fn list_directory(dir: &Path, hidden: bool, limits: &Limits) -> Result<Value, Um
                     continue; // directories and symlinks are not entries
                 }
                 let path = entry.into_path();
-                // hidden files and node_modules are skipped by default (§5.2);
+                // hidden files and node_modules are skipped by default;
                 // --hidden re-enables hidden files but not node_modules. The
                 // check applies below the traversal root only: the root
                 // itself is user-specified (temp dirs are often hidden).
@@ -88,7 +88,7 @@ fn list_directory(dir: &Path, hidden: bool, limits: &Limits) -> Result<Value, Um
             _ => None,
         };
         let Some(kind) = kind else {
-            continue; // traversal only reports .um/.note (spec §5.2)
+            continue; // traversal only reports.um/.note
         };
 
         let result = match kind {

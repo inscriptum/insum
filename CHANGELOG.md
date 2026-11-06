@@ -21,7 +21,7 @@ Format — Keep a Changelog; versioning — SemVer.
 - Table projection in annotated reading no longer silently drops cell
   content: lists in cells flatten with their markers, bold/italic/code
   survive, unknown inline nodes get explicit markers, and row/cell/paragraph
-  anchors are emitted inline (§6.5 inside tables).
+ anchors are emitted inline.
 - `search --note <title>` no longer masks an ambiguous title as "not found":
   the ambiguity error now lists the matching note ids.
 - A block larger than the whole page budget is emitted whole with an explicit

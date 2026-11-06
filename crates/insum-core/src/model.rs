@@ -1,4 +1,4 @@
-//! Data model: manifests, note documents, block traversal (spec §4.2, §4.6,
+//! Data model: manifests, note documents, block traversal (,
 //! and the node types observed in real on-disk Inscriptum documents).
 
 use serde_json::{Map, Value};
@@ -12,12 +12,12 @@ use crate::error::{ErrorCode, UmError};
 pub const INLINE_NODE_TYPES: [&str; 3] = ["text", "hardBreak", "wikiLink"];
 
 /// Reserved attr that holds the block ID once migration/annotation happened
-/// (spec §4.4); it is reported separately, not inside `attrs`.
+///; it is reported separately, not inside `attrs`.
 pub const ID_ATTR: &str = "id";
 
 /// The node dictionary observed in real on-disk Inscriptum documents.
 /// Types outside it are preserved but reported as unknown (warnings) — and
-/// their text cannot be extracted (§4.7).
+/// their text cannot be extracted.
 pub const KNOWN_NODE_TYPES: [&str; 28] = [
     "noteDoc",
     "doc",
@@ -50,7 +50,7 @@ pub const KNOWN_NODE_TYPES: [&str; 28] = [
 ];
 
 /// A parsed manifest: known fields extracted, the raw value kept for
-/// unknown-field preservation (spec §3.10, §12).
+/// unknown-field preservation.
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub format: String,
@@ -186,7 +186,7 @@ impl NoteDescriptor {
     }
 
     /// `features.block_ids == 1` marks documents whose IDs are guaranteed
-    /// (spec §4.6); only `insum migrate-ids` writes the marker.
+    ///; only `insum migrate-ids` writes the marker.
     pub fn block_ids_enabled(&self) -> bool {
         self.features
             .as_ref()
@@ -197,7 +197,7 @@ impl NoteDescriptor {
 }
 
 /// A parsed note payload: legacy raw `noteDoc` or a document inside an
-/// `inscriptum-note` envelope (spec §4.6).
+/// `inscriptum-note` envelope.
 #[derive(Debug, Clone)]
 pub struct NoteDoc {
     /// The ProseMirror-like document (`type: "noteDoc"`).
@@ -274,7 +274,7 @@ fn validate_doc(doc: &Value) -> Result<(), UmError> {
     Ok(())
 }
 
-/// One block in the flat preorder listing (`tree`, search, §6.2).
+/// One block in the flat preorder listing (`tree`, search).
 #[derive(Debug, Clone)]
 pub struct BlockEntry {
     pub pointer: String,
@@ -285,10 +285,10 @@ pub struct BlockEntry {
     pub index: usize,
     pub attrs: Value,
     /// Text of nodes whose direct content is inline; never aggregates
-    /// children (spec §6.2/§6.4).
+    /// children.
     pub text: Option<String>,
     /// True when `text` was dropped because the content contains an inline
-    /// node type outside the known dictionary (spec §4.7).
+    /// node type outside the known dictionary.
     pub text_incomplete: bool,
     pub children_truncated: bool,
 }
@@ -298,11 +298,11 @@ pub struct BlockEntry {
 pub struct Traversal {
     pub blocks: Vec<BlockEntry>,
     /// True when the document is deeper than the enforced JSON depth limit
-    /// (UM_MAX_DEPTH) — callers must fail with `LIMIT_EXCEEDED` (spec §5.5).
+    /// (UM_MAX_DEPTH) — callers must fail with `LIMIT_EXCEEDED`.
     pub depth_exceeded: bool,
     /// True when some block lost its text because of an unknown inline node
     /// type — search/tree consumers must not claim full completeness
-    /// (spec §4.7, §3.5 «никаких тихих потерь»).
+    ///.
     pub unknown_inline: bool,
 }
 
@@ -382,7 +382,7 @@ fn walk(
     let mut children_truncated = false;
 
     // `--depth n` shows levels 0..n-1; a parent at the cut is emitted and
-    // marked `children_truncated` instead of its descendants (spec §6.2).
+    // marked `children_truncated` instead of its descendants.
     let descend = match max_depth {
         None => true,
         Some(max) => depth + 1 < max,
@@ -426,10 +426,10 @@ fn walk(
 }
 
 /// Direct inline text of a node, if its content consists of inline nodes.
-/// Parent containers never aggregate descendant text (spec §6.2). The flag
+/// Parent containers never aggregate descendant text. The flag
 /// reports unknown inline node types: their text is unknowable without a
 /// schema artifact, so partial text is withheld instead of silently
-/// returned (spec §4.7, §3.5).
+/// returned.
 fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
     let Some(children) = object.get("content").and_then(Value::as_array) else {
         return (None, false);
@@ -463,7 +463,7 @@ fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
             // text of its own (normal, not a loss)
             t if KNOWN_NODE_TYPES.contains(&t) => return (None, false),
             // unknown node type: its text is unknowable without a schema
-            // artifact — withhold instead of silently dropping (§4.7, §3.5)
+            // artifact — withhold instead of silently dropping
             _ => return (None, true),
         }
     }
@@ -482,7 +482,7 @@ fn has_block_children(object: &Map<String, Value>) -> bool {
         })
 }
 
-/// Title of a note per spec §6.4: manifest title, else the first top-level
+/// Title of a note per: manifest title, else the first top-level
 /// heading's text, else null. `noteTitle` counts as a heading-equivalent —
 /// it is the semantic title node of title-schema pages.
 pub fn note_title(manifest_title: Option<&str>, doc: &Value) -> Option<String> {

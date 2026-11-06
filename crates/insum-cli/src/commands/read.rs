@@ -1,5 +1,5 @@
 //! `insum read` — whole-note reading: JSON envelope or annotated projection
-//! (spec §6.5). The projection is read-only text with pointer anchors; it is
+//! The projection is read-only text with pointer anchors; it is
 //! never a storage format and has no parser.
 
 use std::collections::HashMap;
@@ -95,7 +95,7 @@ pub fn run(
         })));
     }
 
-    // annotated: paginate by top-level blocks across notes (spec §6.5).
+    // annotated: paginate by top-level blocks across notes.
     // Page shape mirrors tree: the first note may be partial (mid-note
     // cursor); every following note is emitted whole or the page stops on
     // the note boundary with um:incomplete + cursor to it.
@@ -268,7 +268,7 @@ fn children_index(blocks: &[BlockEntry]) -> HashMap<&str, Vec<&BlockEntry>> {
 }
 
 /// Render a block with its anchor; anchors are emitted for EVERY structural
-/// block — nested paragraphs inside lists are addressable too (spec §6.5
+/// block — nested paragraphs inside lists are addressable too (
 /// «перед каждым блоком»).
 fn render_block(
     block: &BlockEntry,
@@ -483,7 +483,7 @@ fn render_block(
             }
         }
         _ => {
-            // known-but-unrendered or unknown nodes stay explicit (spec §6.5)
+            // known-but-unrendered or unknown nodes stay explicit
             out.push_str(&format!(
                 "<!-- um:unrendered type=\"{}\" pointer=\"{}\" -->\n",
                 escape_comment_value(&block.node_type),
@@ -522,7 +522,7 @@ fn apply_inline_marks(text: &str, marks: Option<&Vec<Value>>, unknown: &mut Vec<
 
 /// Render the inline content of a paragraph-like block with markdown marks
 /// (known marks are projected; unknown marks get an explicit trailing
-/// marker instead of a silent loss, spec §6.5).
+/// marker instead of a silent loss).
 ///
 /// Boundary-based neutralization (review X-01): document-sourced pieces
 /// (text runs, hard breaks, wikiLink projections) accumulate into a run

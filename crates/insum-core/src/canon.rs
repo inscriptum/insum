@@ -1,5 +1,5 @@
 //! Canonical JSON (JCS, RFC 8785) — needed to hash note descriptors for
-//! `note_rev` (spec §5.4). A JCS-lite implementation: object keys sorted,
+//! `note_rev`. A JCS-lite implementation: object keys sorted,
 //! no whitespace, minimal string escaping. Numbers go through serde_json's
 //! default formatting (integers and typical manifest values are exact); the
 //! hash contract is owned by this CLI.

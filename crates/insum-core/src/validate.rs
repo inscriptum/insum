@@ -1,8 +1,8 @@
-//! Note validation — structural checks (§10.1) and coded diagnostics (§10.2).
+//! Note validation — structural checks and coded diagnostics.
 //!
 //! Stage A implements Container and Structural JSON checks plus ID checks
 //! for documents marked `features.block_ids`; Schema checks require a schema
-//! artifact and arrive with the schema-cli task (§6.6).
+//! artifact and arrive with the schema-cli task.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -12,8 +12,8 @@ use crate::error::ErrorCode;
 use crate::limits::Limits;
 use crate::model::{INLINE_NODE_TYPES, KNOWN_NODE_TYPES};
 
-/// A single diagnostic: `code` is a stable §11 registry name, `message` is
-/// human-facing (spec §11). Severity follows §10.2: a rule is either an
+/// A single diagnostic: `code` is a stable registry name, `message` is
+/// human-facing. Severity follows: a rule is either an
 /// error or a warning; `--strict` promotes warnings.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Diag {
@@ -34,9 +34,9 @@ impl NoteValidation {
     }
 }
 
-/// Validate one note document: structure (§10.1 Structural JSON checks),
-/// unknown node types (warning, §10.2), and ID rules for documents marked
-/// `features.block_ids` (§6.6, §10.1 ID checks).
+/// Validate one note document: structure,
+/// unknown node types (warning), and ID rules for documents marked
+/// `features.block_ids`.
 pub fn validate_note_doc(
     doc: &Value,
     block_ids_enabled: bool,
@@ -143,7 +143,7 @@ fn walk_structure(
     Ok(())
 }
 
-/// ID checks for documents marked `features.block_ids` (§10.1): every
+/// ID checks for documents marked `features.block_ids`: every
 /// addressable block has an ID, IDs match `^[a-z0-9]{8,12}$` and are unique.
 fn validate_block_ids(doc: &Value, limits: &Limits, result: &mut NoteValidation) {
     let blocks = crate::traverse(doc, None, limits.max_depth);

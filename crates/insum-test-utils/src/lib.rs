@@ -1,6 +1,6 @@
 //! insum-test-utils — generation of `.um` / `.note` fixtures for insum tests.
 //!
-//! Fixtures follow the UM Document Container Format 1.0 (spec §4.2/§4.6) and
+//! Fixtures follow the UM Document Container Format 1.0 and
 //! the node types observed in real on-disk Inscriptum documents:
 //! a `.um` file is a ZIP with `manifest.json` and `notes/<ULID>.json` entries;
 //! a `.note` file is a raw ProseMirror-like `noteDoc` JSON (legacy) or an
@@ -8,7 +8,7 @@
 //!
 //! Generators are deterministic: entry order, contents and ZIP timestamps are
 //! fixed, ULIDs derive from a counter — so two runs on the same input produce
-//! byte-identical files (spec §3.11).
+//! byte-identical files.
 
 use std::fs::File;
 use std::io::Write;
@@ -20,7 +20,7 @@ use zip::write::SimpleFileOptions;
 
 /// Fixed ZIP entry metadata so fixture bytes are reproducible: the timestamp
 /// is pinned explicitly — with the `time` feature enabled, `default()` would
-/// stamp the current wall clock and break byte-determinism (spec §3.11).
+/// stamp the current wall clock and break byte-determinism.
 fn fixture_zip_options() -> SimpleFileOptions {
     SimpleFileOptions::default().last_modified_time(zip::DateTime::default()) // 1980-01-01
 }
@@ -68,7 +68,7 @@ fn nanoseconds_counter() -> u32 {
 }
 
 /// A deterministic ULID: `index` selects distinct values, the time part is
-/// fixed. ULIDs do not encode position (spec §4.4) — this is only a stable
+/// fixed. ULIDs do not encode position — this is only a stable
 /// source of syntactically valid identifiers.
 pub fn ulid_seq(index: u32) -> String {
     // Golden-ratio spread over the 80-bit random part: distinct indices give
@@ -179,7 +179,7 @@ impl FixtureNote {
     }
 }
 
-/// Manifest JSON for the given notes, in order (spec §4.6).
+/// Manifest JSON for the given notes, in order.
 pub fn manifest(notes: &[FixtureNote]) -> Value {
     let entries: Vec<Value> = notes
         .iter()
@@ -228,12 +228,12 @@ pub fn write_um(path: &Path, notes: &[FixtureNote]) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Write a legacy `.note`: the file equals the raw `noteDoc` JSON
-/// (no envelope, no block IDs — read API supports it as-is, spec §6.1).
+/// (no envelope, no block IDs — read API supports it as-is).
 pub fn write_legacy_note(path: &Path, doc: &Value) -> std::io::Result<()> {
     std::fs::write(path, doc.to_string())
 }
 
-/// Write a versioned `.note` envelope (spec §4.6). The write of envelopes is
+/// Write a versioned `.note` envelope. The write of envelopes is
 /// an этап C concern; read API must already read them.
 pub fn write_envelope_note(path: &Path, doc: &Value) -> std::io::Result<()> {
     let envelope = json!({
@@ -251,7 +251,7 @@ pub fn write_envelope_note(path: &Path, doc: &Value) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Ready-made fixture sets (acceptance §15.1 №1–2)
+// Ready-made fixture sets (acceptance)
 // ---------------------------------------------------------------------------
 
 /// The minimal container: manifest plus one small title page.

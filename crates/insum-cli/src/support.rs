@@ -10,7 +10,7 @@ use insum_core::container::classify_extension;
 use insum_core::model::note_title;
 use insum_core::{ErrorCode, Limits, NoteDescriptor, NoteFile, UmContainer, UmError};
 
-/// Paths in JSON use `/` regardless of the OS (spec §5.2).
+/// Paths in JSON use `/` regardless of the OS.
 pub fn render_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     text.strip_prefix("./").unwrap_or(&text).to_owned()
@@ -48,7 +48,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
-/// Hidden segments and `node_modules` are skipped (spec §5.2). The check
+/// Hidden segments and `node_modules` are skipped. The check
 /// applies to segments below the traversal root only: the root itself is
 /// user-specified (and temp directories are often hidden).
 pub fn hidden_below(root: &Path, path: &Path, hidden: bool) -> bool {
@@ -62,13 +62,13 @@ pub fn hidden_below(root: &Path, path: &Path, hidden: bool) -> bool {
 }
 
 /// A location that could not even be enumerated: best-effort commands report
-/// it and lower `complete` (spec §11).
+/// it and lower `complete`.
 pub struct WalkError {
     pub path: String,
     pub message: String,
 }
 
-/// Walk the given paths and collect `.um`/`.note` files (spec §5.2):
+/// Walk the given paths and collect `.um`/`.note` files:
 /// recursive, hidden files and `node_modules` skipped unless `hidden` (the
 /// toggle never re-enables `node_modules`). Explicitly named arguments are
 /// resolved like `ls` resolves them — a symlinked directory or file named
@@ -208,7 +208,7 @@ fn resolve_note<'a>(
         )),
         many => {
             // W-09: ambiguity is signalled STRUCTURALLY (details field), not
-            // via the message text — §11 says messages may change.
+ // via the message text — says messages may change.
             let ids: Vec<&str> = many.iter().map(|note| note.id.as_str()).collect();
             Err(UmError::new(
                 ErrorCode::NoteNotFound,
@@ -230,7 +230,7 @@ fn resolve_note<'a>(
 ///
 /// Documented: repeated `--note` flags select WHICH notes are read,
 /// but the output order always follows the manifest (order, then id) — not
-/// the order of the flags. That keeps every response deterministic per §3.11
+/// the order of the flags. That keeps every response deterministic per
 /// regardless of argument order.
 pub fn read_notes(
     path: &Path,
@@ -330,7 +330,7 @@ pub fn error_value(err: &UmError) -> Value {
 }
 
 /// What a command produces for stdout: one JSON document or the annotated
-/// text projection (spec §5.3, §6.5).
+/// text projection.
 pub enum Output {
     Json(Value),
     Text(String),
@@ -369,7 +369,7 @@ impl SourceReader {
                 let mut order: Vec<NoteDescriptor> =
                     container.notes_in_order().into_iter().cloned().collect();
                 if let Some(filters) = filters {
-                    // manifest order preserved (§5.3); each filter resolves by
+                    // manifest order preserved; each filter resolves by
                     // id or exact title (flag order does not matter)
                     let mut resolved: Vec<String> = Vec::with_capacity(filters.len());
                     for filter in filters {
@@ -479,7 +479,7 @@ impl SourceReader {
         }
         let meta = self.note_meta.as_ref().expect("note meta");
         // The re-open trap is removed — the rev was computed from the
-        // same bytes as the document (§5.4: both `.note` revs hash one read).
+        // same bytes as the document.
         // A Skip-path consumer (search/validate) never calls this.
         if meta.file_rev.is_empty() {
             return Err(UmError::internal(

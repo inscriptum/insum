@@ -3,7 +3,7 @@
 //! Owns everything that is not command-line plumbing: reading `.um` ZIP
 //! containers and `.note` documents, the manifest model, JSON traversal,
 //! JSON Pointers, note/file revisions, limits, and the error registry
-//! (spec §5–§6, §11–§12). CLI commands must not duplicate this logic.
+//! (see docs/insum-spec.md). CLI commands must not duplicate this logic.
 //!
 //! The public behavior contract is summarized in `docs/insum-spec.md`.
 
