@@ -13,9 +13,9 @@ Planned command groups:
 
 ## Status
 
-Work in progress. The specification lives in the Inscriptum knowledge base
-(`DEVELOPMENT/insum.um`, pages `spec-*`); it is the canon, not this repository.
-The first read-only release is planned as `0.1.0`.
+Work in progress. The first read-only release is planned as `0.1.0`; see
+[CHANGELOG.md](CHANGELOG.md) for what already works and
+[docs/insum-spec.md](docs/insum-spec.md) for the CLI behavior contract.
 
 ## License
 
