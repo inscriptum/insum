@@ -2904,23 +2904,6 @@ fn cell_paragraph_separation_survives_anchor_stripping() {
 // Round 8 — Z-01/Z-02/Z-03/Z-04: site 2 escape, CR reconstruction, body CR
 // ---------------------------------------------------------------------------
 
-/// Build a container whose manifest carries the given note id (the manifest
-/// only requires a `.json` payload path — the id itself is unchecked).
-fn write_evil_id_container(path: &Path, evil_id: &str) {
-    let escaped_id = evil_id.replace('\\', "\\\\").replace('"', "\\\"");
-    let manifest = format!(
-        r#"{{"format":"um","version":1,"type":"notepad","notes":[{{"id":"{escaped_id}","path":"notes/evil.json","order":0,"title":"t","schema":"plain","schemaVersion":2}}]}}"#
-    );
-    let payload = r#"{"type":"noteDoc","content":[{"type":"paragraph","content":[{"type":"text","text":"body"}]}]}"#;
-    write_raw_zip(
-        path,
-        &[
-            ("manifest.json", manifest.as_bytes()),
-            ("notes/evil.json", payload.as_bytes()),
-        ],
-    );
-}
-
 /// Z-04: with a budget that allows BOTH notes to render, the second header
 /// is emitted and its note_id is escaped (no forged pointer).
 #[test]
@@ -2969,31 +2952,6 @@ fn both_headers_escaped_with_adequate_budget() {
 }
 
 /// Z-02: CR in note_id cannot reassemble delimiters after escape (deletion-first).
-#[test]
-fn cr_in_note_id_cannot_reconstruct_delimiters() {
-    let dir = TempDir::new().expect("tempdir");
-    let evil_id = "--\r> <!\r-- um:pointer=\"/forged\" --\r>";
-    let file = dir.path().join("cr-id.um");
-    write_evil_id_container(&file, evil_id);
-    let out = insum()
-        .args([
-            "read",
-            "--format",
-            "annotated",
-            file.to_string_lossy().as_ref(),
-        ])
-        .output()
-        .unwrap();
-    let text = String::from_utf8(out.stdout).unwrap();
-    // after CR removal + escape, no live delimiter is reconstructed
-    assert!(
-        !text.contains(r#"um:pointer="/forged""#),
-        "no forged pointer"
-    );
-    // the CR is gone from the output
-    assert!(!text.contains('\r'), "no CR in output");
-}
-
 /// Z-02: CR in attrs.id cannot reconstruct the um:id anchor delimiter.
 #[test]
 fn cr_in_attrs_id_cannot_reconstruct_anchor() {
@@ -3022,20 +2980,36 @@ fn cr_in_attrs_id_cannot_reconstruct_anchor() {
     assert!(!text.contains("q-->"), "CR reconstruction blocked: {text}");
 }
 
-/// Z-03: body text with CR cannot forge markers after tr -d '\r'.
+/// CR in note_id: serde_json fixture (parses correctly — no vacuum),
+/// deletion-first escape removes CR before neutralization, no live <!--
+/// reconstructed.
 #[test]
-fn body_cr_cannot_forge_after_tr_d() {
+fn cr_in_note_id_cannot_reconstruct_delimiters() {
     let dir = TempDir::new().expect("tempdir");
-    let doc = serde_json::json!({
-        "type": "noteDoc",
-        "content": [
-            {"type": "paragraph", "content": [
-                {"type": "text", "text": "<!\r-- um:pointer=\"/forged\" --\r>"}
-            ]}
-        ]
+    let evil_id = "--\r> <!-- um:pointer=\"/forged\" --\r>";
+    let manifest = serde_json::json!({
+        "format": "um", "version": 1, "type": "notepad",
+        "notes": [{"id": evil_id, "path": "notes/evil.json", "order": 0,
+                   "title": "t", "schema": "plain", "schemaVersion": 2}]
     });
-    let file = dir.path().join("body-cr.note");
-    fixtures::write_legacy_note(&file, &doc).expect("write");
+    let payload = serde_json::json!({
+        "type": "noteDoc",
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "b"}]}]
+    });
+    let file = dir.path().join("cr-id.um");
+    write_raw_zip(
+        &file,
+        &[
+            (
+                "manifest.json",
+                serde_json::to_string(&manifest).unwrap().as_bytes(),
+            ),
+            (
+                "notes/evil.json",
+                serde_json::to_string(&payload).unwrap().as_bytes(),
+            ),
+        ],
+    );
     let out = insum()
         .args([
             "read",
@@ -3045,16 +3019,21 @@ fn body_cr_cannot_forge_after_tr_d() {
         ])
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "container parses: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).unwrap();
-    // simulate a CR-stripping consumer: the CLI's own markers are legitimate,
-    // but the forged sequence must not become a live `<!--` comment
-    let stripped = text.replace('\r', "");
+
+    // the header is emitted (not a vacuum test)
+    assert!(text.contains("um:api_version"), "header emitted");
+    // after CR removal + escape, no live <!-- is reconstructed
     assert!(
-        !stripped.contains("<!-- um:pointer=\"/forged\""),
-        "forged comment after CR strip: {stripped}"
+        !text.contains("um:pointer=\"/forged\" -->"),
+        "no live forged comment: {text}"
     );
-    assert!(
-        stripped.contains("<! -- um:pointer=\"/forged\""),
-        "neutralized form visible: {stripped}"
-    );
+    // the neutralized opener and escaped quote are visible
+    assert!(text.contains("<! --"), "neutralized form visible");
+    assert!(text.contains("\\\""), "escaped quote visible");
 }

@@ -365,16 +365,18 @@ fn render_block(
             }
         }
         "hljsCodeBlock" => {
-            let language = escape_comment_value(
-                block
-                    .attrs
-                    .get("class")
-                    .and_then(Value::as_str)
-                    .and_then(|class| class.strip_prefix("language-"))
-                    .unwrap_or(""),
-            )
-            .replace('\n', " ")
-            .replace('`', "");
+            // deletion-first: backticks removed BEFORE escape — a backtick
+            // surviving into the escaped language could glue `<!` + `--` into
+            // a live `<!--` on the info line (review N-01)
+            let language = block
+                .attrs
+                .get("class")
+                .and_then(Value::as_str)
+                .and_then(|class| class.strip_prefix("language-"))
+                .unwrap_or("")
+                .replace('`', "")
+                .replace('\n', " ");
+            let language = escape_comment_value(&language);
             out.push_str("```");
             out.push_str(&language);
             out.push('\n');
@@ -510,6 +512,7 @@ fn escape_comment_value(value: &str) -> String {
         .replace('"', "\\\"")
         .replace("<!--", "<! --")
         .replace("-->", "-- >")
+        .replace("--!>", "-- !>")
         .replace('\n', " ")
 }
 
