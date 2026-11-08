@@ -14,7 +14,6 @@
 //! The git binary must be in PATH (documented in the user docs); blobs are
 //! bounded by the same limits as regular reads.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,6 +32,9 @@ pub const DEFAULT_REVISIONS: usize = 20;
 
 /// Context preview of a changed block.
 const PREVIEW_CHARS: usize = 120;
+
+/// The notes of one parsed revision blob: (id, title, document).
+type RevisionNotes = Vec<(String, Option<String>, Value)>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Revision {
@@ -266,7 +268,7 @@ fn revision_notes(
     blob: &[u8],
     extension: &str,
     limits: &Limits,
-) -> Result<Option<Vec<(String, Option<String>, Value)>>, UmError> {
+) -> Result<Option<RevisionNotes>, UmError> {
     if extension == "note" {
         let doc: Value = match serde_json::from_slice(blob) {
             Ok(doc) => doc,
@@ -363,10 +365,10 @@ fn block_text(node: &Value) -> Option<String> {
             }
             Value::Object(map) => {
                 if map.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(text) = map.get("text").and_then(Value::as_str) {
-                        if out.chars().count() < PREVIEW_CHARS {
-                            out.push_str(text);
-                        }
+                    if let Some(text) = map.get("text").and_then(Value::as_str)
+                        && out.chars().count() < PREVIEW_CHARS
+                    {
+                        out.push_str(text);
                     }
                     return; // text nodes own their text; do not descend
                 }
@@ -477,10 +479,7 @@ fn diff_documents(old: &Value, new: &Value, pointer: &str, diff: &mut NoteDiff) 
 }
 
 /// Structural diff of the note sets of two revisions.
-fn diff_note_sets(
-    old: &[(String, Option<String>, Value)],
-    new: &[(String, Option<String>, Value)],
-) -> Vec<NoteDiff> {
+fn diff_note_sets(old: &RevisionNotes, new: &RevisionNotes) -> Vec<NoteDiff> {
     let mut diffs = Vec::new();
     for (id, title, doc) in new {
         match old.iter().find(|(old_id, _, _)| old_id == id) {
@@ -510,7 +509,7 @@ fn diff_note_sets(
             }
         }
     }
-    for (id, title, doc) in old {
+    for (id, title, _) in old {
         if !new.iter().any(|(new_id, _, _)| new_id == id) {
             diffs.push(NoteDiff {
                 note_id: id.clone(),
@@ -588,8 +587,7 @@ pub fn collect(
     }
 
     // parse every listed revision's notes (bounded by --limit + 1)
-    let mut parsed: Vec<Option<Vec<(String, Option<String>, Value)>>> =
-        Vec::with_capacity(listed.len());
+    let mut parsed: Vec<Option<RevisionNotes>> = Vec::with_capacity(listed.len());
     for revision in &listed {
         let notes = revision_blob(&repo, &revision.sha, limits)
             .and_then(|blob| revision_notes(&blob, &extension, limits))?;
