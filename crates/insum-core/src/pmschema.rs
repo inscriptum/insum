@@ -1229,7 +1229,8 @@ mod tests {
 
     #[test]
     fn deep_nesting_is_rejected_not_a_stack_overflow() {
-        let deep = "(".repeat(500) + "block" + &")".repeat(500);
+        // 200 parens = 401 tokens: under the token cap, over the depth cap
+        let deep = "(".repeat(200) + "block" + &")".repeat(200);
         let raw = json!({
             "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
             "top_node": "doc", "validation_capability": "partial",
@@ -1243,59 +1244,94 @@ mod tests {
             .err()
             .expect("must not compile");
         assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
+        assert!(err.message.contains("nested deeper"), "{}", err.message);
     }
 
     #[test]
     fn exponential_dfa_is_capped() {
-        // a short expression whose DFA would explode exponentially
-        let mut expr = String::new();
-        for i in 0..40 {
-            expr.push_str(&format!("(a{i} | b{i})* "));
+        // a short expression whose DFA explodes exponentially: the
+        // product state space of the two interleaved (t0|t1)* loops is
+        // ~2^24 — the state cap must stop it in milliseconds
+        let mut nodes = serde_json::Map::new();
+        nodes.insert(
+            "doc".to_owned(),
+            json!({"content": "(t0 | t1)* t0 (t0 | t1){24}", "groups": [], "attrs": {},
+                   "marks": [], "addressable": false, "inline_content": false,
+                   "searchable": false}),
+        );
+        for i in 0..2 {
+            for name in [format!("t{i}")] {
+                nodes.insert(
+                    name.clone(),
+                    json!({"content": null, "groups": [], "attrs": {}, "marks": [],
+                           "addressable": true, "inline_content": false, "searchable": false}),
+                );
+            }
         }
-        expr.push_str("a0 (a0 | b0){30}");
         let raw = json!({
             "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
             "top_node": "doc", "validation_capability": "partial",
-            "nodes": {
-                "doc": {"content": expr, "groups": [], "attrs": {}, "marks": [],
-                        "addressable": false, "inline_content": false, "searchable": false},
-                "a0": {"content": null, "groups": [], "attrs": {}, "marks": [],
-                       "addressable": true, "inline_content": false, "searchable": false},
-                "b0": {"content": null, "groups": [], "attrs": {}, "marks": [],
-                       "addressable": true, "inline_content": false, "searchable": false}
-            },
+            "nodes": nodes,
             "marks": {}
         });
-        // only a0/b0 exist; the other a{i}/b{i} names the expression
-        // references resolve as unknowns — the compiler must fail either
-        // way, quickly and without hanging
         let err = PmSchema::build(&SchemaArtifact::parse(raw).unwrap())
             .err()
             .expect("must not compile");
         assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
+        assert!(
+            err.message.contains("DFA states") || err.message.contains("NFA states"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
     fn required_attribute_semantics_follow_compute_attrs() {
+        // `code` has no `default` key in the artifact — a required
+        // attribute exactly like PM spec.attrs without a default
         let raw = json!({
             "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
             "top_node": "doc", "validation_capability": "partial",
             "nodes": {
-                "doc": {"content": "para*", "groups": [], "attrs": {}, "marks": [],
+                // doc's mark set allows the req mark on its children
+                "doc": {"content": "para*", "groups": [], "attrs": {}, "marks": ["req"],
                         "addressable": false, "inline_content": false, "searchable": false},
                 "para": {"content": null, "groups": ["block"], "attrs": {},
                          "marks": [], "addressable": true, "inline_content": false,
                          "searchable": false}
             },
-            "marks": {}
+            "marks": {
+                "code": {"group": null, "attrs": {}},
+                "req": {"group": null, "attrs": {"key": {}}}
+            }
         });
         let schema = PmSchema::build(&SchemaArtifact::parse(raw).unwrap()).unwrap();
-        // no required attrs anywhere in this fixture — the check passes
-        let doc = json!({"type": "doc", "content": [
-            {"type": "para", "content": []},
-            {"type": "para", "attrs": {}, "content": []}
+        // attrs absent entirely → required missing → error
+        let absent = json!({"type": "doc", "content": [{"type": "para", "content": []}]});
+        let result = schema.check_document(&absent);
+        assert!(
+            result.valid(),
+            "para declares no attrs — nothing is required"
+        );
+
+        // a mark with a required attr: absent attrs object → error
+        let missing_mark_attr = json!({"type": "doc", "content": [
+            {"type": "para", "content": []}
         ]});
-        assert!(schema.check_document(&doc).valid());
+        let _ = missing_mark_attr;
+        let with_mark = json!({"type": "doc", "content": [
+            {"type": "para", "content": [], "marks": [{"type": "req"}]}
+        ]});
+        let result = schema.check_document(&with_mark);
+        assert!(!result.valid());
+        assert!(result.errors.iter().any(|e| e.code == "ATTR_REQUIRED"));
+
+        // the required attr given → clean; the other mark has no attrs
+        let given = json!({"type": "doc", "content": [
+            {"type": "para", "content": [], "marks": [{"type": "req", "attrs": {"key": "v"}}]}
+        ]});
+        let result = schema.check_document(&given);
+        assert!(result.valid(), "{:?}", result.errors);
     }
 
     #[test]
