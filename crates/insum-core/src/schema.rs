@@ -331,12 +331,16 @@ pub fn resolve(
 }
 
 /// Walk up from `start` (a file or directory) looking for the plugin's
-/// runtime artifact.
+/// runtime artifact. A bare file name has an empty parent — that means the
+/// working directory, not "no vault".
 pub fn find_plugin_artifact(start: &Path) -> Option<PathBuf> {
     let start_dir = if start.is_dir() {
         start
     } else {
-        start.parent()?
+        match start.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        }
     };
     for dir in start_dir.ancestors() {
         let candidate = dir.join(PLUGIN_SCHEMA_SUBPATH);

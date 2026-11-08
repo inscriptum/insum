@@ -414,3 +414,94 @@ fn title_page_fixture_helper_matches_docs() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn validate_finds_vault_artifact_for_bare_filename() {
+    // A bare file name has an empty parent — the vault rule must fall back
+    // to the working directory instead of silently missing the artifact.
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_dir = dir.path().join(".obsidian/plugins/inscriptum");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("schema.json"),
+        serde_json::to_vec(&fixture_artifact()).unwrap(),
+    )
+    .unwrap();
+    let um = dir.path().join("page.um");
+    write_um(
+        &um,
+        &[FixtureNote {
+            id: "01TESTNOTE000000000000000".to_owned(),
+            title: "T".to_owned(),
+            schema: "title",
+            doc: json!({
+                "type": "noteDoc",
+                "content": [
+                    {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+                    paragraph(&[text("hello")])
+                ]
+            }),
+        }],
+    )
+    .unwrap();
+
+    let output = insum()
+        .arg("validate")
+        .arg("page.um")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let file = &value["files"][0];
+    assert_eq!(
+        file["schema"]["source"],
+        "plugin-runtime",
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(value["validation_level"], "schema");
+}
+
+#[test]
+fn validate_empty_directory_never_claims_schema_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let output = insum().arg("validate").arg(&empty).output().unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["validation_level"], "structural");
+    assert_eq!(value["files"], json!([]));
+    assert_eq!(value["valid"], true);
+}
+
+#[test]
+fn validate_strict_promotes_artifact_config_warnings_to_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact = tampered_artifact(dir.path(), "schema.json");
+    let um = fixture_um(dir.path());
+    let output = insum()
+        .arg("validate")
+        .arg("--strict")
+        .arg("--schema")
+        .arg(&artifact)
+        .arg(&um)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let file = &value["files"][0];
+    assert_eq!(file["valid"], false);
+    let error_codes: Vec<&str> = file["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        error_codes.contains(&"SCHEMA_MISMATCH"),
+        "config warnings land in errors under --strict: {file}"
+    );
+}

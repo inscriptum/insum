@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -33,8 +34,8 @@ pub fn run(
     // An explicit artifact is loaded once and applies to every file; a
     // missing or corrupt explicit file is a hard error (the user pointed
     // at it), matching the resolution contract in insum-core.
-    let explicit = match schema {
-        Some(path) => Some(resolve(Some(path), Path::new("."), limits)?),
+    let explicit: Option<Arc<ResolvedSchema>> = match schema {
+        Some(path) => Some(Arc::new(resolve(Some(path), Path::new("."), limits)?)),
         None => None,
     };
 
@@ -60,7 +61,7 @@ pub fn run(
     }
 
     // runtime artifacts are looked up once per parent directory
-    let mut runtime_cache: HashMap<PathBuf, Option<Result<ResolvedSchema, UmError>>> =
+    let mut runtime_cache: HashMap<PathBuf, Option<Result<Arc<ResolvedSchema>, UmError>>> =
         HashMap::new();
 
     for file in &files {
@@ -69,7 +70,7 @@ pub fn run(
         if file_schema.level != "schema" {
             all_schema = false;
         }
-        let result = validate_file(file, strict, file_schema.artifact.as_ref(), limits);
+        let result = validate_file(file, strict, file_schema.artifact.as_deref(), limits);
         match result {
             Ok(mut file_json) => {
                 file_json["path"] = json!(rendered);
@@ -78,14 +79,21 @@ pub fn run(
                     file_json["schema"] = info;
                 }
                 if !file_schema.warnings.is_empty() {
-                    let mut warnings: Vec<Value> = file_schema.warnings;
-                    if let Some(existing) = file_json["warnings"].as_array() {
-                        warnings.extend(existing.iter().cloned());
-                    }
-                    file_json["warnings"] = json!(warnings);
-                    // §6.6: --strict turns every warning into an error.
+                    // §6.6: --strict turns every warning into an error —
+                    // artifact configuration warnings included.
                     if strict {
+                        let mut errors = file_schema.warnings;
+                        if let Some(existing) = file_json["errors"].as_array() {
+                            errors.extend(existing.iter().cloned());
+                        }
+                        file_json["errors"] = json!(errors);
                         file_json["valid"] = json!(false);
+                    } else {
+                        let mut warnings = file_schema.warnings;
+                        if let Some(existing) = file_json["warnings"].as_array() {
+                            warnings.extend(existing.iter().cloned());
+                        }
+                        file_json["warnings"] = json!(warnings);
                     }
                 }
                 if file_json["valid"] != json!(true) {
@@ -111,34 +119,39 @@ pub fn run(
         }
     }
 
+    // An empty file set validated nothing: the report must not claim the
+    // schema level for a run without a single validated file.
+    let top_level_schema = all_schema && !file_results.is_empty();
     Ok(json!({
         "api_version": 1,
-        "validation_level": if all_schema { "schema" } else { "structural" },
+        "validation_level": if top_level_schema { "schema" } else { "structural" },
         "valid": all_valid,
         "files": file_results,
     }))
 }
 
 /// The per-file artifact decision: which level applies, whether inventory
-/// checks run, what the report shows and which configuration warnings
-/// (stale or corrupt artifact) surface.
+/// checks run, what the report shows and which configuration diagnostics
+/// (stale or unusable artifact) surface.
 struct FileSchema {
     level: &'static str,
-    artifact: Option<insum_core::schema::SchemaArtifact>,
+    artifact: Option<Arc<insum_core::schema::SchemaArtifact>>,
     info: Option<Value>,
     warnings: Vec<Value>,
 }
 
 fn file_schema(
     file: &Path,
-    explicit: Option<&ResolvedSchema>,
-    runtime_cache: &mut HashMap<PathBuf, Option<Result<ResolvedSchema, UmError>>>,
+    explicit: Option<&Arc<ResolvedSchema>>,
+    runtime_cache: &mut HashMap<PathBuf, Option<Result<Arc<ResolvedSchema>, UmError>>>,
     limits: &Limits,
 ) -> FileSchema {
     let info_of = |resolved: &ResolvedSchema| {
         json!({
             "source": resolved.source.as_str(),
             "source_path": resolved.source_path.as_ref().map(|p| p.display().to_string()),
+            "schema_version": resolved.artifact.schema_version,
+            "plugin_version": resolved.artifact.plugin_version,
             "schema_hash": resolved.artifact.schema_hash,
             "hash_verified": resolved.hash_verified,
             "validation_capability": resolved.artifact.validation_capability,
@@ -149,7 +162,7 @@ fn file_schema(
         if resolved.hash_verified {
             return FileSchema {
                 level: "schema",
-                artifact: Some(resolved.artifact.clone()),
+                artifact: Some(Arc::new(resolved.artifact.clone())),
                 info: Some(info_of(resolved)),
                 warnings: Vec::new(),
             };
@@ -173,7 +186,7 @@ fn file_schema(
     let resolved = match cached {
         Some(result) => result,
         None => {
-            let result = resolve(None, start, limits);
+            let result = resolve(None, start, limits).map(Arc::new);
             runtime_cache.insert(start.to_path_buf(), Some(result.clone()));
             result
         }
@@ -200,16 +213,18 @@ fn file_schema(
         },
         Ok(resolved) => FileSchema {
             level: "schema",
-            artifact: Some(resolved.artifact.clone()),
+            artifact: Some(Arc::new(resolved.artifact.clone())),
             info: Some(info_of(&resolved)),
             warnings: Vec::new(),
         },
+        // The registry code of the actual failure (invalid, oversized,
+        // unreadable) is kept — repair hints differ per class.
         Err(err) => FileSchema {
             level: "structural",
             artifact: None,
             info: None,
             warnings: vec![json!({
-                "code": "SCHEMA_ARTIFACT_INVALID",
+                "code": err.code.as_str(),
                 "message": format!("runtime schema artifact could not be used: {}", err.message),
             })],
         },
