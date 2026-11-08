@@ -5,6 +5,16 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ## [Unreleased]
 
+### Added
+
+- Lock/dirty-lease protocol prototype (§9.2) in `insum-core`: hidden
+  sidecar files (`.<name>.insum-lock`, `.<name>.insum-lease`) next to the
+  target, atomic create-new acquisition, wait/timeout with `WRITE_LOCKED`,
+  op-id-checked release, and crash recovery (dead pid on the same host is
+  broken immediately; cross-host and corrupt files recover by age). The
+  future `apply`/`migrate-ids` entry point (`acquire_write_lock`) refuses
+  to write while a live editor lease exists.
+
 ### Fixed
 
 - Annotated reading neutralizes the `<!--` sequence coming from document
