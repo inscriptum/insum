@@ -12,6 +12,7 @@ pub mod container;
 pub mod error;
 pub mod limits;
 pub mod model;
+pub mod pmschema;
 pub mod pointer;
 pub mod schema;
 pub mod validate;

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use insum_core::pmschema::PmSchema;
 use insum_core::schema::{ResolvedSchema, SchemaSource, resolve};
 use insum_core::{Limits, UmError};
 
@@ -70,7 +71,7 @@ pub fn run(
         if file_schema.level != "schema" {
             all_schema = false;
         }
-        let result = validate_file(file, strict, file_schema.artifact.as_deref(), limits);
+        let result = validate_file(file, strict, file_schema.pm.as_deref(), limits);
         match result {
             Ok(mut file_json) => {
                 file_json["path"] = json!(rendered);
@@ -130,14 +131,20 @@ pub fn run(
     }))
 }
 
-/// The per-file artifact decision: which level applies, whether inventory
-/// checks run, what the report shows and which configuration diagnostics
-/// (stale or unusable artifact) surface.
+/// The per-file artifact decision: which level applies, whether the
+/// ProseMirror-parity check runs, what the report shows and which
+/// configuration diagnostics (stale or unusable artifact) surface.
 struct FileSchema {
     level: &'static str,
-    artifact: Option<Arc<insum_core::schema::SchemaArtifact>>,
+    pm: Option<Arc<PmSchema>>,
     info: Option<Value>,
     warnings: Vec<Value>,
+}
+
+/// Compile the parity schema once per artifact; a broken artifact (bad
+/// content expression) becomes a configuration warning, not a crash.
+fn compiled(resolved: &ResolvedSchema) -> Result<Arc<PmSchema>, UmError> {
+    PmSchema::build(&resolved.artifact).map(Arc::new)
 }
 
 fn file_schema(
@@ -160,16 +167,30 @@ fn file_schema(
 
     if let Some(resolved) = explicit {
         if resolved.hash_verified {
+            let pm = match compiled(resolved) {
+                Ok(pm) => pm,
+                Err(err) => {
+                    return FileSchema {
+                        level: "structural",
+                        pm: None,
+                        info: Some(info_of(resolved)),
+                        warnings: vec![json!({
+                            "code": err.code.as_str(),
+                            "message": format!("schema artifact could not be compiled: {}", err.message),
+                        })],
+                    };
+                }
+            };
             return FileSchema {
                 level: "schema",
-                artifact: Some(Arc::clone(&resolved.artifact)),
+                pm: Some(pm),
                 info: Some(info_of(resolved)),
                 warnings: Vec::new(),
             };
         }
         return FileSchema {
             level: "structural",
-            artifact: None,
+            pm: None,
             info: Some(info_of(resolved)),
             warnings: vec![json!({
                 "code": "SCHEMA_MISMATCH",
@@ -195,13 +216,13 @@ fn file_schema(
     match resolved {
         Ok(resolved) if resolved.source == SchemaSource::BundledFallback => FileSchema {
             level: "structural",
-            artifact: None,
+            pm: None,
             info: Some(info_of(&resolved)),
             warnings: Vec::new(),
         },
         Ok(resolved) if !resolved.hash_verified => FileSchema {
             level: "structural",
-            artifact: None,
+            pm: None,
             info: Some(info_of(&resolved)),
             warnings: vec![json!({
                 "code": "SCHEMA_MISMATCH",
@@ -211,17 +232,28 @@ fn file_schema(
                 ),
             })],
         },
-        Ok(resolved) => FileSchema {
-            level: "schema",
-            artifact: Some(Arc::clone(&resolved.artifact)),
-            info: Some(info_of(&resolved)),
-            warnings: Vec::new(),
+        Ok(resolved) => match compiled(&resolved) {
+            Ok(pm) => FileSchema {
+                level: "schema",
+                pm: Some(pm),
+                info: Some(info_of(&resolved)),
+                warnings: Vec::new(),
+            },
+            Err(err) => FileSchema {
+                level: "structural",
+                pm: None,
+                info: Some(info_of(&resolved)),
+                warnings: vec![json!({
+                    "code": err.code.as_str(),
+                    "message": format!("schema artifact could not be compiled: {}", err.message),
+                })],
+            },
         },
         // The registry code of the actual failure (invalid, oversized,
         // unreadable) is kept — repair hints differ per class.
         Err(err) => FileSchema {
             level: "structural",
-            artifact: None,
+            pm: None,
             info: None,
             warnings: vec![json!({
                 "code": err.code.as_str(),
@@ -234,7 +266,7 @@ fn file_schema(
 fn validate_file(
     path: &Path,
     strict: bool,
-    artifact: Option<&insum_core::schema::SchemaArtifact>,
+    pm: Option<&PmSchema>,
     limits: &Limits,
 ) -> Result<Value, UmError> {
     let views = read_notes(path, None, limits, Revs::Skip)?.views;
@@ -248,7 +280,7 @@ fn validate_file(
             &view.doc,
             view.block_ids_enabled,
             limits,
-            artifact,
+            pm,
         )?;
         if !validation.valid() {
             file_valid = false;
