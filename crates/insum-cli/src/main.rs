@@ -136,6 +136,12 @@ enum Command {
         /// Files or directories to validate.
         paths: Vec<PathBuf>,
     },
+    /// Show the applicable schema artifact, its source and fingerprint.
+    Schema {
+        /// Describe one node type from the artifact.
+        #[arg(long, value_name = "NODE")]
+        r#type: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -170,10 +176,16 @@ fn main() {
         std::process::exit(0);
     }
 
-    // --schema is accepted globally but only validate knows it; say
-    // so before running anything
-    if !matches!(cli.command, Some(Command::Validate { .. })) && cli.schema.is_some() {
-        let err = UmError::usage("--schema is supported by `insum validate` only in this release");
+    // --schema is accepted globally but only schema-aware commands know it;
+    // say so before running anything
+    if !matches!(
+        cli.command,
+        Some(Command::Validate { .. }) | Some(Command::Schema { .. })
+    ) && cli.schema.is_some()
+    {
+        let err = UmError::usage(
+            "--schema is supported by `insum schema` and `insum validate` only in this release",
+        );
         fail(&err, cli.pretty);
     }
 
@@ -265,8 +277,12 @@ fn main() {
             hidden,
             paths,
         }) => {
-            // --schema is accepted globally but only validate knows it
+            // --schema is accepted globally but only schema-aware commands know it
             commands::validate::run(paths, *strict, cli.schema.as_deref(), *hidden, &limits)
+                .map(Output::Json)
+        }
+        Some(Command::Schema { r#type }) => {
+            commands::schema::run(cli.schema.as_deref(), r#type.as_deref(), &limits)
                 .map(Output::Json)
         }
     };

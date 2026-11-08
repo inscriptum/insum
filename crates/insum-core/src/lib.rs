@@ -13,6 +13,7 @@ pub mod error;
 pub mod limits;
 pub mod model;
 pub mod pointer;
+pub mod schema;
 pub mod validate;
 
 pub use container::{NoteFile, UmContainer};
@@ -20,4 +21,4 @@ pub use error::{ErrorCode, UmError};
 pub use limits::Limits;
 pub use model::{BlockEntry, Manifest, NoteDescriptor, NoteDoc, traverse};
 pub use pointer::{encode_token, resolve, split};
-pub use validate::{Diag, NoteValidation, validate_note_doc};
+pub use validate::{Diag, NoteValidation, validate_note_doc, validate_note_doc_with_schema};

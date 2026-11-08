@@ -3,6 +3,7 @@
 pub mod block;
 pub mod ls;
 pub mod read;
+pub mod schema;
 pub mod search;
 pub mod tree;
 pub mod validate;

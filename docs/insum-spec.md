@@ -26,12 +26,54 @@ until then this document is the reference for consumers (agents and scripts).
 | `insum block get <file> [--note <id>] --pointer <p>` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it) |
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |
 | `insum read <file> [--note <id>] [--format json\|annotated]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors |
-| `insum validate [--strict] [--hidden] <paths>...` | Structural validation (`validation_level: "structural"`) |
+| `insum schema [--type <node>] [--schema <file>]` | Show the applicable schema artifact (source, path, hash, validation capability); `--type` shows one node descriptor with its example |
+| `insum validate [--strict] [--hidden] [--schema <file>] <paths>...` | Validation with an explicit level: `structural` or `schema` |
 
 `--note <value>` resolves the value as the note id (ULID) first, then as an
 exact note title; a title matching several notes fails with their ids listed
 (no silent first match), and every response still carries the canonical ULID
 `note_id` — cursors and future write CAS remain id-bound.
+
+## Schema artifact and validation levels
+
+The editor's schema has exactly one source: the plugin generates
+`schema.json` in its own directory at startup (`.obsidian/plugins/inscriptum/`
+inside a vault). `insum schema` and `insum validate` resolve the artifact in
+a fixed order:
+
+1. explicit `--schema <file>` (reported as `source: "explicit"`);
+2. the plugin runtime artifact found by walking up from the target file (or
+   the working directory for `insum schema`) — `source: "plugin-runtime"`;
+3. the CLI's bundled snapshot — `source: "bundled-fallback"`, a reserve for
+   reading and diagnostics.
+
+`insum schema` reports the artifact id, version, hash (`schema_hash`), source,
+source path, plugin version and `validation_capability`, plus `hash_verified`:
+the hash is recomputed (SHA-256 over RFC 8785 canonical JSON without
+`schema_hash` and `plugin_version`) and compared with the declared value. A
+mismatch keeps the command working and adds a `SCHEMA_MISMATCH` warning — a
+stale artifact is shown, not hidden. `--type <node>` prints the node
+descriptor (content rule, groups, attrs, marks, `addressable`,
+`inline_content`, `searchable` and the example when the artifact carries
+one); an unknown type fails with exit 6 and lists the available types.
+
+`insum validate` reports `validation_level` per file and for the whole run:
+
+- `structural` — container, manifest, note JSON structure, limits, ID rules
+  for documents marked `features.block_ids`. Applied whenever no verified
+  applicable artifact is found; the bundled fallback is labeled in the
+  report but never lifts the level.
+- `schema` — additionally, inventory checks against the artifact: node types,
+  attribute keys and mark types are compared with the artifact, and the
+  document root is compared with its `top_node`. A node type the artifact
+  does not declare is an error — unless it is a known legacy type observed in
+  real on-disk documents (reported as `SCHEMA_NODE_LEGACY`: document version
+  semantics are outside the artifact). Undeclared attributes and marks are
+  warnings (`SCHEMA_ATTR_UNKNOWN`, `SCHEMA_MARK_UNKNOWN`).
+
+`full` is never claimed by this release: it is reserved for validation proven
+ by the differential test corpus. With `--strict` every warning becomes an
+error, including artifact configuration warnings (`SCHEMA_MISMATCH`).
 
 ## Output conventions
 
@@ -76,7 +118,8 @@ Configured via environment variables with safe defaults, enforced on actual
 data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 `UM_MAX_TOTAL_BYTES` (256 MiB), `UM_MAX_DEPTH` (128),
 `UM_MAX_OUTPUT_BYTES` (64 KiB), `UM_MAX_SEARCH_MATCHES` (1 000),
-`UM_MAX_OPS_BYTES`, `UM_MAX_APPLY_OPS`, `UM_MAX_COMMIT_RETRIES`.
+`UM_MAX_OPS_BYTES`, `UM_MAX_APPLY_OPS`, `UM_MAX_COMMIT_RETRIES`,
+`UM_MAX_SCHEMA_BYTES` (1 MiB — schema artifact files).
 
 ## Notes on data fidelity
 
