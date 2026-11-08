@@ -275,7 +275,9 @@ impl SchemaSource {
 pub struct ResolvedSchema {
     pub source: SchemaSource,
     pub source_path: Option<PathBuf>,
-    pub artifact: SchemaArtifact,
+    /// Cheap to share: artifacts are read once and handed to every file or
+    /// consumer without deep clones.
+    pub artifact: std::sync::Arc<SchemaArtifact>,
     pub hash_verified: bool,
 }
 
@@ -302,7 +304,7 @@ pub fn resolve(
         return Ok(ResolvedSchema {
             source: SchemaSource::Explicit,
             source_path: Some(path.to_path_buf()),
-            artifact,
+            artifact: std::sync::Arc::new(artifact),
             hash_verified,
         });
     }
@@ -313,7 +315,7 @@ pub fn resolve(
         return Ok(ResolvedSchema {
             source: SchemaSource::PluginRuntime,
             source_path: Some(path),
-            artifact,
+            artifact: std::sync::Arc::new(artifact),
             hash_verified,
         });
     }
@@ -325,7 +327,7 @@ pub fn resolve(
     Ok(ResolvedSchema {
         source: SchemaSource::BundledFallback,
         source_path: None,
-        artifact,
+        artifact: std::sync::Arc::new(artifact),
         hash_verified,
     })
 }

@@ -505,3 +505,38 @@ fn validate_strict_promotes_artifact_config_warnings_to_errors() {
         "config warnings land in errors under --strict: {file}"
     );
 }
+
+#[test]
+fn validate_keeps_the_registry_code_of_an_unusable_runtime_artifact() {
+    // An artifact above UM_MAX_SCHEMA_BYTES is a limit failure, not a
+    // corrupt file: the report keeps the registry code of the actual class.
+    let dir = tempfile::tempdir().unwrap();
+    let um = fixture_um(dir.path());
+    let plugin_dir = dir.path().join(".obsidian/plugins/inscriptum");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    let raw = fixture_artifact().to_string();
+    std::fs::write(
+        plugin_dir.join("schema.json"),
+        format!("{}{}", raw, " ".repeat(300)),
+    )
+    .unwrap();
+
+    let output = insum()
+        .env("UM_MAX_SCHEMA_BYTES", "100")
+        .arg("validate")
+        .arg(&um)
+        .current_dir(dir.path()) // the vault rule finds the oversized artifact
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let file = &value["files"][0];
+    assert_eq!(file["validation_level"], "structural");
+    let warnings = file["warnings"].as_array().unwrap();
+    assert_eq!(
+        warnings[0]["code"],
+        "LIMIT_EXCEEDED",
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

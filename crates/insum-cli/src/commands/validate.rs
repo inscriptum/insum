@@ -162,7 +162,7 @@ fn file_schema(
         if resolved.hash_verified {
             return FileSchema {
                 level: "schema",
-                artifact: Some(Arc::new(resolved.artifact.clone())),
+                artifact: Some(Arc::clone(&resolved.artifact)),
                 info: Some(info_of(resolved)),
                 warnings: Vec::new(),
             };
@@ -213,7 +213,7 @@ fn file_schema(
         },
         Ok(resolved) => FileSchema {
             level: "schema",
-            artifact: Some(Arc::new(resolved.artifact.clone())),
+            artifact: Some(Arc::clone(&resolved.artifact)),
             info: Some(info_of(&resolved)),
             warnings: Vec::new(),
         },
