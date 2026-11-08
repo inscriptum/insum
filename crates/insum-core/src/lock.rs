@@ -135,28 +135,50 @@ fn epoch_ms() -> u64 {
 }
 
 fn new_op_id() -> String {
-    // 12 hex chars from the OS entropy source; uniqueness per attempt is
-    // enough — op_id only has to distinguish concurrent holders
-    let bytes = std::time::SystemTime::now()
+    // 12 hex chars from wall-clock nanoseconds mixed with the pid: not
+    // cryptographic entropy, but collisions between concurrent holders on
+    // one host are practically impossible, which is all op_id needs
+    let nanos = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     let pid = std::process::id();
-    format!("{:08x}{:04x}", bytes, pid & 0xffff)
+    format!("{:08x}{:04x}", nanos, pid & 0xffff)
 }
 
 fn current_hostname() -> Option<String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .ok()
-            .map(|s| s.trim().to_owned())
+        // gethostname(2): works without a shell environment (agent runs
+        // have no exported HOSTNAME)
+        let mut buffer = [0u8; 256];
+        let result =
+            unsafe { libc::gethostname(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
+        if result != 0 {
+            return None;
+        }
+        let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+        let name = String::from_utf8_lossy(&buffer[..end]).trim().to_owned();
+        if name.is_empty() { None } else { Some(name) }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .ok()
+        use windows_sys::Win32::System::SystemInformation::{
+            ComputerNameDnsHostname, GetComputerNameExW,
+        };
+        let mut size: u32 = 0;
+        unsafe {
+            // first call: required buffer size in UTF-16 units
+            let _ = GetComputerNameExW(ComputerNameDnsHostname, std::ptr::null_mut(), &mut size);
+            if size == 0 {
+                return None;
+            }
+            let mut buffer = vec![0u16; size as usize];
+            if GetComputerNameExW(ComputerNameDnsHostname, buffer.as_mut_ptr(), &mut size) == 0 {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&buffer[..size as usize]))
+        }
     }
 }
 
@@ -200,7 +222,22 @@ fn sidecar_path(target: &Path, suffix: &str) -> PathBuf {
     target.with_file_name(format!(".{name}{suffix}"))
 }
 
+/// A sidecar larger than this is not a legitimate lock/lease — treat it as
+/// corrupt without loading it into memory.
+const SIDECAR_MAX_BYTES: u64 = 64 * 1024;
+
+/// Read and parse a sidecar. `Ok(None)` covers both a missing and an
+/// unparsable file; a foreign `format` parses but is rejected by callers
+/// via `is_supported_sidecar`.
 fn read_sidecar(path: &Path) -> Result<Option<Sidecar>, UmError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(UmError::from(err)),
+    };
+    if metadata.len() > SIDECAR_MAX_BYTES {
+        return Ok(None); // oversized: corrupt by definition
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -208,34 +245,49 @@ fn read_sidecar(path: &Path) -> Result<Option<Sidecar>, UmError> {
     };
     match serde_json::from_slice::<Sidecar>(&bytes) {
         Ok(sidecar) => Ok(Some(sidecar)),
-        Err(_) => Ok(None), // corrupt: reported as unparsable by the caller
+        Err(_) => Ok(None), // corrupt: callers apply the age policy
     }
 }
 
-/// Age of a sidecar file, from the recorded creation time when parsable,
-/// otherwise from the file mtime.
+/// A sidecar of an unknown format version is foreign: it is never
+/// interpreted, only aged (recovery rule of the protocol document).
+fn is_supported_sidecar(sidecar: &Sidecar) -> bool {
+    sidecar.format == SIDECAR_FORMAT && (sidecar.kind == "lock" || sidecar.kind == "lease")
+}
+
+/// Age of a sidecar file: the recorded creation time clamped by the file
+/// mtime (a skewed clock may claim the future or the far past; the mtime is
+/// written by the same machine that reads it and cannot lie as much).
 fn sidecar_age(path: &Path, sidecar: Option<&Sidecar>) -> Duration {
-    let created = sidecar.map(|s| s.created_at).unwrap_or_else(|| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    });
+    let mtime_ms = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    let recorded = sidecar.map(|s| s.created_at);
+    let created = match (recorded, mtime_ms) {
+        (Some(recorded), Some(mtime)) => recorded.max(mtime),
+        (Some(recorded), None) => recorded,
+        (None, Some(mtime)) => mtime,
+        (None, None) => 0,
+    };
     let now = epoch_ms();
     Duration::from_millis(now.saturating_sub(created))
 }
 
-/// A holder is provably gone when the pid is dead on the same host; a
-/// cross-host (or unknown-host) holder is only judged by age.
+/// Recovery rule of the protocol document: on the SAME host the pid check
+/// is authoritative — a live holder is never broken, no matter how old
+/// (breaking it would risk parallel commits and lost editor state). A
+/// CROSS-HOST or unknown-host holder cannot be probed, so only age
+/// (`stale_after`) declares it gone.
 fn holder_is_gone(sidecar: &Sidecar, path: &Path, stale_after: Duration) -> bool {
     let same_host = match (&sidecar.holder.hostname, current_hostname()) {
         (Some(recorded), Some(current)) => recorded.as_str() == current.as_str(),
-        _ => true, // no hostname info: trust the pid check on this machine
+        // unknown host on either side: the pid check is not trustworthy
+        _ => false,
     };
-    if same_host && !pid_alive(sidecar.holder.pid) {
-        return true;
+    if same_host {
+        return !pid_alive(sidecar.holder.pid);
     }
     sidecar_age(path, Some(sidecar)) > stale_after
 }
@@ -248,16 +300,40 @@ pub enum LeaseState {
     /// A lease is held; `holder_pid` is informational.
     Held { holder: Holder, op_id: String },
     /// A lease exists but its holder is provably gone (dead pid on this
-    /// host) or it is older than `stale_after`.
+    /// host) or it is older than `stale_after`; `op_id` is `None` for a
+    /// corrupt/foreign file.
     Stale { op_id: Option<String> },
+    /// A fresh corrupt or foreign-format lease: it may be mid-write, so it
+    /// blocks conservatively and is only broken after `stale_after`.
+    Corrupt,
 }
 
 /// Inspect the dirty lease of `target` without touching it (§9.2: apply
-/// refuses to write while a live lease exists).
+/// refuses to write while a live lease exists). A corrupt or foreign
+/// lease blocks conservatively while fresh (it may be mid-write) and
+/// counts as stale once it ages past `stale_after`.
 pub fn check_dirty_lease(target: &Path, stale_after: Duration) -> Result<LeaseState, UmError> {
     let path = sidecar_path(target, LEASE_SUFFIX);
     match read_sidecar(&path)? {
-        None => Ok(LeaseState::Free),
+        None => {
+            if path.exists() {
+                // corrupt or unreadable: age decides
+                if sidecar_age(&path, None) > stale_after {
+                    Ok(LeaseState::Stale { op_id: None })
+                } else {
+                    Ok(LeaseState::Corrupt)
+                }
+            } else {
+                Ok(LeaseState::Free)
+            }
+        }
+        Some(sidecar) if !is_supported_sidecar(&sidecar) => {
+            if sidecar_age(&path, Some(&sidecar)) > stale_after {
+                Ok(LeaseState::Stale { op_id: None })
+            } else {
+                Ok(LeaseState::Corrupt)
+            }
+        }
         Some(sidecar) => {
             if holder_is_gone(&sidecar, &path, stale_after) {
                 Ok(LeaseState::Stale {
@@ -273,12 +349,28 @@ pub fn check_dirty_lease(target: &Path, stale_after: Duration) -> Result<LeaseSt
     }
 }
 
-/// Remove a stale lease; returns whether a file was removed. A live lease
-/// is never touched.
+/// Remove a stale (or aged-corrupt) lease; returns whether a file was
+/// removed. A live lease is never touched.
 pub fn break_stale_lease(target: &Path, stale_after: Duration) -> Result<bool, UmError> {
     let path = sidecar_path(target, LEASE_SUFFIX);
     match read_sidecar(&path)? {
-        None => Ok(false),
+        None => {
+            // corrupt file: broken only when aged
+            if path.exists() && sidecar_age(&path, None) > stale_after {
+                std::fs::remove_file(&path).map_err(UmError::from)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Some(sidecar) if !is_supported_sidecar(&sidecar) => {
+            if sidecar_age(&path, Some(&sidecar)) > stale_after {
+                std::fs::remove_file(&path).map_err(UmError::from)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
         Some(sidecar) => {
             if holder_is_gone(&sidecar, &path, stale_after) {
                 std::fs::remove_file(&path).map_err(UmError::from)?;
@@ -290,10 +382,10 @@ pub fn break_stale_lease(target: &Path, stale_after: Duration) -> Result<bool, U
     }
 }
 
-/// A held transactional commit lock. Release on drop would mask misuse —
-/// the protocol requires an explicit release in both success and error
-/// paths, so dropping without `release` leaves the file and a warning is
-/// logged in debug builds; recovery is the stale detection.
+/// A held transactional commit lock. The protocol requires an explicit
+/// `release` in both success and error paths; dropping without it leaves
+/// the file in place (a known limitation — recovery is the stale
+/// detection, and a retry in the same process waits out its own lock).
 pub struct FileLock {
     path: PathBuf,
     op_id: String,
@@ -351,7 +443,7 @@ impl FileLock {
             }
             return Ok(());
         };
-        if sidecar.kind != "lock" && sidecar.kind != "lease" {
+        if !is_supported_sidecar(&sidecar) {
             // a foreign sidecar format: age-based recovery only
             if sidecar_age(path, Some(&sidecar)) > config.stale_after {
                 let _ = std::fs::remove_file(path);
@@ -426,6 +518,15 @@ pub fn acquire_write_lock(
         LeaseState::Stale { .. } => {
             break_stale_lease(target, config.stale_after)?;
         }
+        LeaseState::Corrupt => {
+            return Err(UmError::new(
+                ErrorCode::WriteLocked,
+                "the dirty lease file of this file is unreadable and fresh",
+            )
+            .with_hint(
+                "A lease that is mid-write or damaged blocks the write conservatively; it recovers by age, or remove the lease sidecar manually if you are sure no editor is running.",
+            ));
+        }
         LeaseState::Held { holder, op_id } => {
             return Err(UmError::new(
                 ErrorCode::WriteLocked,
@@ -472,6 +573,17 @@ mod tests {
 
     fn write_sidecar(path: &Path, sidecar: &Sidecar) {
         std::fs::write(path, serde_json::to_vec(sidecar).unwrap()).unwrap();
+    }
+
+    /// Write a sidecar and age BOTH the recorded time and the file mtime
+    /// (the age rule clamps created_at with the mtime, so both must lie in
+    /// the past to make the file look old).
+    fn write_aged_sidecar(path: &Path, mut sidecar: Sidecar) {
+        sidecar.created_at = epoch_ms() - 120_000;
+        write_sidecar(path, &sidecar);
+        let aged = SystemTime::now() - Duration::from_secs(120);
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(aged).unwrap();
     }
 
     #[test]
@@ -594,6 +706,117 @@ mod tests {
         // released); the losers all failed with WRITE_LOCKED
         assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(sidecar_path(&target, LOCK_SUFFIX).exists());
+    }
+
+    #[test]
+    fn live_same_host_holder_survives_any_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LEASE_SUFFIX);
+        // our own pid: provably alive on this host, aged far beyond the cap
+        let mut lease = Sidecar::new("lease", "plugin", Some("dirty"));
+        lease.holder.pid = std::process::id();
+        write_aged_sidecar(&path, lease);
+
+        // a live editor lease older than stale_after is STILL HELD —
+        // breaking it would write over unsaved editor state (§9.2 MUST)
+        match check_dirty_lease(&target, fast_config().stale_after).unwrap() {
+            LeaseState::Held { .. } => {}
+            other => panic!("live lease must stay Held, got {other:?}"),
+        }
+        let err = acquire_write_lock(&target, "apply", &fast_config()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WriteLocked);
+        assert!(
+            path.exists(),
+            "a live holder is never broken, whatever its age"
+        );
+    }
+
+    #[test]
+    fn cross_host_holder_is_judged_by_age_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LOCK_SUFFIX);
+        // a live pid on a DIFFERENT host cannot be probed: age decides
+        let mut lock = Sidecar::new("lock", "cli", Some("sync"));
+        lock.holder.hostname = Some("other-machine.example".to_owned());
+        lock.holder.pid = std::process::id();
+        write_aged_sidecar(&path, lock);
+
+        // aged cross-host lock: broken despite the (irrelevant) live pid
+        let lock_guard = FileLock::acquire(&target, "apply", &fast_config()).unwrap();
+        lock_guard.release().unwrap();
+        assert!(!path.exists());
+
+        // fresh cross-host lock: waits out the timeout (WRITE_LOCKED)
+        let mut fresh = Sidecar::new("lock", "cli", Some("sync"));
+        fresh.holder.hostname = Some("other-machine.example".to_owned());
+        fresh.holder.pid = std::process::id();
+        write_sidecar(&path, &fresh);
+        let err = FileLock::acquire(&target, "apply", &fast_config()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WriteLocked);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn foreign_format_is_never_interpreted_only_aged() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LOCK_SUFFIX);
+        let mut future = Sidecar::new("lock", "cli", Some("from-the-future"));
+        future.format = 99;
+        write_sidecar(&path, &future);
+        // fresh foreign file: blocked, untouched
+        let err = FileLock::acquire(&target, "apply", &fast_config()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WriteLocked);
+        assert!(path.exists());
+        // aged foreign file: removed without interpretation
+        write_aged_sidecar(&path, future);
+        let lock_guard = FileLock::acquire(&target, "apply", &fast_config()).unwrap();
+        lock_guard.release().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn corrupt_lease_blocks_fresh_and_recovers_aged() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LEASE_SUFFIX);
+        std::fs::write(&path, b"{half-written").unwrap();
+
+        // fresh corrupt lease: blocks conservatively (may be mid-write)
+        match check_dirty_lease(&target, fast_config().stale_after).unwrap() {
+            LeaseState::Corrupt => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        let err = acquire_write_lock(&target, "apply", &fast_config()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::WriteLocked);
+        assert!(path.exists());
+
+        // aged corrupt lease: stale, broken by the recovery path
+        let aged = SystemTime::now() - Duration::from_secs(120);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(aged).unwrap();
+        drop(file);
+        match check_dirty_lease(&target, fast_config().stale_after).unwrap() {
+            LeaseState::Stale { op_id: None } => {}
+            other => panic!("expected Stale(None), got {other:?}"),
+        }
+        assert!(break_stale_lease(&target, fast_config().stale_after).unwrap());
+        let lock_guard = acquire_write_lock(&target, "apply", &fast_config()).unwrap();
+        lock_guard.release().unwrap();
+    }
+
+    #[test]
+    fn oversized_sidecar_is_corrupt_without_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LEASE_SUFFIX);
+        std::fs::write(&path, vec![b'x'; 128 * 1024]).unwrap();
+        match check_dirty_lease(&target, fast_config().stale_after).unwrap() {
+            LeaseState::Corrupt => {}
+            other => panic!("oversized file must be corrupt, got {other:?}"),
+        }
     }
 
     #[test]
