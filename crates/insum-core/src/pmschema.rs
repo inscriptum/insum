@@ -38,6 +38,15 @@ use crate::validate::Diag;
 
 // ─── Content expression DFA (port of prosemirror-model content.ts) ───────
 
+/// Resource caps for compiling content expressions of an UNTRUSTED
+/// artifact: the NFA→DFA construction can blow up exponentially from a
+/// short expression, and parser/compiler recursion is unbounded without a
+/// guard. A legitimate editor schema sits orders of magnitude below these.
+const MAX_EXPR_TOKENS: usize = 512;
+const MAX_EXPR_DEPTH: usize = 128;
+const MAX_NFA_STATES: usize = 4_096;
+const MAX_DFA_STATES: usize = 4_096;
+
 /// A DFA state: `valid_end` marks a valid end of the content; edges map a
 /// node type index to the next state.
 struct Dfa {
@@ -161,10 +170,16 @@ fn parse_expr(
     type_index: &HashMap<String, usize>,
     groups: &HashMap<String, Vec<usize>>,
     inline: &mut Option<bool>,
+    depth: usize,
 ) -> Result<Expr, String> {
-    let mut exprs = vec![parse_expr_seq(stream, type_index, groups, inline)?];
+    if depth > MAX_EXPR_DEPTH {
+        return Err(format!(
+            "content expression nested deeper than {MAX_EXPR_DEPTH} levels"
+        ));
+    }
+    let mut exprs = vec![parse_expr_seq(stream, type_index, groups, inline, depth)?];
     while stream.eat("|") {
-        exprs.push(parse_expr_seq(stream, type_index, groups, inline)?);
+        exprs.push(parse_expr_seq(stream, type_index, groups, inline, depth)?);
     }
     Ok(if exprs.len() == 1 {
         exprs.pop().unwrap()
@@ -178,10 +193,15 @@ fn parse_expr_seq(
     type_index: &HashMap<String, usize>,
     groups: &HashMap<String, Vec<usize>>,
     inline: &mut Option<bool>,
+    depth: usize,
 ) -> Result<Expr, String> {
-    let mut exprs = vec![parse_expr_subscript(stream, type_index, groups, inline)?];
+    let mut exprs = vec![parse_expr_subscript(
+        stream, type_index, groups, inline, depth,
+    )?];
     while stream.next().is_some_and(|t| t != ")" && t != "|") {
-        exprs.push(parse_expr_subscript(stream, type_index, groups, inline)?);
+        exprs.push(parse_expr_subscript(
+            stream, type_index, groups, inline, depth,
+        )?);
     }
     Ok(if exprs.len() == 1 {
         exprs.pop().unwrap()
@@ -195,8 +215,9 @@ fn parse_expr_subscript(
     type_index: &HashMap<String, usize>,
     groups: &HashMap<String, Vec<usize>>,
     inline: &mut Option<bool>,
+    depth: usize,
 ) -> Result<Expr, String> {
-    let mut expr = parse_expr_atom(stream, type_index, groups, inline)?;
+    let mut expr = parse_expr_atom(stream, type_index, groups, inline, depth)?;
     loop {
         if stream.eat("+") {
             expr = Expr::Plus(Box::new(expr));
@@ -271,9 +292,10 @@ fn parse_expr_atom(
     type_index: &HashMap<String, usize>,
     groups: &HashMap<String, Vec<usize>>,
     inline: &mut Option<bool>,
+    depth: usize,
 ) -> Result<Expr, String> {
     if stream.eat("(") {
-        let expr = parse_expr(stream, type_index, groups, inline)?;
+        let expr = parse_expr(stream, type_index, groups, inline, depth + 1)?;
         if !stream.eat(")") {
             return Err("Missing closing paren".to_owned());
         }
@@ -324,12 +346,17 @@ fn connect(nfa: &mut Nfa, edges: &[EdgeId], to: usize) {
     }
 }
 
-fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Vec<EdgeId> {
-    match expr {
+fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Result<Vec<EdgeId>, String> {
+    if nfa.len() > MAX_NFA_STATES {
+        return Err(format!(
+            "content expression expands beyond {MAX_NFA_STATES} NFA states"
+        ));
+    }
+    Ok(match expr {
         Expr::Choice(exprs) => {
             let mut out = Vec::new();
             for expr in exprs {
-                out.extend(compile(expr, from, nfa));
+                out.extend(compile(expr, from, nfa)?);
             }
             out
         }
@@ -337,7 +364,7 @@ fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Vec<EdgeId> {
             let mut current = from;
             let mut out = Vec::new();
             for (i, expr) in exprs.iter().enumerate() {
-                let next = compile(expr, current, nfa);
+                let next = compile(expr, current, nfa)?;
                 if i == exprs.len() - 1 {
                     out = next;
                 } else {
@@ -354,22 +381,22 @@ fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Vec<EdgeId> {
             nfa.push(vec![]);
             let skip = push_edge(nfa, from, None);
             connect(nfa, &[skip], loop_state);
-            let inner = compile(expr, loop_state, nfa);
+            let inner = compile(expr, loop_state, nfa)?;
             connect(nfa, &inner, loop_state);
             vec![push_edge(nfa, loop_state, None)]
         }
         Expr::Plus(expr) => {
             let loop_state = nfa.len();
             nfa.push(vec![]);
-            let first = compile(expr, from, nfa);
+            let first = compile(expr, from, nfa)?;
             connect(nfa, &first, loop_state);
-            let again = compile(expr, loop_state, nfa);
+            let again = compile(expr, loop_state, nfa)?;
             connect(nfa, &again, loop_state);
             vec![push_edge(nfa, loop_state, None)]
         }
         Expr::Opt(expr) => {
             let skip = push_edge(nfa, from, None);
-            let inner = compile(expr, from, nfa);
+            let inner = compile(expr, from, nfa)?;
             let mut out = vec![skip];
             out.extend(inner);
             out
@@ -379,12 +406,12 @@ fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Vec<EdgeId> {
             for _ in 0..*min {
                 let next = nfa.len();
                 nfa.push(vec![]);
-                let inner = compile(expr, current, nfa);
+                let inner = compile(expr, current, nfa)?;
                 connect(nfa, &inner, next);
                 current = next;
             }
             if *max == -1 {
-                let inner = compile(expr, current, nfa);
+                let inner = compile(expr, current, nfa)?;
                 connect(nfa, &inner, current);
             } else {
                 for _ in *min..(*max as usize) {
@@ -392,7 +419,7 @@ fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Vec<EdgeId> {
                     nfa.push(vec![]);
                     let skip = push_edge(nfa, current, None);
                     nfa[skip.0][skip.1].1 = Some(next);
-                    let inner = compile(expr, current, nfa);
+                    let inner = compile(expr, current, nfa)?;
                     connect(nfa, &inner, next);
                     current = next;
                 }
@@ -400,7 +427,7 @@ fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Vec<EdgeId> {
             vec![push_edge(nfa, current, None)]
         }
         Expr::Name(idx) => vec![push_edge(nfa, from, Some(*idx))],
-    }
+    })
 }
 
 /// Nodes reachable by null edges; nodes with a single null-out-edge are
@@ -452,6 +479,11 @@ fn build_dfa(nfa: &Nfa, type_names: &[String], required_attr: &[bool]) -> Result
             if let Some(&idx) = labeled.get(&key) {
                 idx
             } else {
+                if states.len() >= MAX_DFA_STATES {
+                    return Err(format!(
+                        "content expression expands beyond {MAX_DFA_STATES} DFA states"
+                    ));
+                }
                 let idx = states.len();
                 states.push(DfaState {
                     valid_end: $set.contains(&success),
@@ -505,7 +537,7 @@ fn build_dfa(nfa: &Nfa, type_names: &[String], required_attr: &[bool]) -> Result
         let mut names: Vec<&str> = Vec::new();
         for (term, next) in &state.edges {
             names.push(&type_names[*term]);
-            let generatable = type_names[*term] == "text" || !required_attr[*term];
+            let generatable = type_names[*term] != "text" && !required_attr[*term];
             if dead && generatable {
                 dead = false;
             }
@@ -619,12 +651,17 @@ impl PmSchema {
             let content = match &spec.content {
                 None => Dfa::empty(),
                 Some(expr) => {
+                    if tokenize(expr).len() > MAX_EXPR_TOKENS {
+                        return Err(invalid(format!(
+                            "content expression of {name} exceeds {MAX_EXPR_TOKENS} tokens"
+                        )));
+                    }
                     let mut stream = TokenStream::new(expr, &inline_of);
                     if stream.next().is_none() {
                         Dfa::empty()
                     } else {
                         let mut inline: Option<bool> = None;
-                        let parsed = parse_expr(&mut stream, &type_index, &groups, &mut inline)
+                        let parsed = parse_expr(&mut stream, &type_index, &groups, &mut inline, 0)
                             .map_err(|mut message| {
                                 message.push_str(&format!(" (in content expression of {name})"));
                                 invalid(message)
@@ -635,7 +672,10 @@ impl PmSchema {
                             )));
                         }
                         let mut nfa: Nfa = vec![vec![]];
-                        let edges = compile(&parsed, 0, &mut nfa);
+                        let edges = compile(&parsed, 0, &mut nfa).map_err(|mut message| {
+                            message.push_str(&format!(" (in content expression of {name})"));
+                            invalid(message)
+                        })?;
                         let success = nfa.len();
                         nfa.push(vec![]);
                         connect(&mut nfa, &edges, success);
@@ -784,19 +824,19 @@ impl PmSchema {
                         });
                     }
                 }
-                if !attrs.is_empty() {
-                    for (name, has_default) in &node_type.attrs {
-                        if !has_default && !attrs.contains_key(name) {
-                            out.errors.push(Diag {
-                                code: "ATTR_REQUIRED",
-                                message: format!(
-                                    "no value supplied for required attribute {name:?} of node type {type_name:?}"
-                                ),
-                            });
-                        }
+                for (name, has_default) in &node_type.attrs {
+                    if !has_default && !attrs.contains_key(name) {
+                        out.errors.push(Diag {
+                            code: "ATTR_REQUIRED",
+                            message: format!(
+                                "no value supplied for required attribute {name:?} of node type {type_name:?}"
+                            ),
+                        });
                     }
                 }
             }
+            // attrs absent entirely: PM computeAttrs receives null —
+            // required attributes still throw
             _ => {
                 for (name, has_default) in &node_type.attrs {
                     if !has_default {
@@ -933,8 +973,30 @@ impl PmSchema {
                         });
                     }
                 }
-                let _ = mark_idx;
+                for (name, has_default) in &spec.attrs {
+                    if !has_default && !mark_attrs.contains_key(name) {
+                        out.errors.push(Diag {
+                            code: "ATTR_REQUIRED",
+                            message: format!(
+                                "no value supplied for required attribute {name:?} of mark type {mark_type:?}"
+                            ),
+                        });
+                    }
+                }
+            } else {
+                let spec = &self.marks[mark_type];
+                for (name, has_default) in &spec.attrs {
+                    if !has_default {
+                        out.errors.push(Diag {
+                            code: "ATTR_REQUIRED",
+                            message: format!(
+                                "no value supplied for required attribute {name:?} of mark type {mark_type:?}"
+                            ),
+                        });
+                    }
+                }
             }
+            let _ = mark_idx;
         }
     }
 }
@@ -1163,6 +1225,99 @@ mod tests {
         ]});
         let result = schema.check_document(&doc);
         assert!(!result.valid());
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_a_stack_overflow() {
+        let deep = "(".repeat(500) + "block" + &")".repeat(500);
+        let raw = json!({
+            "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
+            "top_node": "doc", "validation_capability": "partial",
+            "nodes": {"doc": {"content": deep, "groups": [], "attrs": {}, "marks": [],
+                              "addressable": false, "inline_content": false, "searchable": false},
+                      "block": {"content": null, "groups": ["block"], "attrs": {}, "marks": [],
+                                "addressable": true, "inline_content": false, "searchable": false}},
+            "marks": {}
+        });
+        let err = PmSchema::build(&SchemaArtifact::parse(raw).unwrap())
+            .err()
+            .expect("must not compile");
+        assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
+    }
+
+    #[test]
+    fn exponential_dfa_is_capped() {
+        // a short expression whose DFA would explode exponentially
+        let mut expr = String::new();
+        for i in 0..40 {
+            expr.push_str(&format!("(a{i} | b{i})* "));
+        }
+        expr.push_str("a0 (a0 | b0){30}");
+        let raw = json!({
+            "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
+            "top_node": "doc", "validation_capability": "partial",
+            "nodes": {
+                "doc": {"content": expr, "groups": [], "attrs": {}, "marks": [],
+                        "addressable": false, "inline_content": false, "searchable": false},
+                "a0": {"content": null, "groups": [], "attrs": {}, "marks": [],
+                       "addressable": true, "inline_content": false, "searchable": false},
+                "b0": {"content": null, "groups": [], "attrs": {}, "marks": [],
+                       "addressable": true, "inline_content": false, "searchable": false}
+            },
+            "marks": {}
+        });
+        // only a0/b0 exist; the other a{i}/b{i} names the expression
+        // references resolve as unknowns — the compiler must fail either
+        // way, quickly and without hanging
+        let err = PmSchema::build(&SchemaArtifact::parse(raw).unwrap())
+            .err()
+            .expect("must not compile");
+        assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
+    }
+
+    #[test]
+    fn required_attribute_semantics_follow_compute_attrs() {
+        let raw = json!({
+            "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
+            "top_node": "doc", "validation_capability": "partial",
+            "nodes": {
+                "doc": {"content": "para*", "groups": [], "attrs": {}, "marks": [],
+                        "addressable": false, "inline_content": false, "searchable": false},
+                "para": {"content": null, "groups": ["block"], "attrs": {},
+                         "marks": [], "addressable": true, "inline_content": false,
+                         "searchable": false}
+            },
+            "marks": {}
+        });
+        let schema = PmSchema::build(&SchemaArtifact::parse(raw).unwrap()).unwrap();
+        // no required attrs anywhere in this fixture — the check passes
+        let doc = json!({"type": "doc", "content": [
+            {"type": "para", "content": []},
+            {"type": "para", "attrs": {}, "content": []}
+        ]});
+        assert!(schema.check_document(&doc).valid());
+    }
+
+    #[test]
+    fn text_only_required_positions_fail_at_compile() {
+        // PM checkForDeadEnds: text is not generatable — "text+" cannot be
+        // filled, so the schema must not compile
+        let raw = json!({
+            "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
+            "top_node": "doc", "validation_capability": "partial",
+            "nodes": {
+                "doc": {"content": "text+", "groups": [], "attrs": {}, "marks": [],
+                        "addressable": false, "inline_content": false, "searchable": false},
+                "text": {"content": null, "groups": ["inline"], "attrs": {}, "marks": [],
+                         "addressable": false, "inline_content": true, "searchable": false}
+            },
+            "marks": {}
+        });
+        let err = PmSchema::build(&SchemaArtifact::parse(raw).unwrap())
+            .err()
+            .expect("must not compile");
+        assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
+        assert!(err.message.contains("non-generatable"), "{}", err.message);
     }
 
     #[test]

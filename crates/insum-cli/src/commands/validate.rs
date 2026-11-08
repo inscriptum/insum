@@ -61,13 +61,23 @@ pub fn run(
         }));
     }
 
-    // runtime artifacts are looked up once per parent directory
+    // runtime artifacts are looked up once per parent directory; the
+    // compiled parity schema is reused across files (keyed by artifact path)
     let mut runtime_cache: HashMap<PathBuf, Option<Result<Arc<ResolvedSchema>, UmError>>> =
         HashMap::new();
+    let mut pm_cache: HashMap<PathBuf, Arc<PmSchema>> = HashMap::new();
+    let mut explicit_pm: Option<Arc<PmSchema>> = None;
 
     for file in &files {
         let rendered = render_path(file);
-        let file_schema = file_schema(file, explicit.as_ref(), &mut runtime_cache, limits);
+        let file_schema = file_schema(
+            file,
+            explicit.as_ref(),
+            &mut runtime_cache,
+            &mut pm_cache,
+            &mut explicit_pm,
+            limits,
+        );
         if file_schema.level != "schema" {
             all_schema = false;
         }
@@ -151,6 +161,8 @@ fn file_schema(
     file: &Path,
     explicit: Option<&Arc<ResolvedSchema>>,
     runtime_cache: &mut HashMap<PathBuf, Option<Result<Arc<ResolvedSchema>, UmError>>>,
+    pm_cache: &mut HashMap<PathBuf, Arc<PmSchema>>,
+    explicit_pm: &mut Option<Arc<PmSchema>>,
     limits: &Limits,
 ) -> FileSchema {
     let info_of = |resolved: &ResolvedSchema| {
@@ -167,19 +179,19 @@ fn file_schema(
 
     if let Some(resolved) = explicit {
         if resolved.hash_verified {
-            let pm = match compiled(resolved) {
-                Ok(pm) => pm,
-                Err(err) => {
-                    return FileSchema {
-                        level: "structural",
-                        pm: None,
-                        info: Some(info_of(resolved)),
-                        warnings: vec![json!({
-                            "code": err.code.as_str(),
-                            "message": format!("schema artifact could not be compiled: {}", err.message),
-                        })],
-                    };
-                }
+            if explicit_pm.is_none() {
+                *explicit_pm = compiled(resolved).ok();
+            }
+            let Some(pm) = explicit_pm.clone() else {
+                return FileSchema {
+                    level: "structural",
+                    pm: None,
+                    info: Some(info_of(resolved)),
+                    warnings: vec![json!({
+                        "code": "SCHEMA_ARTIFACT_INVALID",
+                        "message": "schema artifact could not be compiled; validation stays structural",
+                    })],
+                };
             };
             return FileSchema {
                 level: "schema",
@@ -232,23 +244,41 @@ fn file_schema(
                 ),
             })],
         },
-        Ok(resolved) => match compiled(&resolved) {
-            Ok(pm) => FileSchema {
-                level: "schema",
-                pm: Some(pm),
-                info: Some(info_of(&resolved)),
-                warnings: Vec::new(),
-            },
-            Err(err) => FileSchema {
-                level: "structural",
-                pm: None,
-                info: Some(info_of(&resolved)),
-                warnings: vec![json!({
-                    "code": err.code.as_str(),
-                    "message": format!("schema artifact could not be compiled: {}", err.message),
-                })],
-            },
-        },
+        Ok(resolved) => {
+            // compile once per artifact path (bundled has no path and is
+            // never compiled — it does not lift the level)
+            let pm = match &resolved.source_path {
+                Some(path) => {
+                    if let Some(cached) = pm_cache.get(path) {
+                        Some(cached.clone())
+                    } else {
+                        let pm = compiled(&resolved).ok();
+                        if let Some(pm) = &pm {
+                            pm_cache.insert(path.clone(), pm.clone());
+                        }
+                        pm
+                    }
+                }
+                None => None,
+            };
+            match pm {
+                Some(pm) => FileSchema {
+                    level: "schema",
+                    pm: Some(pm),
+                    info: Some(info_of(&resolved)),
+                    warnings: Vec::new(),
+                },
+                None => FileSchema {
+                    level: "structural",
+                    pm: None,
+                    info: Some(info_of(&resolved)),
+                    warnings: vec![json!({
+                        "code": "SCHEMA_ARTIFACT_INVALID",
+                        "message": "runtime schema artifact could not be compiled; validation stays structural",
+                    })],
+                },
+            }
+        }
         // The registry code of the actual failure (invalid, oversized,
         // unreadable) is kept — repair hints differ per class.
         Err(err) => FileSchema {

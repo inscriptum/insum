@@ -68,8 +68,12 @@ const schema = new Schema({
           marks: (spec.marks ?? []).join(" "),
           attrs: Object.fromEntries(
             Object.entries(spec.attrs ?? {}).map(([attr, spec2]) => [
+              // the artifact omits `default` for required attributes —
+              // pass the key through only when it exists
               attr,
-              { default: (spec2 as { default?: unknown }).default ?? null },
+              "default" in (spec2 as object)
+                ? { default: (spec2 as { default?: unknown }).default }
+                : {},
             ]),
           ),
           inline: isInline(name),
@@ -87,7 +91,9 @@ const schema = new Schema({
           attrs: Object.fromEntries(
             Object.entries(spec.attrs ?? {}).map(([attr, spec2]) => [
               attr,
-              { default: (spec2 as { default?: unknown }).default ?? null },
+              "default" in (spec2 as object)
+                ? { default: (spec2 as { default?: unknown }).default }
+                : {},
             ]),
           ),
         },
@@ -368,9 +374,15 @@ emit("invalid-noteproperty-value-first", {
   type: "noteProperty",
   content: [node("notePropertyValue", text("v")), node("notePropertyName", text("k"))],
 });
-emit("invalid-hljsblock-plain-paragraph", {
+// the artifact's hljs expression "(hljsCodeBlockRow | paragraph?)+"
+// really allows paragraphs inside code blocks — PM confirmed it
+emit("valid-hljsblock-paragraph-allowed", {
   type: "hljsCodeBlock",
   content: [node("paragraph", text("код"))],
+}, "valid");
+emit("invalid-hljsblock-heading-child", {
+  type: "hljsCodeBlock",
+  content: [node("heading", text("не ряд кода"))],
 });
 
 // ── 5. invalid: text nodes ───────────────────────────────────────────────

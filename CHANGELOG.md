@@ -9,7 +9,7 @@ Format — Keep a Changelog; versioning — SemVer.
 
 - Differential TS×Rust corpus (§4.8): a TypeScript harness builds a real
   prosemirror-model Schema from the artifact and records its verdicts for
-  121 documents (valid compositions, targeted mutations, unknown types,
+  122 documents (valid compositions, targeted mutations, unknown types,
   mark-set rules, text and shape edge cases); the committed corpus is
   replayed by the Rust gate `corpus_gate` with zero divergences, and CI
   regenerates it requiring a byte-identical result.
@@ -22,25 +22,6 @@ Format — Keep a Changelog; versioning — SemVer.
   (title-less noteDoc roots, legacy node types) are reported with
   `SCHEMA_FAMILY_UNCOVERED` / `SCHEMA_NODE_LEGACY` warnings instead of
   invented verdicts.
-
-### Added
-
-- `insum schema [--type <node>] [--schema <file>]`: show the applicable
-  schema artifact — source (`explicit` / `plugin-runtime` /
-  `bundled-fallback`), path, hash with recomputation result
-  (`hash_verified`) and `validation_capability`; `--type` prints one node
-  descriptor (content rule, attrs, marks, flags, example) and unknown types
-  fail with `UNSUPPORTED_NODE_TYPE` listing the available types.
-- `insum validate` now distinguishes `structural` and `schema` levels per
-  file and for the whole run: with an applicable artifact (explicit or
-  found by the vault rule) inventory checks run against it — node types,
-  attribute keys, mark types, document root — and the report labels the
-  artifact source and hash. Legacy node types observed in real documents
-  but absent from the artifact are `SCHEMA_NODE_LEGACY` warnings; undeclared
-  attrs and marks are warnings; alien node types are errors. The bundled
-  fallback (`schema/inscriptum-schema.json`) is labeled but never lifts the
-  level; `full` stays reserved for the differential corpus.
-- New limit `UM_MAX_SCHEMA_BYTES` (default 1 MiB) caps schema artifact files.
 
 ### Fixed
 
