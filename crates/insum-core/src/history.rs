@@ -278,7 +278,9 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<(Vec<Revision>, u
             .unwrap_or(0);
         let author = fields.next().unwrap_or("").trim().to_owned();
         let subject = fields.next().unwrap_or("").trim().to_owned();
-        if !is_valid_sha(&sha) {
+        // every object name that will reach a git argument must be hex:
+        // the sha AND the parents (a forged subject can carry separators)
+        if !is_valid_sha(&sha) || parents.iter().any(|parent| !is_valid_sha(parent)) {
             skipped += 1;
             continue;
         }
@@ -298,11 +300,7 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<(Vec<Revision>, u
 /// LIMIT_EXCEEDED instead of allocating it whole.
 fn revision_blob(repo: &RepoLocation, sha: &str, limits: &Limits) -> Result<Vec<u8>, UmError> {
     let object = format!("{sha}:{}", repo.file_in_repo);
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(&repo.root)
-        .arg("show")
-        .arg(&object)
+    let mut child = git_command(&repo.root, &["show", &object])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -322,14 +320,21 @@ fn revision_blob(repo: &RepoLocation, sha: &str, limits: &Limits) -> Result<Vec<
     std::io::Read::take(&mut stdout, limit as u64)
         .read_to_end(&mut bytes)
         .map_err(UmError::from)?;
+    drop(stdout); // close the pipe: a writer blocked on it can finish
+    let oversized = bytes.len() > limits.max_entry_bytes;
+    if oversized {
+        // the writer is still feeding a blob nobody reads — stop it
+        // instead of waiting forever in wait()
+        let _ = child.kill();
+    }
     let status = child.wait().map_err(UmError::from)?;
-    if !status.success() {
+    if !status.success() && !oversized {
         return Err(UmError::new(
             ErrorCode::IoError,
             format!("git show {object} failed"),
         ));
     }
-    if bytes.len() > limits.max_entry_bytes {
+    if oversized {
         return Err(UmError::new(
             ErrorCode::LimitExceeded,
             format!(
@@ -736,7 +741,7 @@ pub fn collect(
     let listed_count = listed.len();
     let output_count = listed_count.min(limit);
     let mut parsed_by_sha: HashMap<String, Option<RevisionNotes>> = HashMap::new();
-    let parent_notes: HashMap<String, Option<RevisionNotes>> = HashMap::new();
+    let mut parent_cache: HashMap<String, Option<RevisionNotes>> = HashMap::new();
     for revision in listed.iter().take(output_count + 1) {
         let notes = revision_blob(&repo, &revision.sha, limits)
             .and_then(|blob| revision_notes(&blob, &extension, limits))?;
@@ -766,67 +771,76 @@ pub fn collect(
             }
         };
         let parent_sha = revision.parents.first().cloned();
-        let parent: Option<Option<RevisionNotes>> = match &parent_sha {
+        enum ParentNotes {
+            Root,
+            Parsed(RevisionNotes),
+            Unparseable,
+        }
+        let parent = match &parent_sha {
             // root commit: no parent, no diff
-            None => Some(None),
+            None => ParentNotes::Root,
             Some(sha) => {
-                if let Some(cached) = parsed_by_sha.get(sha).cloned() {
-                    Some(cached)
-                } else if let Some(cached) = parent_notes.get(sha).cloned() {
-                    Some(cached)
-                } else {
-                    Some(
-                        revision_blob(&repo, sha, limits)
-                            .and_then(|blob| revision_notes(&blob, &extension, limits))?,
-                    )
+                let cached = parsed_by_sha
+                    .get(sha)
+                    .cloned()
+                    .or_else(|| parent_cache.get(sha).cloned());
+                match cached {
+                    Some(Some(notes)) => ParentNotes::Parsed(notes),
+                    Some(None) => ParentNotes::Unparseable,
+                    None => {
+                        let parsed = revision_blob(&repo, sha, limits)
+                            .and_then(|blob| revision_notes(&blob, &extension, limits))?;
+                        parent_cache.insert(sha.clone(), parsed.clone());
+                        match parsed {
+                            Some(notes) => ParentNotes::Parsed(notes),
+                            None => ParentNotes::Unparseable,
+                        }
+                    }
                 }
             }
-        };
-        let parent_notes_opt = match parent {
-            // the parent blob does not parse: this revision's diff is not
-            // judged
-            None => {
-                diffs.push(RevisionDiff {
-                    revision,
-                    notes: Vec::new(),
-                    warning: Some(warning(
-                        "PARENT_BLOB_NOT_PARSEABLE",
-                        format!(
-                            "the parent revision {} does not parse as a {} file; the diff against it is not judged",
-                            parent_sha
-                                .as_deref()
-                                .map(|s| s[..7.min(s.len())].to_owned())
-                                .unwrap_or_default(),
-                            if extension == "note" { ".note" } else { ".um" }
-                        ),
-                    )),
-                });
-                continue;
-            }
-            Some(parent) => parent,
         };
         let mut revision_diff = RevisionDiff {
             revision,
             notes: Vec::new(),
             warning: None,
         };
-        if let Some(parent) = parent_notes_opt {
-            let mut per_note = diff_note_sets(&parent, &notes);
-            if let Some(filter) = note_filter {
-                per_note.retain(|diff| {
-                    diff.note_id == filter || diff.note_title.as_deref() == Some(filter)
-                });
+        match parent {
+            // the parent blob does not parse: this revision's diff is not
+            // judged — said explicitly, never silently
+            ParentNotes::Unparseable => {
+                revision_diff.warning = Some(warning(
+                    "PARENT_BLOB_NOT_PARSEABLE",
+                    format!(
+                        "the parent revision {} does not parse as a {} file; the diff against it is not judged",
+                        parent_sha
+                            .as_deref()
+                            .map(|s| s[..7.min(s.len())].to_owned())
+                            .unwrap_or_default(),
+                        if extension == "note" { ".note" } else { ".um" }
+                    ),
+                ));
             }
-            revision_diff.notes = per_note;
-        } else if let Some(filter) = note_filter {
-            // root commit with a filter: report whether the note exists in
-            // this revision (context, no block diff)
-            if let Some((_, title, _)) = notes.iter().find(|(id, _, _)| id == filter) {
-                revision_diff.notes.push(NoteDiff {
-                    note_id: filter.to_owned(),
-                    note_title: title.clone(),
-                    ..NoteDiff::default()
-                });
+            ParentNotes::Root => {
+                if let Some(filter) = note_filter {
+                    // root commit with a filter: report whether the note
+                    // exists in this revision (context, no block diff)
+                    if let Some((_, title, _)) = notes.iter().find(|(id, _, _)| id == filter) {
+                        revision_diff.notes.push(NoteDiff {
+                            note_id: filter.to_owned(),
+                            note_title: title.clone(),
+                            ..NoteDiff::default()
+                        });
+                    }
+                }
+            }
+            ParentNotes::Parsed(parent_notes) => {
+                let mut per_note = diff_note_sets(&parent_notes, &notes);
+                if let Some(filter) = note_filter {
+                    per_note.retain(|diff| {
+                        diff.note_id == filter || diff.note_title.as_deref() == Some(filter)
+                    });
+                }
+                revision_diff.notes = per_note;
             }
         }
         diffs.push(revision_diff);
@@ -1120,6 +1134,118 @@ mod tests {
             serde_json::to_string(&after.revisions).unwrap()
         );
         drop(dir);
+    }
+
+    #[test]
+    fn forged_log_records_never_reach_git_arguments() {
+        // a commit subject carrying the field separators forges log
+        // records; neither the sha nor the parents may pass validation
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        std::fs::write(&file, b"placeholder").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        // the forged subject smuggles an --output argument through both
+        // the sha and the parents field
+        let forged = "v1\u{1e}--output=PWNED\u{1f}zz\u{1e}";
+        git_in(
+            dir.path(),
+            &["commit", "--quiet", "-m", forged, "--allow-empty"],
+        );
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert!(
+            history.revisions.is_empty()
+                || history
+                    .revisions
+                    .iter()
+                    .all(|r| is_valid_sha(&r.revision.sha))
+        );
+        assert!(
+            !dir.path().join("PWNED:page.um").exists(),
+            "no file may be written through a forged argument"
+        );
+    }
+
+    #[test]
+    fn oversized_revision_blob_fails_fast_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        // an uncompressed 8 MiB blob — far above the 1 MiB test limit
+        std::fs::write(&file, vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "huge blob"]);
+
+        let mut limits = Limits::defaults();
+        limits.max_entry_bytes = 1024 * 1024;
+        let started = std::time::Instant::now();
+        let err = collect(&file, None, MAX_REVISIONS, &limits).unwrap_err();
+        assert_eq!(err.code, ErrorCode::LimitExceeded);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the oversized blob must fail fast, not deadlock: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn unparseable_parent_is_reported_not_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        std::fs::write(&file, b"broken history state").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "broken parent"]);
+        // the child is a real container so only the PARENT fails to parse
+        write_um_bytes(
+            &file,
+            &serde_json::json!({
+                "format": "um", "version": 1, "type": "notepad",
+                "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                           "title": "T", "schema": "plain", "schemaVersion": 3}]
+            }),
+            &serde_json::json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}),
+        );
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "valid child"]);
+
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert_eq!(history.revisions.len(), 2, "both revisions are listed");
+        // the parent blob is "broken history state" — not a .um at all
+        let child = &history.revisions[0];
+        assert!(
+            child
+                .warning
+                .as_ref()
+                .is_some_and(|w| w["code"] == "PARENT_BLOB_NOT_PARSEABLE"),
+            "the silent-loss regression: {:?}",
+            child
+        );
+    }
+
+    #[test]
+    fn git_environment_is_scrubbed() {
+        // an inherited GIT_DIR must not reach the spawned git process:
+        // the scrubbed command carries no GIT_* variables at all
+        let command = git_command(Path::new("."), &["log"]);
+        for (key, _) in command.get_envs() {
+            let name = key.to_string_lossy();
+            assert!(!name.starts_with("GIT_"), "GIT_* leaked: {name}");
+        }
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, _)| key.to_string_lossy() == "PATH"),
+            "PATH must survive the scrub"
+        );
     }
 
     #[test]

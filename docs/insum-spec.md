@@ -83,20 +83,31 @@ data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 
 `insum history` reads the git history of the repository containing the
 file — read-only: the working tree, the index and HEAD are never touched;
-revision blobs come from `git show <sha>:<path>`. The git binary must be
-in PATH (CI runners and agent machines have it; everything else in `insum`
-works without git). Revisions are listed newest-first with sha, commit
-timestamp (UTC, from git), author and subject; each lists what changed per
-note: notes added/removed and blocks added/removed/changed with their JSON
-Pointer, `attrs.id` when present (never required), and a short text
-preview. Blocks are matched positionally by pointer inside one note — a
-moved block shows up as remove+add (documented prototype limitation). A
-file outside a git work tree or untouched by any commit yields an empty
-list with an explicit `NO_GIT_REPOSITORY` / `NO_GIT_HISTORY` warning, not
-an error. `--limit` bounds the revision count (default 20, cap 200); the
+revision blobs come from `git show <sha>:<path>`, and the git environment
+is scrubbed of `GIT_*` variables so an inherited `GIT_DIR` cannot redirect
+the read. The git binary must be in PATH (CI runners and agent machines
+have it; everything else in `insum` works without git). Revisions are
+listed newest-first with sha, parents, commit timestamp (UTC, from git),
+author and subject — `--full-history` includes commits from side branches,
+and every diff runs against the revision's real first parent. Each
+revision lists what changed per note: notes added/removed and blocks
+added/removed/changed with their JSON Pointer, `attrs.id` when present
+(never required), and a short text preview. Blocks are matched
+positionally by pointer inside one note — a moved block shows up as
+remove+add (documented prototype limitation).
+
+Warnings a consumer must expect: `NO_GIT_REPOSITORY` / `NO_GIT_HISTORY`
+(the file is outside a work tree or untouched — empty list, not an
+error), `HAS_MORE_REVISIONS` (older revisions exist beyond `--limit`),
+`LOG_RECORDS_SKIPPED` (a malformed git record — object names that are not
+hex — was ignored), `BLOB_NOT_PARSEABLE` / `PARENT_BLOB_NOT_PARSEABLE`
+(a revision or its parent is not a parseable .um/.note — its diff is not
+judged). `--limit` bounds the revision count (default 20, cap 200); the
 output budget never truncates silently — the oldest revisions are dropped
-with `complete: false` and an `OUTPUT_BUDGET` warning, and a single
-revision that cannot fit is a `LIMIT_EXCEEDED` error.
+with `complete: false`, `revisions_dropped` and an `OUTPUT_BUDGET`
+warning, and a single revision that cannot fit is a `LIMIT_EXCEEDED`
+error. The budget applies to the compact JSON document; `--pretty` renders
+larger (a documented systemic property shared by every command).
 
 ## Notes on data fidelity
 
