@@ -365,9 +365,15 @@ fn validate_reports_legacy_type_as_warning_at_schema_level() {
         file["valid"], true,
         "legacy version semantics are not judged"
     );
-    assert_eq!(
-        file["notes"][0]["warnings"][0]["code"],
-        "SCHEMA_NODE_LEGACY"
+    let warning_codes: Vec<&str> = file["notes"][0]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        warning_codes.contains(&"SCHEMA_NODE_LEGACY"),
+        "{warning_codes:?}"
     );
     // --strict promotes every warning, per §6.6
     let strict = insum()

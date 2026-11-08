@@ -60,7 +60,7 @@ pub fn validate_note_doc_with_schema(
     schema: Option<&PmSchema>,
 ) -> Result<NoteValidation, UmError> {
     let mut result = NoteValidation::default();
-    walk_structure(doc, 0, limits, &mut result, true)?;
+    walk_structure(doc, 0, limits, &mut result)?;
     if block_ids_enabled {
         validate_block_ids(doc, limits, &mut result);
     }
@@ -82,7 +82,6 @@ fn walk_structure(
     depth: usize,
     limits: &Limits,
     result: &mut NoteValidation,
-    is_root: bool,
 ) -> Result<(), UmError> {
     if depth > limits.max_depth {
         return Err(UmError::new(
@@ -170,7 +169,7 @@ fn walk_structure(
     match map.get("content") {
         Some(Value::Array(children)) => {
             for child in children {
-                walk_structure(child, depth + 1, limits, result, false)?;
+                walk_structure(child, depth + 1, limits, result)?;
             }
         }
         Some(_) => result.errors.push(Diag {

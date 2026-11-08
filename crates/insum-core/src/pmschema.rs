@@ -423,7 +423,7 @@ fn scan(node: usize, nfa: &Nfa, result: &mut Vec<usize>) {
     result.push(node);
     for (term, to) in edges {
         let Some(to) = to else { continue };
-        if term.is_none() && !result.contains(&to) {
+        if term.is_none() && !result.contains(to) {
             scan(*to, nfa, result);
         }
     }
@@ -529,7 +529,6 @@ fn build_dfa(nfa: &Nfa, type_names: &[String], required_attr: &[bool]) -> Result
 
 /// A compiled node type.
 struct PmNodeType {
-    name: String,
     /// Mark type names allowed on the CHILDREN of this node (the artifact
     /// `marks` list — PM `markSet` resolved at artifact generation time).
     mark_set: Vec<String>,
@@ -577,6 +576,7 @@ impl PmSchema {
         for members in groups.values_mut() {
             members.sort_unstable();
         }
+        let _ = &names;
 
         // PM's inline/block mixing check keys on `NodeType.isInline` (the
         // node itself is text-level), not on `inlineContent` ("its content
@@ -614,7 +614,7 @@ impl PmSchema {
         }
 
         let mut types: Vec<PmNodeType> = Vec::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
+        for name in names.iter() {
             let spec = &artifact.nodes[name];
             let content = match &spec.content {
                 None => Dfa::empty(),
@@ -647,7 +647,6 @@ impl PmSchema {
                 }
             };
             types.push(PmNodeType {
-                name: name.clone(),
                 mark_set: spec.marks.clone(),
                 attrs: spec
                     .attrs
@@ -693,21 +692,20 @@ impl PmSchema {
                 message: "document root has no leading noteTitle: the noteDoc content rule of this artifact covers the title family only (validation_limits), the content match of the root is not judged".to_owned(),
             });
         }
-        self.check_node(doc, true, root_skips_content_match, &mut out);
+        self.check_node(doc, root_skips_content_match, &mut out);
 
         // Root type vs artifact top_node: document families are application
         // semantics (§4.7) — a warning, never an error.
         if let (Some(top_node), Some(root_type)) =
             (&self.top_node, doc.get("type").and_then(Value::as_str))
+            && root_type != top_node.as_str()
         {
-            if root_type != top_node.as_str() {
-                out.warnings.push(Diag {
-                    code: "SCHEMA_ROOT_MISMATCH",
-                    message: format!(
-                        "document root type {root_type:?} differs from the artifact top_node {top_node:?} (document families are application semantics)"
-                    ),
-                });
-            }
+            out.warnings.push(Diag {
+                code: "SCHEMA_ROOT_MISMATCH",
+                message: format!(
+                    "document root type {root_type:?} differs from the artifact top_node {top_node:?} (document families are application semantics)"
+                ),
+            });
         }
         out
     }
@@ -741,7 +739,6 @@ impl PmSchema {
     fn check_node(
         &self,
         node: &Value,
-        is_root: bool,
         skip_content_match: bool,
         out: &mut crate::validate::NoteValidation,
     ) {
@@ -880,7 +877,7 @@ impl PmSchema {
         }
 
         for child in children {
-            self.check_node(child, false, false, out);
+            self.check_node(child, false, out);
         }
     }
 
@@ -949,10 +946,10 @@ fn contains_only_declared_types(node: &Value, schema: &PmSchema) -> bool {
             .iter()
             .all(|item| contains_only_declared_types(item, schema)),
         Value::Object(map) => {
-            if let Some(type_name) = map.get("type").and_then(Value::as_str) {
-                if !schema.has_type(type_name) {
-                    return false;
-                }
+            if let Some(type_name) = map.get("type").and_then(Value::as_str)
+                && !schema.has_type(type_name)
+            {
+                return false;
             }
             map.get("content")
                 .map(|content| contains_only_declared_types(content, schema))
