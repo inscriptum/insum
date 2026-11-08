@@ -27,6 +27,7 @@ until then this document is the reference for consumers (agents and scripts).
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |
 | `insum read <file> [--note <id>] [--format json\|annotated]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors |
 | `insum validate [--strict] [--hidden] <paths>...` | Structural validation (`validation_level: "structural"`) |
+| `insum history <file> [--note <id\|title>] [--limit n] [--format json\|annotated] [--max-bytes n]` | Change history of the file from git: revisions newest-first, each with a per-note structural diff against its parent |
 
 `--note <value>` resolves the value as the note id (ULID) first, then as an
 exact note title; a title matching several notes fails with their ids listed
@@ -77,6 +78,25 @@ data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 `UM_MAX_TOTAL_BYTES` (256 MiB), `UM_MAX_DEPTH` (128),
 `UM_MAX_OUTPUT_BYTES` (64 KiB), `UM_MAX_SEARCH_MATCHES` (1 000),
 `UM_MAX_OPS_BYTES`, `UM_MAX_APPLY_OPS`, `UM_MAX_COMMIT_RETRIES`.
+
+## History (git-backed)
+
+`insum history` reads the git history of the repository containing the
+file — read-only: the working tree, the index and HEAD are never touched;
+revision blobs come from `git show <sha>:<path>`. The git binary must be
+in PATH (CI runners and agent machines have it; everything else in `insum`
+works without git). Revisions are listed newest-first with sha, commit
+timestamp (UTC, from git), author and subject; each lists what changed per
+note: notes added/removed and blocks added/removed/changed with their JSON
+Pointer, `attrs.id` when present (never required), and a short text
+preview. Blocks are matched positionally by pointer inside one note — a
+moved block shows up as remove+add (documented prototype limitation). A
+file outside a git work tree or untouched by any commit yields an empty
+list with an explicit `NO_GIT_REPOSITORY` / `NO_GIT_HISTORY` warning, not
+an error. `--limit` bounds the revision count (default 20, cap 200); the
+output budget never truncates silently — the oldest revisions are dropped
+with `complete: false` and an `OUTPUT_BUDGET` warning, and a single
+revision that cannot fit is a `LIMIT_EXCEEDED` error.
 
 ## Notes on data fidelity
 

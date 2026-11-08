@@ -8,7 +8,7 @@ and atomic block-level writes.
 
 Planned command groups:
 
-- **Read** — `ls`, `search`, `tree`, `block get`, `read`, `validate`
+- **Read** — `ls`, `search`, `tree`, `block get`, `read`, `validate`, `history`
 - **Write** (later releases) — `migrate-ids`, `apply`
 
 ## Status

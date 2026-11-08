@@ -495,10 +495,12 @@ dependencies = [
 name = "insum-core"
 version = "0.1.0-dev"
 dependencies = [
+ "insum-test-utils",
  "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "walkdir",
  "zip",
 ]

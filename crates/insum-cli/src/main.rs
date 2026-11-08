@@ -136,6 +136,23 @@ enum Command {
         /// Files or directories to validate.
         paths: Vec<PathBuf>,
     },
+    /// Readable change history of a file from git (read-only).
+    History {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Only changes of this note (id or exact title).
+        #[arg(long)]
+        note: Option<String>,
+        /// Last `n` revisions (default 20, cap 200).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// `json` (default) or `annotated`.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Output budget in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -269,6 +286,13 @@ fn main() {
             commands::validate::run(paths, *strict, cli.schema.as_deref(), *hidden, &limits)
                 .map(Output::Json)
         }
+        Some(Command::History {
+            file,
+            note,
+            limit,
+            format,
+            max_bytes,
+        }) => commands::history::run(file, note.as_deref(), *limit, format, *max_bytes, &limits),
     };
 
     match result {
