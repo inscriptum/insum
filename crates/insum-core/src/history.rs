@@ -683,6 +683,7 @@ pub fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::process::Command as Process;
 
     fn git_in(dir: &Path, args: &[&str]) {

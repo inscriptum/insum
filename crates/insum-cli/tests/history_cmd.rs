@@ -89,7 +89,7 @@ fn history_outputs_the_json_envelope() {
     let value: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["api_version"], 1);
     assert_eq!(value["file_in_repo"], "page.um");
-    assert!(value["repo_root"].as_str().unwrap().len() > 0);
+    assert!(!value["repo_root"].as_str().unwrap().is_empty());
     assert_eq!(value["complete"], true);
     assert_eq!(value["warnings"], json!([]));
     let revisions = value["revisions"].as_array().unwrap();
