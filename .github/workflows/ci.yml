@@ -26,3 +26,18 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test --workspace --all-features
+
+  corpus-generate:
+    # §4.8: the corpus is regenerated from the artifact and must be
+    # byte-identical to the committed one; the Rust gate (corpus_gate)
+    # replays it in the build-and-test matrix on every OS.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Regenerate the differential corpus
+        run: cd schema-tests/generator && npm ci && npm run generate
+      - name: Require a byte-identical corpus
+        run: git diff --exit-code -- schema-tests/fixtures/corpus.jsonl

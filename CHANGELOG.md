@@ -7,6 +7,24 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- Differential TS×Rust corpus (§4.8): a TypeScript harness builds a real
+  prosemirror-model Schema from the artifact and records its verdicts for
+  121 documents (valid compositions, targeted mutations, unknown types,
+  mark-set rules, text and shape edge cases); the committed corpus is
+  replayed by the Rust gate `corpus_gate` with zero divergences, and CI
+  regenerates it requiring a byte-identical result.
+- `insum validate` at the `schema` level now performs full
+  ProseMirror-parity checks: content expressions, children's marks against
+  the parent's mark set (`MARK_NOT_ALLOWED`), unknown mark types
+  (`UNKNOWN_MARK_TYPE`), repeated mark types (`MARK_DUPLICATE`), content
+  mismatches (`CONTENT_MISMATCH`), required attributes (`ATTR_REQUIRED`),
+  empty text nodes. Documents outside the artifact's declared scope
+  (title-less noteDoc roots, legacy node types) are reported with
+  `SCHEMA_FAMILY_UNCOVERED` / `SCHEMA_NODE_LEGACY` warnings instead of
+  invented verdicts.
+
+### Added
+
 - `insum schema [--type <node>] [--schema <file>]`: show the applicable
   schema artifact — source (`explicit` / `plugin-runtime` /
   `bundled-fallback`), path, hash with recomputation result

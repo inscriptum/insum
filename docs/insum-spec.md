@@ -63,13 +63,20 @@ one); an unknown type fails with exit 6 and lists the available types.
   for documents marked `features.block_ids`. Applied whenever no verified
   applicable artifact is found; the bundled fallback is labeled in the
   report but never lifts the level.
-- `schema` — additionally, inventory checks against the artifact: node types,
-  attribute keys and mark types are compared with the artifact, and the
-  document root is compared with its `top_node`. A node type the artifact
-  does not declare is an error — unless it is a known legacy type observed in
-  real on-disk documents (reported as `SCHEMA_NODE_LEGACY`: document version
-  semantics are outside the artifact). Undeclared attributes and marks are
-  warnings (`SCHEMA_ATTR_UNKNOWN`, `SCHEMA_MARK_UNKNOWN`).
+- `schema` — additionally, the document is validated with
+  ProseMirror-parity semantics derived from the artifact (proven by the
+  differential corpus): content expressions per node type, children's marks
+  against the parent's mark set, attribute defaults and requiredness, mark
+  sets (a repeated mark type fails), unknown node and mark types. A node
+  type the artifact does not declare is an error — unless it is a known
+  legacy type observed in real on-disk documents (reported as
+  `SCHEMA_NODE_LEGACY`: document version semantics are outside the
+  artifact). Undeclared attributes are dropped by the editor — reported as
+  `SCHEMA_ATTR_UNKNOWN` warnings. A noteDoc root outside the title family
+  (no leading `noteTitle`, or carrying legacy types) is outside the
+  artifact's content rule by its own declaration — the root content match
+  is skipped with `SCHEMA_FAMILY_UNCOVERED`; everything else is still
+  checked.
 
 `full` is never claimed by this release: it is reserved for validation proven
  by the differential test corpus. With `--strict` every warning becomes an
