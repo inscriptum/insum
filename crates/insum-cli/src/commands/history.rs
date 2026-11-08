@@ -27,6 +27,14 @@ pub fn run(
             "unknown --format {format:?}: expected json or annotated"
         )));
     }
+    if format == "annotated" && max_bytes.is_some() {
+        // the annotated projection is bounded by --limit; honoring a byte
+        // budget for it would need a text pager — refuse instead of
+        // silently ignoring the option
+        return Err(UmError::usage(
+            "--max-bytes is not supported with --format annotated",
+        ));
+    }
     let history = collect(file, note, limit.unwrap_or(DEFAULT_REVISIONS), limits)?;
 
     match format {
@@ -52,20 +60,20 @@ pub fn run(
 /// one revision is kept (a single oversized revision is a LIMIT_EXCEEDED).
 fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmError> {
     let mut dropped = 0usize;
+    let mut markers = false;
     loop {
         let serialized = serde_json::to_string(value)
             .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
         if serialized.len() <= budget {
             if dropped > 0 {
                 let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
-                warnings.push(json!({
-                    "code": "OUTPUT_BUDGET",
-                    "message": format!(
-                        "{dropped} oldest revision(s) dropped to fit the output budget; pass --max-bytes to raise it"
-                    ),
-                }));
-                value["complete"] = json!(false);
-                value["revisions_dropped"] = json!(dropped);
+                for warning in warnings.iter_mut() {
+                    if warning["code"] == json!("OUTPUT_BUDGET") {
+                        warning["message"] = json!(format!(
+                            "{dropped} oldest revision(s) dropped to fit the output budget; pass --max-bytes to raise it"
+                        ));
+                    }
+                }
                 value["warnings"] = json!(warnings);
             }
             return Ok(());
@@ -85,6 +93,20 @@ fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmE
         }
         revisions.pop();
         dropped += 1;
+        // the counter is live from the first drop; the marker fields are
+        // part of the output from now on — their bytes count in every
+        // later measurement
+        value["revisions_dropped"] = json!(dropped);
+        if !markers {
+            value["complete"] = json!(false);
+            let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
+            warnings.push(json!({
+                "code": "OUTPUT_BUDGET",
+                "message": "oldest revision(s) dropped to fit the output budget",
+            }));
+            value["warnings"] = json!(warnings);
+            markers = true;
+        }
     }
 }
 

@@ -260,12 +260,61 @@ fn history_budget_drops_oldest_explicitly() {
         .output()
         .unwrap();
     let full_value: Value = serde_json::from_slice(&full.stdout).unwrap();
+    let _full_len = serde_json::to_string(&full_value).unwrap().len();
+
+    // a HEAVY middle revision makes the drop profitable: the drop walks
+    // from the oldest (a tiny root without diffs), so the budget is aimed
+    // below the two oldest revisions — both are dropped, the newest stays
+    let long_text = "длинный текст ".repeat(200);
+    write_um(
+        &dir.path().join("page.um"),
+        &json!({"type": "noteDoc", "content": [
+            {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": long_text}]}
+        ]}),
+    );
+    git_in(dir.path(), &["add", "."]);
+    git_in(
+        dir.path(),
+        &["commit", "--quiet", "-m", "v3: long paragraph"],
+    );
+
+    // one more tiny commit on top: now the heavy diff sits in the MIDDLE
+    // of the list [v4 tiny, v3 heavy, v2 small, v1 tiny]
+    write_um(
+        &dir.path().join("page.um"),
+        &json!({"type": "noteDoc", "content": [
+            {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": long_text}]},
+            {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "H"}]}
+        ]}),
+    );
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "v4: heading"]);
+
+    let full = insum()
+        .arg("history")
+        .arg("page.um")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let full_value: Value = serde_json::from_slice(&full.stdout).unwrap();
     let full_len = serde_json::to_string(&full_value).unwrap().len();
+    let revisions = full_value["revisions"].as_array().unwrap();
+    assert!(revisions.len() == 4, "four revisions listed");
+    let heavy_len = serde_json::to_string(&revisions[1]).unwrap().len();
+    assert!(heavy_len > 400, "the fixture needs a heavy middle revision");
+    let tail_len = serde_json::to_string(&revisions[2]).unwrap().len()
+        + serde_json::to_string(&revisions[3]).unwrap().len();
+    // the budget forces exactly two drops (the two oldest, the small
+    // ones) and keeps the heavy middle revision alive
+    let budget = full_len - tail_len + 200;
+    assert!(budget < full_len, "the full output must not fit");
     let output = insum()
         .arg("history")
         .arg("page.um")
         .arg("--max-bytes")
-        .arg((full_len - 10).to_string())
+        .arg(budget.to_string())
         .current_dir(dir.path())
         .output()
         .unwrap();
@@ -273,18 +322,19 @@ fn history_budget_drops_oldest_explicitly() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["complete"], false);
     let revisions_left = value["revisions"].as_array().unwrap().len();
-    assert!(revisions_left < 2, "at least one revision was dropped");
-    let codes: Vec<&str> = value["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["code"].as_str().unwrap())
-        .collect();
-    assert!(codes.contains(&"OUTPUT_BUDGET"), "{codes:?}");
     assert_eq!(
         value["revisions_dropped"].as_u64().unwrap() as usize + revisions_left,
-        2
+        4
     );
+    assert_eq!(revisions_left, 2, "the heavy middle revision is dropped");
+    assert!(codes_contains(&value, "OUTPUT_BUDGET"));
+}
+
+fn codes_contains(value: &Value, code: &str) -> bool {
+    value["warnings"]
+        .as_array()
+        .map(|warnings| warnings.iter().any(|w| w["code"].as_str() == Some(code)))
+        .unwrap_or(false)
 }
 
 #[test]

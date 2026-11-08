@@ -14,6 +14,8 @@
 //! The git binary must be in PATH (documented in the user docs); blobs are
 //! bounded by the same limits as regular reads.
 
+use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,11 +40,24 @@ type RevisionNotes = Vec<(String, Option<String>, Value)>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Revision {
+    /// Hex object name (SHA-1 40 or SHA-256 64 chars) — validated before
+    /// it ever reaches a git argument.
     pub sha: String,
+    /// Parent object names, first parent first (merge-aware diffs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<String>,
     /// Commit time, epoch seconds (from git — no local clock).
     pub timestamp: i64,
     pub author: String,
     pub subject: String,
+}
+
+/// A commit sha must be plain hex of a known digest length: anything else
+/// from the log stream is not an object name (a commit subject can carry
+/// the field separators) and must never reach `git show` as an argument.
+fn is_valid_sha(candidate: &str) -> bool {
+    (candidate.len() == 40 || candidate.len() == 64)
+        && candidate.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// One block-level change inside a note diff.
@@ -122,25 +137,23 @@ fn warning(code: &str, message: String) -> Value {
 
 /// Run git in `dir` and capture stdout; a missing binary is a structured
 /// IO error with a hint, a git-level failure is returned as raw stderr.
+/// The environment is scrubbed of GIT_* variables: an inherited GIT_DIR
+/// (hooks, CI wrappers) must not redirect the history read to a foreign
+/// repository.
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, UmError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                UmError::new(
-                    ErrorCode::IoError,
-                    "git binary not found in PATH".to_owned(),
-                )
-                .with_hint(
-                    "insum history reads the git history of the file; install git or add it to PATH.",
-                )
-            } else {
-                UmError::from(err)
-            }
-        })?;
+    let output = git_command(dir, args).output().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            UmError::new(
+                ErrorCode::IoError,
+                "git binary not found in PATH".to_owned(),
+            )
+            .with_hint(
+                "insum history reads the git history of the file; install git or add it to PATH.",
+            )
+        } else {
+            UmError::from(err)
+        }
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         // a repository without any commits: `git log` fails — that is an
@@ -154,6 +167,25 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, UmError> {
         ));
     }
     Ok(output.stdout)
+}
+
+/// A scrubbed git invocation: GIT_* removed, PATH/HOME kept (git needs
+/// them to find the binary and the system config).
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "PATH" | "HOME" | "SystemRoot" | "SYSTEMROOT" | "ComSpec"
+        ) || name.starts_with("SYSTEMDRIVE")
+        {
+            command.env(key, value);
+        }
+    }
+    command
 }
 
 struct RepoLocation {
@@ -172,8 +204,11 @@ fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
     let root_bytes = match git(dir, &["rev-parse", "--show-toplevel"]) {
         Ok(bytes) => bytes,
         Err(err) => {
-            // "not a git repository" is an expected outcome, not a failure
-            if err.message.contains("not a git repository") {
+            // "not a git repository" and bare repositories are expected
+            // outcomes (no work tree), not failures
+            if err.message.contains("not a git repository")
+                || err.message.contains("must be run in a work tree")
+            {
                 return Ok(None);
             }
             return Err(err);
@@ -201,13 +236,18 @@ fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
     Ok(Some(RepoLocation { root, file_in_repo }))
 }
 
-/// List the revisions that touched the file, newest-first.
-fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<Vec<Revision>, UmError> {
-    let format = "%H%x1f%at%x1f%an%x1f%s%x1e";
+/// List the revisions that touched the file, newest-first, with their
+/// parent links. `--full-history` keeps every commit that touched the file
+/// on side branches; a record with a non-hex "sha" (a commit subject can
+/// carry the field separators) is skipped and reported via the returned
+/// skipped count.
+fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<(Vec<Revision>, usize), UmError> {
+    let format = "%H%x1f%P%x1f%at%x1f%an%x1f%s%x1e";
     let out = git(
         &repo.root,
         &[
             "log",
+            "--full-history",
             &format!("--max-count={limit}"),
             &format!("--format={format}"),
             "--",
@@ -216,6 +256,7 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<Vec<Revision>, Um
     )?;
     let text = String::from_utf8_lossy(&out);
     let mut revisions = Vec::new();
+    let mut skipped = 0usize;
     for record in text.split('\u{1e}') {
         let record = record.trim_start_matches(['\n', '\r']).trim();
         if record.is_empty() {
@@ -223,6 +264,12 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<Vec<Revision>, Um
         }
         let mut fields = record.split('\u{1f}');
         let sha = fields.next().unwrap_or("").trim().to_owned();
+        let parents = fields
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let timestamp = fields
             .next()
             .unwrap_or("")
@@ -231,24 +278,58 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<Vec<Revision>, Um
             .unwrap_or(0);
         let author = fields.next().unwrap_or("").trim().to_owned();
         let subject = fields.next().unwrap_or("").trim().to_owned();
-        if sha.is_empty() {
+        if !is_valid_sha(&sha) {
+            skipped += 1;
             continue;
         }
         revisions.push(Revision {
             sha,
+            parents,
             timestamp,
             author,
             subject,
         });
     }
-    Ok(revisions)
+    Ok((revisions, skipped))
 }
 
-/// Extract the blob of one revision: `git show <sha>:<path>`.
+/// Extract the blob of one revision: `git show <sha>:<path>`. The stream
+/// is read through a `take` bound so an oversized blob fails with
+/// LIMIT_EXCEEDED instead of allocating it whole.
 fn revision_blob(repo: &RepoLocation, sha: &str, limits: &Limits) -> Result<Vec<u8>, UmError> {
     let object = format!("{sha}:{}", repo.file_in_repo);
-    let out = git(&repo.root, &["show", &object])?;
-    if out.len() > limits.max_entry_bytes {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .arg("show")
+        .arg(&object)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                UmError::new(ErrorCode::IoError, "git binary not found in PATH".to_owned())
+                    .with_hint(
+                        "insum history reads the git history of the file; install git or add it to PATH.",
+                    )
+            } else {
+                UmError::from(err)
+            }
+        })?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let limit = limits.max_entry_bytes + 1;
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut stdout, limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(UmError::from)?;
+    let status = child.wait().map_err(UmError::from)?;
+    if !status.success() {
+        return Err(UmError::new(
+            ErrorCode::IoError,
+            format!("git show {object} failed"),
+        ));
+    }
+    if bytes.len() > limits.max_entry_bytes {
         return Err(UmError::new(
             ErrorCode::LimitExceeded,
             format!(
@@ -257,7 +338,36 @@ fn revision_blob(repo: &RepoLocation, sha: &str, limits: &Limits) -> Result<Vec<
             ),
         ));
     }
-    Ok(out)
+    Ok(bytes)
+}
+
+/// Read one ZIP entry bounded by the ACTUAL decompressed bytes (the
+/// header size is untrusted): more than the limit is LIMIT_EXCEEDED; a
+/// missing entry is `Ok(None)`.
+fn read_zip_entry(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+    limits: &Limits,
+) -> Result<Option<Vec<u8>>, UmError> {
+    let entry = match archive.by_name(name) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
+    };
+    let mut bytes = Vec::new();
+    entry
+        .take((limits.max_entry_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(UmError::from)?;
+    if bytes.len() > limits.max_entry_bytes {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!(
+                "entry {name:?} larger than UM_MAX_ENTRY_BYTES ({})",
+                limits.max_entry_bytes
+            ),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 /// The notes of one revision blob: id → (title, document JSON).
@@ -274,7 +384,16 @@ fn revision_notes(
             Ok(doc) => doc,
             Err(_) => return Ok(None),
         };
-        return Ok(Some(vec![("note".to_owned(), None, doc)]));
+        let title = doc
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|children| {
+                children
+                    .iter()
+                    .find(|child| child.get("type").and_then(Value::as_str) == Some("noteTitle"))
+                    .and_then(note_title_text)
+            });
+        return Ok(Some(vec![("note".to_owned(), title, doc)]));
     }
     // .um: a ZIP container — parse in memory
     let reader = std::io::Cursor::new(blob);
@@ -282,22 +401,19 @@ fn revision_notes(
         Ok(archive) => archive,
         Err(_) => return Ok(None),
     };
-    let manifest_bytes = match archive.by_name("manifest.json") {
-        Ok(entry) => {
-            if entry.size() > limits.max_entry_bytes as u64 {
-                return Err(UmError::new(
-                    ErrorCode::LimitExceeded,
-                    format!(
-                        "manifest larger than UM_MAX_ENTRY_BYTES ({})",
-                        limits.max_entry_bytes
-                    ),
-                ));
-            }
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::BufReader::new(entry), &mut bytes)?;
-            bytes
-        }
-        Err(_) => return Ok(None),
+    if archive.len() > limits.max_archive_entries {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!(
+                "revision container holds more than UM_MAX_ARCHIVE_ENTRIES ({}) entries",
+                limits.max_archive_entries
+            ),
+        ));
+    }
+    let manifest_bytes = read_zip_entry(&mut archive, "manifest.json", limits)?;
+    let manifest_bytes = match manifest_bytes {
+        Some(bytes) => bytes,
+        None => return Ok(None),
     };
     let manifest: Value = match serde_json::from_slice(&manifest_bytes) {
         Ok(manifest) => manifest,
@@ -309,22 +425,9 @@ fn revision_notes(
     };
     let mut notes = Vec::new();
     for descriptor in &manifest.notes {
-        let payload = match archive.by_name(&descriptor.path) {
-            Ok(entry) => {
-                if entry.size() > limits.max_entry_bytes as u64 {
-                    return Err(UmError::new(
-                        ErrorCode::LimitExceeded,
-                        format!(
-                            "note payload larger than UM_MAX_ENTRY_BYTES ({})",
-                            limits.max_entry_bytes
-                        ),
-                    ));
-                }
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::BufReader::new(entry), &mut bytes)?;
-                bytes
-            }
-            Err(_) => return Ok(None), // inconsistent history blob
+        let payload = match read_zip_entry(&mut archive, &descriptor.path, limits)? {
+            Some(bytes) => bytes,
+            None => return Ok(None), // inconsistent history blob
         };
         let doc: Value = match serde_json::from_slice(&payload) {
             Ok(doc) => doc,
@@ -333,6 +436,41 @@ fn revision_notes(
         notes.push((descriptor.id.clone(), descriptor.title.clone(), doc));
     }
     Ok(Some(notes))
+}
+
+/// The text of the first noteTitle child (the .note title source).
+fn note_title_text(title_node: &Value) -> Option<String> {
+    fn direct_text(node: &Value, out: &mut String) {
+        match node {
+            Value::String(text) => out.push_str(text),
+            Value::Array(items) => items.iter().for_each(|item| direct_text(item, out)),
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = map.get("text").and_then(Value::as_str) {
+                        out.push_str(text);
+                    }
+                    return;
+                }
+                for value in map.values() {
+                    match value {
+                        Value::Array(_) | Value::Object(_) => direct_text(value, out),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    if let Some(content) = title_node.get("content") {
+        direct_text(content, &mut out);
+    }
+    let trimmed = out.trim().to_owned();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn block_id(node: &Value) -> Option<String> {
@@ -567,8 +705,14 @@ pub fn collect(
     };
 
     // one extra revision gives the oldest listed one its real parent
-    let listed = list_revisions(&repo, limit + 1)?;
+    let (listed, skipped) = list_revisions(&repo, limit + 1)?;
     let mut warnings = Vec::new();
+    if skipped > 0 {
+        warnings.push(warning(
+            "LOG_RECORDS_SKIPPED",
+            format!("{skipped} git log record(s) had a malformed object name and were skipped"),
+        ));
+    }
     if listed.is_empty() {
         warnings.push(warning(
             "NO_GIT_HISTORY",
@@ -586,79 +730,119 @@ pub fn collect(
         });
     }
 
-    // parse every listed revision's notes (bounded by --limit + 1)
-    let mut parsed: Vec<Option<RevisionNotes>> = Vec::with_capacity(listed.len());
-    for revision in &listed {
+    // the diff of every listed revision runs against its REAL first
+    // parent (merge-aware): reuse a listed revision's parsed notes when it
+    // is the parent, otherwise fetch and parse the parent blob separately
+    let listed_count = listed.len();
+    let output_count = listed_count.min(limit);
+    let mut parsed_by_sha: HashMap<String, Option<RevisionNotes>> = HashMap::new();
+    let parent_notes: HashMap<String, Option<RevisionNotes>> = HashMap::new();
+    for revision in listed.iter().take(output_count + 1) {
         let notes = revision_blob(&repo, &revision.sha, limits)
             .and_then(|blob| revision_notes(&blob, &extension, limits))?;
-        parsed.push(notes);
+        parsed_by_sha.insert(revision.sha.clone(), notes);
     }
 
     let mut diffs: Vec<RevisionDiff> = Vec::new();
-    for index in 0..listed.len().min(limit) {
-        let revision = &listed[index];
-        match &parsed[index] {
-            Some(notes) => {
-                let mut revision_diff = RevisionDiff {
-                    revision: revision.clone(),
-                    notes: Vec::new(),
-                    warning: None,
-                };
-                if let Some(Some(parent_notes)) = parsed.get(index + 1) {
-                    // the parent is the NEXT (older) revision; the diff
-                    // runs from the parent to this revision
-                    let mut per_note = diff_note_sets(parent_notes, notes);
-                    if let Some(filter) = note_filter {
-                        per_note.retain(|diff| {
-                            diff.note_id == filter || diff.note_title.as_deref() == Some(filter)
-                        });
-                    }
-                    revision_diff.notes = per_note;
-                } else if index + 1 < listed.len() && parsed[index + 1].is_none() {
-                    // the parent blob does not parse: this revision's diff
-                    // is not judged
-                    revision_diff.warning = Some(warning(
-                        "PARENT_BLOB_NOT_PARSEABLE",
-                        format!(
-                            "the parent revision {} does not parse; the diff against it is not judged",
-                            &listed[index + 1].sha[..7.min(listed[index + 1].sha.len())]
-                        ),
-                    ));
-                } else if let Some(filter) = note_filter {
-                    // the oldest revision overall: context for the filter
-                    if let Some((_, title, _)) = notes.iter().find(|(id, _, _)| id == filter) {
-                        revision_diff.notes.push(NoteDiff {
-                            note_id: filter.to_owned(),
-                            note_title: title.clone(),
-                            ..NoteDiff::default()
-                        });
-                    }
-                }
-                diffs.push(revision_diff);
-            }
+    for revision in listed.iter().take(output_count).cloned() {
+        let notes = match parsed_by_sha.get(&revision.sha).cloned().flatten() {
+            Some(notes) => notes,
             None => {
                 // this blob does not parse: the revision is listed with a
                 // warning, the parent linkage restarts at the next one
+                let sha_head = revision.sha[..7.min(revision.sha.len())].to_owned();
                 diffs.push(RevisionDiff {
-                    revision: revision.clone(),
+                    revision,
                     notes: Vec::new(),
                     warning: Some(warning(
                         "BLOB_NOT_PARSEABLE",
                         format!(
-                            "revision {} does not parse as a {} file; its diff is not judged",
-                            &revision.sha[..7.min(revision.sha.len())],
+                            "revision {sha_head} does not parse as a {} file; its diff is not judged",
                             if extension == "note" { ".note" } else { ".um" }
                         ),
                     )),
                 });
+                continue;
+            }
+        };
+        let parent_sha = revision.parents.first().cloned();
+        let parent: Option<Option<RevisionNotes>> = match &parent_sha {
+            // root commit: no parent, no diff
+            None => Some(None),
+            Some(sha) => {
+                if let Some(cached) = parsed_by_sha.get(sha).cloned() {
+                    Some(cached)
+                } else if let Some(cached) = parent_notes.get(sha).cloned() {
+                    Some(cached)
+                } else {
+                    Some(
+                        revision_blob(&repo, sha, limits)
+                            .and_then(|blob| revision_notes(&blob, &extension, limits))?,
+                    )
+                }
+            }
+        };
+        let parent_notes_opt = match parent {
+            // the parent blob does not parse: this revision's diff is not
+            // judged
+            None => {
+                diffs.push(RevisionDiff {
+                    revision,
+                    notes: Vec::new(),
+                    warning: Some(warning(
+                        "PARENT_BLOB_NOT_PARSEABLE",
+                        format!(
+                            "the parent revision {} does not parse as a {} file; the diff against it is not judged",
+                            parent_sha
+                                .as_deref()
+                                .map(|s| s[..7.min(s.len())].to_owned())
+                                .unwrap_or_default(),
+                            if extension == "note" { ".note" } else { ".um" }
+                        ),
+                    )),
+                });
+                continue;
+            }
+            Some(parent) => parent,
+        };
+        let mut revision_diff = RevisionDiff {
+            revision,
+            notes: Vec::new(),
+            warning: None,
+        };
+        if let Some(parent) = parent_notes_opt {
+            let mut per_note = diff_note_sets(&parent, &notes);
+            if let Some(filter) = note_filter {
+                per_note.retain(|diff| {
+                    diff.note_id == filter || diff.note_title.as_deref() == Some(filter)
+                });
+            }
+            revision_diff.notes = per_note;
+        } else if let Some(filter) = note_filter {
+            // root commit with a filter: report whether the note exists in
+            // this revision (context, no block diff)
+            if let Some((_, title, _)) = notes.iter().find(|(id, _, _)| id == filter) {
+                revision_diff.notes.push(NoteDiff {
+                    note_id: filter.to_owned(),
+                    note_title: title.clone(),
+                    ..NoteDiff::default()
+                });
             }
         }
+        diffs.push(revision_diff);
+    }
+
+    if listed_count > limit {
+        warnings.push(warning(
+            "HAS_MORE_REVISIONS",
+            format!("older revisions exist; raise --limit (cap {MAX_REVISIONS}) to see more"),
+        ));
     }
 
     if let Some(filter) = note_filter {
         let matched = diffs
             .iter()
-            .any(|revision| revision.notes.iter().any(|note| !note.is_empty()))
+            .any(|revision_diff| revision_diff.notes.iter().any(|note| !note.is_empty()))
             || diffs.is_empty();
         if !matched && warnings.is_empty() {
             // the filter matched nothing anywhere: say so explicitly
