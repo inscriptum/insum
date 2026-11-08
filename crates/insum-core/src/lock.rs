@@ -11,10 +11,12 @@
 //!   it (and recovers a stale one).
 //!
 //! Both files are JSON with the holder's pid, hostname, an operation id and
-//! the creation time. Recovery: a lock whose holder process is provably
-//! dead (same host) or whose age exceeds `stale_after` is broken and
-//! re-acquired; a corrupt lock is treated the same way after it ages past
-//! `stale_after` (a fresh corrupt file stays — it may be mid-write).
+//! the creation time. Recovery: a holder provably dead on the same host is
+//! broken immediately; a cross-host or unknown-host holder cannot be
+//! probed and is only declared gone after `stale_after`; a LIVE same-host
+//! holder is never broken, whatever its age. A corrupt file blocks
+//! conservatively while fresh and is broken once it ages past
+//! `stale_after` (it may be mid-write).
 //!
 //! The protocol document for the plugin side lives in the knowledge base
 //! (`~/insum/DEVELOPMENT/insum/lock-protocol.um`); this module implements
@@ -56,7 +58,9 @@ pub struct LockConfig {
     pub timeout: Duration,
     /// Sleep between create-new attempts.
     pub poll_interval: Duration,
-    /// Age after which a lock with no provable holder is broken.
+    /// Age after which a holder that cannot be probed (cross-host or
+    /// unknown host) and corrupt files are declared gone. A live same-host
+    /// holder is never broken, whatever its age.
     pub stale_after: Duration,
 }
 
@@ -471,7 +475,7 @@ impl FileLock {
             "the file is held by another writer (commit lock)".to_owned(),
         )
         .with_hint(
-            "Wait for the other writer to finish; a lock whose process died is broken automatically on the next attempt.",
+            "Wait for the other writer to finish; a lock whose process died is broken automatically on the next attempt — unless the dead pid was reused by another process, then remove the lock sidecar manually.",
         )
         .with_details(details))
     }
@@ -513,32 +517,39 @@ pub fn acquire_write_lock(
     purpose: &str,
     config: &LockConfig,
 ) -> Result<FileLock, UmError> {
-    match check_dirty_lease(target, config.stale_after)? {
-        LeaseState::Free => {}
-        LeaseState::Stale { .. } => {
-            break_stale_lease(target, config.stale_after)?;
-        }
-        LeaseState::Corrupt => {
-            return Err(UmError::new(
-                ErrorCode::WriteLocked,
-                "the dirty lease file of this file is unreadable and fresh",
-            )
-            .with_hint(
-                "A lease that is mid-write or damaged blocks the write conservatively; it recovers by age, or remove the lease sidecar manually if you are sure no editor is running.",
-            ));
-        }
-        LeaseState::Held { holder, op_id } => {
-            return Err(UmError::new(
-                ErrorCode::WriteLocked,
-                format!(
-                    "the editor holds a dirty lease for this file (unsaved changes, holder pid {})",
-                    holder.pid
-                ),
-            )
-            .with_hint(
-                "Save or close the document in the editor, then retry; the lease is released on save/close.",
-            )
-            .with_details(serde_json::json!({ "lease_op_id": op_id })));
+    loop {
+        match check_dirty_lease(target, config.stale_after)? {
+            LeaseState::Free => break,
+            LeaseState::Stale { .. } => {
+                // the stale file may have been replaced by a fresh live
+                // lease between the check and the break — the break
+                // refuses to touch a live one; re-check instead of writing
+                if !break_stale_lease(target, config.stale_after)? {
+                    continue;
+                }
+            }
+            LeaseState::Corrupt => {
+                return Err(UmError::new(
+                    ErrorCode::WriteLocked,
+                    "the dirty lease file of this file is unreadable and fresh",
+                )
+                .with_hint(
+                    "A lease that is mid-write or damaged blocks the write conservatively; it recovers by age, or remove the lease sidecar manually if you are sure no editor is running.",
+                ));
+            }
+            LeaseState::Held { holder, op_id } => {
+                return Err(UmError::new(
+                    ErrorCode::WriteLocked,
+                    format!(
+                        "the editor holds a dirty lease for this file (unsaved changes, holder pid {})",
+                        holder.pid
+                    ),
+                )
+                .with_hint(
+                    "Save or close the document in the editor, then retry; the lease is released on save/close.",
+                )
+                .with_details(serde_json::json!({ "lease_op_id": op_id })));
+            }
         }
     }
     FileLock::acquire(target, purpose, config)
@@ -565,7 +576,13 @@ mod tests {
 
     fn dead_pid() -> u32 {
         // a child that already exited: its pid is provably not alive
+        #[cfg(unix)]
         let mut child = std::process::Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let _ = child.wait();
         pid
@@ -775,6 +792,22 @@ mod tests {
         let lock_guard = FileLock::acquire(&target, "apply", &fast_config()).unwrap();
         lock_guard.release().unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn unknown_hostname_is_judged_by_age_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LOCK_SUFFIX);
+        // no hostname recorded: the pid check is not trustworthy even on
+        // the same machine — age is the only evidence
+        let mut lock = Sidecar::new("lock", "cli", Some("from-unknown"));
+        lock.holder.hostname = None;
+        lock.holder.pid = std::process::id(); // alive, but unprovable
+        write_aged_sidecar(&path, lock);
+        let lock_guard = FileLock::acquire(&target, "apply", &fast_config()).unwrap();
+        lock_guard.release().unwrap();
+        assert!(!path.exists(), "aged unknown-host lock is broken by age");
     }
 
     #[test]
