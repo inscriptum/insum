@@ -11,6 +11,7 @@ pub mod canon;
 pub mod container;
 pub mod error;
 pub mod limits;
+pub mod lock;
 pub mod model;
 pub mod pmschema;
 pub mod pointer;
