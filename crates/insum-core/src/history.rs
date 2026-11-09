@@ -1241,12 +1241,15 @@ mod tests {
         let command = git_command(Path::new("."), &["log"]);
         for (key, _) in command.get_envs() {
             let name = key.to_string_lossy();
-            assert!(!name.starts_with("GIT_"), "GIT_* leaked: {name}");
+            assert!(
+                !name.to_ascii_uppercase().starts_with("GIT_"),
+                "GIT_* leaked: {name}"
+            );
         }
         assert!(
             command
                 .get_envs()
-                .any(|(key, _)| key.to_string_lossy() == "PATH"),
+                .any(|(key, _)| key.to_string_lossy().to_ascii_uppercase() == "PATH"),
             "PATH must survive the scrub"
         );
     }
