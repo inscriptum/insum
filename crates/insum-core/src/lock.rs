@@ -210,8 +210,10 @@ fn pid_alive(pid: u32) -> bool {
                 return false;
             }
             let mut exit_code: u32 = 0;
+            // STILL_ACTIVE is an NTSTATUS (i32) in windows-sys; exit codes
+            // come back as u32 — compare through the NTSTATUS width
             let alive =
-                GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE;
+                GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code as i32 == STILL_ACTIVE;
             CloseHandle(handle);
             alive
         }
