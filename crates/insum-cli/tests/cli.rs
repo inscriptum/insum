@@ -100,7 +100,11 @@ fn named_non_um_file_is_reported_not_silently_dropped() {
         String::from_utf8_lossy(&output.stdout)
     );
     let file = &value["files"][0];
-    assert_eq!(file["path"].as_str().unwrap(), plain.display().to_string());
+    // the rendered path is normalized to forward slashes on every OS
+    assert_eq!(
+        file["path"].as_str().unwrap(),
+        plain.display().to_string().replace('\\', "/")
+    );
     assert_eq!(file["valid"], false);
     assert!(
         !file["errors"].as_array().unwrap().is_empty(),
