@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use insum_core::history::{DEFAULT_REVISIONS, collect};
 use insum_core::{ErrorCode, Limits, UmError};
 
-use crate::support::{Output, render_path};
+use crate::support::{Output, escape_comment_value, render_path};
 
 pub fn run(
     file: &Path,
@@ -194,11 +194,11 @@ fn render_annotated(history: &insum_core::history::History) -> String {
             let title = note
                 .note_title
                 .as_deref()
-                .map(|t| format!(" {t:?}"))
+                .map(|t| format!(" {:?}", escape_comment_value(t)))
                 .unwrap_or_default();
             out.push_str(&format!(
                 "  note {}{}: {}\n",
-                note.note_id,
+                escape_comment_value(&note.note_id),
                 title,
                 parts.join(", ")
             ));

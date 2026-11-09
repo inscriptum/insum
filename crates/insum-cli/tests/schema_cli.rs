@@ -549,3 +549,58 @@ fn validate_keeps_the_registry_code_of_an_unusable_runtime_artifact() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn validate_degrades_a_non_compilable_artifact_to_structural() {
+    // T-04: a self-consistent artifact whose content expression cannot be
+    // compiled (null cycle) must degrade validate to `structural` with an
+    // explicit warning — never crash, never silently claim the schema level
+    let dir = tempfile::tempdir().unwrap();
+    let um = fixture_um(dir.path());
+
+    let mut raw = fixture_artifact();
+    raw["nodes"]["doc"]["content"] = json!("(((a{0,0} a{0,0}))*)");
+    raw["nodes"]["a"] = json!({"content": null, "groups": ["block"], "attrs": {},
+                              "marks": [], "addressable": true, "inline_content": false,
+                              "searchable": false});
+    raw["schema_hash"] = json!(compute_hash(&raw)); // self-consistent
+    let artifact = dir.path().join("cycle.json");
+    std::fs::write(&artifact, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+    let output = insum()
+        .arg("validate")
+        .arg("--schema")
+        .arg(&artifact)
+        .arg(&um)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "degradation is not a crash");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["validation_level"], "structural");
+    let file = &value["files"][0];
+    assert_eq!(file["validation_level"], "structural");
+    assert_eq!(file["valid"], true);
+    let codes: Vec<&str> = file["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"SCHEMA_ARTIFACT_INVALID"), "{codes:?}");
+
+    // --strict flips validity: the degraded configuration is a warning,
+    // and §6.6 promotes warnings
+    let strict = insum()
+        .arg("validate")
+        .arg("--strict")
+        .arg("--schema")
+        .arg(&artifact)
+        .arg(&um)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let strict_value: Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(strict_value["files"][0]["valid"], false);
+    assert_eq!(strict_value["valid"], false);
+}

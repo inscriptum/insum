@@ -447,6 +447,40 @@ emit("valid-same-mark-in-paragraph", {
   ],
 }, "valid");
 
+// ── the parent-mark-set rule needs REAL differential coverage: a parent
+// whose mark set is restrictive (hljsCodeBlockRow allows only hljsMark).
+// A patch removing the child-marks check must flip these to mismatch.
+const rowMarks: string[] = artifact.nodes.hljsCodeBlockRow.marks;
+if (!rowMarks.includes("bold")) {
+  emit("invalid-mark-not-allowed-in-code-row-bold", {
+    type: "noteDoc",
+    content: [
+      node("noteTitle", text("T")),
+      node("hljsCodeBlock", node("hljsCodeBlockRow", text("code", [mark("bold")]))),
+    ],
+  });
+}
+if (rowMarks.includes("hljsMark")) {
+  emit("valid-mark-allowed-in-code-row-hljsmark", {
+    type: "noteDoc",
+    content: [
+      node("noteTitle", text("T")),
+      node("hljsCodeBlock", node("hljsCodeBlockRow", text("code", [mark("hljsMark", { class: "l" })]))),
+    ],
+  }, "valid");
+}
+// nested: the ROW's mark set judges marks on its DIRECT children (the
+// text node), while the inner paragraph judges its own children
+if (markNames.includes("italic")) {
+  emit("invalid-nested-mark-not-allowed-in-code-row-italic", {
+    type: "noteDoc",
+    content: [
+      node("noteTitle", text("T")),
+      node("hljsCodeBlock", node("hljsCodeBlockRow", text("code", [mark("italic")]))),
+    ],
+  });
+}
+
 // ── 8. invalid: shapes the reference library rejects ─────────────────────
 emit("invalid-content-not-array", {
   type: "noteDoc",
@@ -518,6 +552,17 @@ emit("valid-title-plus-block-required", {
   content: [node("noteTitle", text("Только заголовок")), node("paragraph", text("и блок"))],
 }, "valid");
 
+// coverage guards (P-02): the differential corpus must actually exercise
+// the parent-mark-set rule — a silent dead emit shows up here
+const markSetNegatives = cases.filter((c) =>
+  c.category.startsWith("invalid-mark-not-allowed-in-code-row"),
+);
+if (markSetNegatives.length === 0 || markSetNegatives.some((c) => c.expected !== "invalid")) {
+  throw new Error(
+    "the parent-mark-set rule has no negative differential coverage — check the hljsCodeBlockRow mark inventory of the artifact",
+  );
+}
+
 // ── report ───────────────────────────────────────────────────────────────
 const validCount = cases.filter((c) => c.expected === "valid").length;
 const invalidCount = cases.length - validCount;
@@ -526,8 +571,26 @@ console.log(
   `corpus: ${cases.length} cases (${validCount} valid / ${invalidCount} invalid), ${categories.size} categories`,
 );
 
+// ── provenance (§4.8): the corpus records WHICH schema snapshot and WHICH
+// reference library produced the verdicts — the gate refuses to replay a
+// corpus whose provenance does not match the artifact it built
+const pmPackage = JSON.parse(
+  readFileSync(join(here, "node_modules", "prosemirror-model", "package.json"), "utf8"),
+) as { version: string };
+const provenance = {
+  record: "provenance",
+  artifact: "schema/inscriptum-schema.json",
+  schema_hash: artifact.schema_hash,
+  plugin_version: artifact.plugin_version ?? null,
+  prosemirror_model: pmPackage.version,
+  seed: 20261109,
+};
+
 const outDir = join(here, "..", "fixtures");
 mkdirSync(outDir, { recursive: true });
-const lines = cases.map((c) => JSON.stringify({ id: c.id, category: c.category, doc: c.doc, expected: c.expected }));
+const lines = [
+  JSON.stringify(provenance),
+  ...cases.map((c) => JSON.stringify({ id: c.id, category: c.category, doc: c.doc, expected: c.expected })),
+];
 writeFileSync(join(outDir, "corpus.jsonl"), lines.join("\n") + "\n");
 console.log(`written: ${join(outDir, "corpus.jsonl")}`);

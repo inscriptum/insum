@@ -134,6 +134,14 @@ pub fn collect_files(
             }
         } else if classify_extension(path).is_some() {
             files.push(path.clone());
+        } else {
+            // an explicitly named file that is not a .um/.note: §3.5 — a
+            // named input is never silently dropped (a walked one is, the
+            // tree may legitimately contain arbitrary files)
+            walk_errors.push(WalkError {
+                path: render_path(&path.clone()),
+                message: "not a .um container or .note document".to_owned(),
+            });
         }
     }
     files.sort_by_key(|path| render_path(path));
@@ -488,4 +496,23 @@ impl SourceReader {
         }
         Ok(meta.file_rev.clone())
     }
+}
+
+/// Escape a document-controlled value interpolated into a CLI comment
+/// template: both comment delimiters are broken so the value can neither
+/// open a forged comment nor close the CLI's own one early (review X-01
+/// class 3). Double quotes and newlines are also neutralized (review
+/// Y-01/Y-02): a quote cannot terminate an attribute to inject a new one,
+/// and a newline cannot split the header into a separate forged line.
+pub fn escape_comment_value(value: &str) -> String {
+    value
+        // deletions first: no later step can reassemble what was removed
+        .replace('\r', "")
+        // structural escapes: backslash before quote (Z-05), then delimiters
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("<!--", "<! --")
+        .replace("-->", "-- >")
+        .replace("--!>", "-- !>")
+        .replace('\n', " ")
 }

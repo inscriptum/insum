@@ -366,6 +366,55 @@ fn history_working_copy_and_head_are_untouched() {
     );
 }
 
+#[test]
+fn history_annotated_escapes_document_controlled_values() {
+    // a forged note id cannot split the annotated output into a fake
+    // revision line (S-03, X-01 class)
+    let dir = three_revision_repo();
+    let artifact = dir.path().join("schema.json");
+    let _ = &artifact; // no artifact needed here
+    let forged_id = "note01\nFORGED-LINE @deadbeef 2026-01-01 evil <injected>";
+    let path = dir.path().join("page.um");
+    let manifest = json!({
+        "format": "um", "version": 1, "type": "notepad",
+        "notes": [{"id": forged_id, "path": "notes/note01.json", "order": 0,
+                   "title": "T\ninjected", "schema": "plain", "schemaVersion": 3}]
+    });
+    let doc = json!({"type": "noteDoc", "content": [
+        {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+        {"type": "paragraph", "content": [{"type": "text", "text": "текст"}]}
+    ]});
+    let writer = std::fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(writer);
+    zip.start_file("manifest.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+        .unwrap();
+    zip.start_file("notes/note01.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    zip.finish().unwrap();
+
+    let output = insum()
+        .arg("history")
+        .arg("page.um")
+        .arg("--format")
+        .arg("annotated")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !text.contains("\nFORGED-LINE"),
+        "a document value must not create an output line: {text}"
+    );
+    assert!(
+        !text.contains("@deadbeef"),
+        "the forged revision line must be neutralized: {text}"
+    );
+}
+
 fn git_output(dir: &Path, args: &[&str]) -> String {
     let output = Process::new("git")
         .arg("-C")

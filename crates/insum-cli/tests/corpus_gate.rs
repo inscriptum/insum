@@ -33,9 +33,35 @@ fn rust_validator_agrees_with_prosemirror_on_the_whole_corpus() {
     let pm = insum_core::pmschema::PmSchema::build(&artifact.artifact).expect("artifact compiles");
     let limits = insum_core::Limits::defaults();
 
+    let mut lines = raw.lines();
+    // the first line is provenance (P-01): which artifact snapshot and
+    // reference library produced these verdicts — the gate refuses a
+    // corpus whose provenance does not match the artifact it replays with
+    let provenance: Value = serde_json::from_str(
+        lines
+            .next()
+            .expect("corpus.jsonl starts with a provenance record"),
+    )
+    .expect("provenance line is JSON");
+    assert_eq!(
+        provenance["record"], "provenance",
+        "corpus.jsonl must start with a provenance record"
+    );
+    let declared_hash = provenance["schema_hash"]
+        .as_str()
+        .expect("provenance carries schema_hash");
+    assert_eq!(
+        declared_hash, artifact.artifact.schema_hash,
+        "corpus provenance does not match the artifact this gate replays with"
+    );
+    assert!(
+        provenance["prosemirror_model"].is_string() && provenance["seed"].is_i64(),
+        "provenance names the reference library and the seed"
+    );
+
     let mut total = 0usize;
     let mut mismatches: Vec<String> = Vec::new();
-    for (index, line) in raw.lines().enumerate() {
+    for line in lines {
         if line.trim().is_empty() {
             continue;
         }
@@ -71,12 +97,26 @@ fn rust_validator_agrees_with_prosemirror_on_the_whole_corpus() {
                 actual = if actual_valid { "valid" } else { "invalid" },
             ));
         }
-        let _ = index;
     }
 
     assert!(
         total >= 100,
         "the corpus shrunk unexpectedly: {total} cases (generator broken?)"
+    );
+    // the parent-mark-set rule must keep real negative coverage (P-02):
+    // a patch removing the child-marks check would flip these cases into
+    // divergences above
+    assert!(
+        raw.lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .is_some_and(|case| {
+                    case["category"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with("invalid-mark-not-allowed-in-code-row"))
+                })
+        }),
+        "the corpus lost its parent-mark-set negative coverage"
     );
     assert!(
         mismatches.is_empty(),

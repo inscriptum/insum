@@ -434,26 +434,47 @@ fn compile(expr: &Expr, from: usize, nfa: &mut Nfa) -> Result<Vec<EdgeId>, Strin
 /// omitted (they may lead to needless duplicated states) — port of
 /// `nullFrom`. Result sorted descending (JS `cmp = b - a`), which is part
 /// of the state identity.
-fn null_from(nfa: &Nfa, start: usize) -> Vec<usize> {
+fn null_from(nfa: &Nfa, start: usize) -> Result<Vec<usize>, String> {
     let mut result: Vec<usize> = Vec::new();
-    scan(start, nfa, &mut result);
+    let mut path: Vec<usize> = Vec::new();
+    scan(start, nfa, &mut result, &mut path)?;
     result.sort_unstable_by(|a, b| b.cmp(a));
-    result
+    Ok(result)
 }
 
-fn scan(node: usize, nfa: &Nfa, result: &mut Vec<usize>) {
+/// Walk null edges collecting reachable states (JS `nullFrom`). `path`
+/// holds the recursion stack: a cycle of empty transitions (degenerate
+/// expression, unreachable in a real schema) is a compile error instead of
+/// an uncatchable stack overflow.
+fn scan(
+    node: usize,
+    nfa: &Nfa,
+    result: &mut Vec<usize>,
+    path: &mut Vec<usize>,
+) -> Result<(), String> {
+    if path.contains(&node) {
+        return Err("content expression contains a loop of empty transitions".to_owned());
+    }
     let edges = &nfa[node];
     if edges.len() == 1 && edges[0].0.is_none() {
+        // pass-through node: excluded from the result set (JS semantics)
         let to = edges[0].1.expect("connected edge");
-        return scan(to, nfa, result);
+        path.push(node);
+        let outcome = scan(to, nfa, result, path);
+        path.pop();
+        return outcome;
     }
     result.push(node);
     for (term, to) in edges {
         let Some(to) = to else { continue };
         if term.is_none() && !result.contains(to) {
-            scan(*to, nfa, result);
+            path.push(node);
+            let outcome = scan(*to, nfa, result, path);
+            path.pop();
+            outcome?;
         }
     }
+    Ok(())
 }
 
 fn state_key(states: &[usize]) -> String {
@@ -496,7 +517,7 @@ fn build_dfa(nfa: &Nfa, type_names: &[String], required_attr: &[bool]) -> Result
         }};
     }
 
-    let start = null_from(nfa, 0);
+    let start = null_from(nfa, 0)?;
     let _start_idx = intern!(start);
     while let Some(set) = queue.pop_front() {
         let parent_idx = labeled[&state_key(&set)];
@@ -505,7 +526,7 @@ fn build_dfa(nfa: &Nfa, type_names: &[String], required_attr: &[bool]) -> Result
             for (term, to) in &nfa[node] {
                 let Some(term) = term else { continue };
                 let to = to.expect("connected edge");
-                let targets = null_from(nfa, to);
+                let targets = null_from(nfa, to)?;
                 let position = match out.iter().position(|(t, _)| t == term) {
                     Some(p) => p,
                     None => {
@@ -1352,6 +1373,36 @@ mod tests {
             .expect("must not compile");
         assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
         assert!(err.message.contains("non-generatable"), "{}", err.message);
+    }
+
+    #[test]
+    fn null_cycle_content_expression_is_rejected_not_stack_overflow() {
+        // the review's reproduction: a degenerate expression whose NFA has
+        // a cycle of empty transitions — below every size/depth cap, but
+        // it must fail as SCHEMA_ARTIFACT_INVALID, not abort (C-01)
+        let raw = json!({
+            "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
+            "top_node": "doc", "validation_capability": "partial",
+            "nodes": {
+                "doc": {"content": "(((a{0,0} a{0,0}))*)", "groups": [], "attrs": {},
+                        "marks": [], "addressable": false, "inline_content": false,
+                        "searchable": false},
+                "a": {"content": null, "groups": ["block"], "attrs": {}, "marks": [],
+                      "addressable": true, "inline_content": false, "searchable": false}
+            },
+            "marks": {}
+        });
+        let started = std::time::Instant::now();
+        let err = PmSchema::build(&SchemaArtifact::parse(raw).unwrap())
+            .err()
+            .expect("must not compile");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "rejected fast, not by stack overflow: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.code, ErrorCode::SchemaArtifactInvalid);
+        assert!(err.message.contains("empty transitions"), "{}", err.message);
     }
 
     #[test]

@@ -334,7 +334,12 @@ pub fn resolve(
 
 /// Walk up from `start` (a file or directory) looking for the plugin's
 /// runtime artifact. A bare file name has an empty parent — that means the
-/// working directory, not "no vault".
+/// working directory, not "no vault". The walk stops at the repository
+/// boundary (the first ancestor containing `.git`, which itself is still
+/// searched): an artifact planted ABOVE the workspace must not be picked
+/// up. Note that `hash_verified` proves integrity against accidental
+/// drift, not authenticity — inside an untrusted workspace the vault rule
+/// trusts the workspace's own artifact; pin a trusted one with `--schema`.
 pub fn find_plugin_artifact(start: &Path) -> Option<PathBuf> {
     let start_dir = if start.is_dir() {
         start
@@ -349,13 +354,32 @@ pub fn find_plugin_artifact(start: &Path) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
+        if dir.join(".git").exists() {
+            // repository boundary: the vault is the workspace, nothing
+            // above it is consulted
+            return None;
+        }
     }
     None
 }
 
 fn load_artifact_file(path: &Path, limits: &Limits) -> Result<SchemaArtifact, UmError> {
+    // size is judged from metadata BEFORE any allocation: a gigabyte file
+    // must fail with LIMIT_EXCEEDED, not allocate itself into an abort
+    let declared_size = std::fs::metadata(path)?.len();
+    if declared_size > limits.max_schema_bytes as u64 {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!(
+                "schema artifact larger than UM_MAX_SCHEMA_BYTES ({})",
+                limits.max_schema_bytes
+            ),
+        ));
+    }
     let bytes = std::fs::read(path)?;
     if bytes.len() > limits.max_schema_bytes {
+        // the metadata lied (file grew between stat and read) — the bytes
+        // are already in memory once, but the contract still holds
         return Err(UmError::new(
             ErrorCode::LimitExceeded,
             format!(
@@ -514,6 +538,43 @@ mod tests {
         let resolved = resolve(None, &nested, &Limits::defaults()).unwrap();
         assert_eq!(resolved.source, SchemaSource::PluginRuntime);
         assert!(resolved.hash_verified);
+    }
+
+    #[test]
+    fn artifact_above_the_repository_boundary_is_ignored() {
+        // an artifact planted above the workspace must not be picked up:
+        // the vault walk stops at the repository boundary (S-01)
+        let dir = tempfile::tempdir().unwrap();
+        // planted artifact ABOVE the repo
+        let planted = dir.path().join(".obsidian/plugins/inscriptum");
+        std::fs::create_dir_all(&planted).unwrap();
+        write_fixture(&planted, "schema.json");
+        // the repo with no artifact of its own
+        let repo = dir.path().join("work");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(".git"), b"gitdir: elsewhere").unwrap();
+        let nested = repo.join("kb");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_plugin_artifact(&nested), None);
+        // and the resolution falls back instead of trusting the artifact
+        let resolved = resolve(None, &nested, &Limits::defaults()).unwrap();
+        assert_eq!(resolved.source, SchemaSource::BundledFallback);
+    }
+
+    #[test]
+    fn artifact_at_the_repository_root_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("vault");
+        let plugin_dir = repo.join(".obsidian/plugins/inscriptum");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_fixture(&plugin_dir, "schema.json");
+        std::fs::write(repo.join(".git"), b"gitdir: elsewhere").unwrap();
+        let nested = repo.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let found = find_plugin_artifact(&nested).unwrap();
+        assert_eq!(found, plugin_dir.join("schema.json"));
     }
 
     #[test]

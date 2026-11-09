@@ -140,33 +140,64 @@ fn warning(code: &str, message: String) -> Value {
 /// The environment is scrubbed of GIT_* variables: an inherited GIT_DIR
 /// (hooks, CI wrappers) must not redirect the history read to a foreign
 /// repository.
+/// Upper bound for git text output (`git log` streams; a forged commit
+/// subject can be arbitrarily large).
+const GIT_STDOUT_MAX: usize = 8 * 1024 * 1024;
+
+/// Run git reading stdout through a hard `take` bound: an oversized stream
+/// is LIMIT_EXCEEDED with the writer killed — never a whole-stream
+/// allocation, never a wait on a pipe nobody drains. stderr is discarded
+/// (errors carry the exit class; git stderr is attacker-influenced text).
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, UmError> {
-    let output = git_command(dir, args).output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            UmError::new(
-                ErrorCode::IoError,
-                "git binary not found in PATH".to_owned(),
-            )
-            .with_hint(
-                "insum history reads the git history of the file; install git or add it to PATH.",
-            )
-        } else {
-            UmError::from(err)
-        }
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        // a repository without any commits: `git log` fails — that is an
-        // empty history, not an error
-        if stderr.contains("does not have any commits yet") {
-            return Ok(Vec::new());
-        }
+    let mut child = git_command(dir, args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                UmError::new(
+                    ErrorCode::IoError,
+                    "git binary not found in PATH".to_owned(),
+                )
+                .with_hint(
+                    "insum history reads the git history of the file; install git or add it to PATH.",
+                )
+            } else {
+                UmError::from(err)
+            }
+        })?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut stdout, GIT_STDOUT_MAX as u64)
+        .read_to_end(&mut bytes)
+        .map_err(UmError::from)?;
+    drop(stdout); // close the pipe: a writer blocked on it can finish
+    let oversized = bytes.len() >= GIT_STDOUT_MAX;
+    if oversized {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(UmError::from)?;
+    if oversized {
         return Err(UmError::new(
-            ErrorCode::IoError,
-            format!("git {} failed: {stderr}", args.join(" ")),
+            ErrorCode::LimitExceeded,
+            format!(
+                "git {} output exceeds {} bytes",
+                args.first().unwrap_or(&"git"),
+                GIT_STDOUT_MAX
+            ),
         ));
     }
-    Ok(output.stdout)
+    if !status.success() {
+        return Err(UmError::new(
+            ErrorCode::IoError,
+            format!(
+                "git {} failed (exit {})",
+                args.join(" "),
+                status.code().unwrap_or(-1)
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// A scrubbed git invocation: GIT_* removed, PATH/HOME kept (git needs
@@ -202,19 +233,18 @@ fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
     } else {
         file.parent().unwrap_or(Path::new("."))
     };
-    let root_bytes = match git(dir, &["rev-parse", "--show-toplevel"]) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            // "not a git repository" and bare repositories are expected
-            // outcomes (no work tree), not failures
-            if err.message.contains("not a git repository")
-                || err.message.contains("must be run in a work tree")
-            {
-                return Ok(None);
-            }
-            return Err(err);
-        }
+    // inside a work tree? `rev-parse --is-inside-work-tree` answers
+    // "true"/"false" with exit 0 (bare → false) and fails outside any
+    // repository — every non-"true" outcome means "no vault" here
+    let inside = match git(dir, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(out) => out,
+        // exit 128: not a repository (or other probe failure) — no vault
+        Err(_) => return Ok(None),
     };
+    if String::from_utf8_lossy(&inside).trim() != "true" {
+        return Ok(None);
+    }
+    let root_bytes = git(dir, &["rev-parse", "--show-toplevel"])?;
     let root_text = String::from_utf8_lossy(&root_bytes).trim().to_owned();
     let root = PathBuf::from(root_text);
     let canonical_file = file.canonicalize().map_err(UmError::from)?;
@@ -252,7 +282,9 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<(Vec<Revision>, u
             &format!("--max-count={limit}"),
             &format!("--format={format}"),
             "--",
-            &repo.file_in_repo,
+            // :(literal) — a file name with glob metacharacters must not
+            // widen the pathspec to foreign commits (S-04)
+            &format!(":(literal){}", repo.file_in_repo),
         ],
     )?;
     let text = String::from_utf8_lossy(&out);
@@ -710,9 +742,27 @@ pub fn collect(
         });
     };
 
-    // one extra revision gives the oldest listed one its real parent
-    let (listed, skipped) = list_revisions(&repo, limit + 1)?;
     let mut warnings = Vec::new();
+    // one extra revision gives the oldest listed one its real parent
+    // an unborn HEAD (no commits yet) is an empty history, not an error:
+    // probe cheaply before streaming the log
+    if git(&repo.root, &["rev-parse", "--verify", "HEAD"]).is_err() {
+        warnings.push(warning(
+            "NO_GIT_HISTORY",
+            format!(
+                "no commits touch {} in this repository; history is empty",
+                repo.file_in_repo
+            ),
+        ));
+        return Ok(History {
+            repo_root: repo.root.display().to_string(),
+            file_in_repo: repo.file_in_repo,
+            revisions: Vec::new(),
+            complete: true,
+            warnings,
+        });
+    }
+    let (listed, skipped) = list_revisions(&repo, limit + 1)?;
     if skipped > 0 {
         warnings.push(warning(
             "LOG_RECORDS_SKIPPED",
@@ -1253,6 +1303,58 @@ mod tests {
                 .any(|(key, _)| key.to_string_lossy().to_ascii_uppercase() == "PATH"),
             "PATH must survive the scrub"
         );
+    }
+
+    #[test]
+    fn oversized_log_stream_is_capped_not_buffered() {
+        // a forged commit subject of half a megabyte: the log stream is
+        // read through a hard take bound and fails fast with
+        // LIMIT_EXCEEDED (S-02), never buffering it whole
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        std::fs::write(&file, b"placeholder").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        // the subject goes through a message file: 9 MiB exceeds the
+        // GIT_STDOUT_MAX bound, and argv limits forbid -m that large
+        let big_subject = "x".repeat(9 * 1024 * 1024);
+        let msg = dir.path().join("msg.txt");
+        std::fs::write(&msg, &big_subject).unwrap();
+        git_in(dir.path(), &["commit", "--quiet", "-F", "msg.txt"]);
+
+        let started = std::time::Instant::now();
+        let err = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::LimitExceeded);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the capped stream must fail fast: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn glob_metacharacters_in_file_name_do_not_widen_the_pathspec() {
+        // "note[1].um" must not act as a glob pulling foreign commits (S-04)
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        // a foreign commit touching a DIFFERENT file the glob would match
+        let foreign = dir.path().join("note11.um");
+        std::fs::write(&foreign, b"foreign content").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "foreign commit"]);
+        // the target file, committed after the foreign one
+        let file = dir.path().join("note[1].um");
+        std::fs::write(&file, b"placeholder").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "target commit"]);
+
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert_eq!(history.revisions.len(), 1);
+        assert_eq!(history.revisions[0].revision.subject, "target commit");
     }
 
     #[test]
