@@ -17,6 +17,7 @@ walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+insum-test-utils = { path = "../insum-test-utils" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

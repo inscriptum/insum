@@ -8,8 +8,15 @@ and atomic block-level writes.
 
 Planned command groups:
 
-- **Read** — `ls`, `search`, `tree`, `block get`, `read`, `validate`, `schema`
+- **Read** — `ls`, `search`, `tree`, `block get`, `read`, `validate`, `schema`, `history`
 - **Write** (later releases) — `migrate-ids`, `apply`
+
+## Requirements
+
+- Rust toolchain to build; the `insum` binary itself has no runtime
+  dependencies beyond the OS.
+- `git` in PATH — only for `insum history` (it reads the git history of
+  the target file); every other command works without git.
 
 ## Status
 

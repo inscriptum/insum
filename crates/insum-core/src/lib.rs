@@ -10,6 +10,7 @@
 pub mod canon;
 pub mod container;
 pub mod error;
+pub mod history;
 pub mod limits;
 pub mod lock;
 pub mod model;

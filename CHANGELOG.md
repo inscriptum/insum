@@ -29,6 +29,15 @@ Format — Keep a Changelog; versioning — SemVer.
   broken immediately; cross-host and corrupt files recover by age). The
   future `apply`/`migrate-ids` entry point (`acquire_write_lock`) refuses
   to write while a live editor lease exists.
+- `insum history <file> [--note <id|title>] [--limit n] [--format json|annotated]`:
+  a readable change history from the git history of the repository —
+  revisions newest-first (sha, UTC timestamp, author, subject), each with
+  a per-note structural diff against its parent (blocks added/removed/
+  changed by JSON Pointer, with `attrs.id` and a text preview when
+  present). Read-only (blobs via `git show`, no checkout); a file outside
+  git or without history is an explicit warning with an empty list; the
+  output budget drops the oldest revisions with `complete: false` instead
+  of truncating silently. Requires git in PATH.
 
 ### Fixed
 

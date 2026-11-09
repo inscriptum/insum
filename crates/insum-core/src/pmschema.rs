@@ -1259,14 +1259,12 @@ mod tests {
                    "marks": [], "addressable": false, "inline_content": false,
                    "searchable": false}),
         );
-        for i in 0..2 {
-            for name in [format!("t{i}")] {
-                nodes.insert(
-                    name.clone(),
-                    json!({"content": null, "groups": [], "attrs": {}, "marks": [],
-                           "addressable": true, "inline_content": false, "searchable": false}),
-                );
-            }
+        for name in ["t0", "t1"] {
+            nodes.insert(
+                name.to_owned(),
+                json!({"content": null, "groups": [], "attrs": {}, "marks": [],
+                       "addressable": true, "inline_content": false, "searchable": false}),
+            );
         }
         let raw = json!({
             "schema_id": "s", "schema_version": 1, "schema_hash": "sha256:x",
