@@ -1097,6 +1097,9 @@ mod tests {
     fn non_um_file_is_a_usage_error() {
         let dir = tempfile::tempdir().unwrap();
         git_in(dir.path(), &["init", "--quiet"]);
+        // CI runners have no global git identity — the repo sets its own
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
         let file = dir.path().join("readme.md");
         std::fs::write(&file, b"x").unwrap();
         git_in(dir.path(), &["add", "."]);
