@@ -176,12 +176,13 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
     command.arg("-C").arg(dir).args(args);
     command.env_clear();
     for (key, value) in std::env::vars_os() {
-        let name = key.to_string_lossy();
+        // Windows variables are matched case-insensitively ("Path" is the
+        // same variable as "PATH")
+        let upper = key.to_string_lossy().to_ascii_uppercase();
         if matches!(
-            name.as_ref(),
-            "PATH" | "HOME" | "SystemRoot" | "SYSTEMROOT" | "ComSpec"
-        ) || name.starts_with("SYSTEMDRIVE")
-        {
+            upper.as_str(),
+            "PATH" | "HOME" | "SYSTEMROOT" | "COMSPEC" | "SYSTEMDRIVE" | "TMP" | "TEMP"
+        ) {
             command.env(key, value);
         }
     }
