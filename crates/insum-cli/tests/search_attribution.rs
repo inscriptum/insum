@@ -65,8 +65,9 @@ fn shared_text_corpus(dir: &std::path::Path, notes: usize, blocks: usize) -> Str
 }
 
 /// For every match: block get by its own note_id + pointer must resolve the
-/// same block (id/type/text) on the same file — and note_title must be the
-/// manifest title of that note id.
+/// same block (id/type/text) on the same file. block get's response carries
+/// no note_title — the id↔title pairing is asserted by the marker test and
+/// the foreign-path test below.
 fn assert_invariant(file: &str, matches: &[Value]) {
     assert!(!matches.is_empty(), "corpus must produce matches");
     for hit in matches {
@@ -208,13 +209,39 @@ fn search_attribution_spans_um_and_note_files() {
             .any(|m| m["path"].as_str().unwrap().ends_with("single.note")),
         ".note file participates in search"
     );
+    // .note matches resolve structurally too: block get without --note on
+    // the same file returns the same block
+    for hit in matches
+        .iter()
+        .filter(|m| m["path"].as_str().unwrap().ends_with("single.note"))
+    {
+        let output = insum()
+            .args([
+                "block",
+                "get",
+                &note_path.to_string_lossy(),
+                "--pointer",
+                hit["pointer"].as_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            ".note match does not resolve: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["block"]["node"]["type"], hit["type"]);
+    }
 }
 
-/// The one deterministic way the invariant CAN break is manifest data whose
-/// descriptor path points at a foreign payload. Search attributes per the
-/// manifest (the only authority for note ids) — it must not swap or crash;
-/// the honest `block get` failure on such data is the DATA defect, pinned
-/// here so a future swap in search logic cannot hide behind it.
+/// Manifest data whose descriptor path points at a foreign payload is the
+/// deterministic data-level oddity worth pinning: search attributes per the
+/// manifest (the only authority for note ids), so the task invariant —
+/// block get by the hit's own note_id + pointer — still holds (search and
+/// block get resolve the same descriptor path). What such data breaks is
+/// the payload-file-name-owns-the-note expectation, nothing else. Pinned so
+/// a future swap in search logic cannot hide behind it.
 #[test]
 fn foreign_descriptor_path_is_attributed_per_manifest() {
     let dir = TempDir::new().unwrap();
