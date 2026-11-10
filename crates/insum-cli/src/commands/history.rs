@@ -59,55 +59,100 @@ pub fn run(
 /// Drop the oldest revisions until the document fits the budget; at least
 /// one revision is kept (a single oversized revision is a LIMIT_EXCEEDED).
 fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmError> {
-    let mut dropped = 0usize;
-    let mut markers = false;
-    loop {
-        let serialized = serde_json::to_string(value)
+    // measure once, decide analytically (C-08): dropping one revision at a
+    // time with a full re-serialize per drop is O(drops x size)
+    let serialized = serde_json::to_string(value)
+        .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
+    if serialized.len() <= budget {
+        return Ok(());
+    }
+    let total = serialized.len();
+    let revisions = value["revisions"]
+        .as_array()
+        .ok_or_else(|| UmError::internal("history revisions must be an array".to_owned()))?
+        .len();
+
+    // the envelope without revisions (path/repo_root/api_version/...)
+    let base_len = {
+        let saved = value["revisions"].take();
+        let base = serde_json::to_string(value)
             .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
-        if serialized.len() <= budget {
-            if dropped > 0 {
-                let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
-                for warning in warnings.iter_mut() {
-                    if warning["code"] == json!("OUTPUT_BUDGET") {
-                        warning["message"] = json!(format!(
-                            "{dropped} oldest revision(s) dropped to fit the output budget; pass --max-bytes to raise it"
-                        ));
-                    }
-                }
-                value["warnings"] = json!(warnings);
-            }
-            return Ok(());
-        }
-        let revisions = value["revisions"]
-            .as_array_mut()
+        value["revisions"] = saved;
+        base.len()
+    };
+
+    // per-revision sizes, newest-first as stored
+    let sizes: Vec<usize> = {
+        let array = value["revisions"]
+            .as_array()
             .ok_or_else(|| UmError::internal("history revisions must be an array".to_owned()))?;
-        if revisions.len() <= 1 {
-            return Err(UmError::new(
-                ErrorCode::LimitExceeded,
-                format!(
-                    "history of {} does not fit the output budget ({serialized} > {budget} bytes) even for one revision",
-                    file.display()
-                ),
-            )
-            .with_hint("Raise --max-bytes or narrow the history with --note."));
+        let mut sizes = Vec::with_capacity(array.len());
+        for r in array {
+            sizes.push(serde_json::to_string(r).unwrap_or_default().len());
         }
-        revisions.pop();
-        dropped += 1;
-        // the counter is live from the first drop; the marker fields are
-        // part of the output from now on — their bytes count in every
-        // later measurement
-        value["revisions_dropped"] = json!(dropped);
-        if !markers {
-            value["complete"] = json!(false);
-            let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
-            warnings.push(json!({
-                "code": "OUTPUT_BUDGET",
-                "message": "oldest revision(s) dropped to fit the output budget",
-            }));
-            value["warnings"] = json!(warnings);
-            markers = true;
+        sizes
+    };
+    if sizes.is_empty() {
+        return Ok(());
+    }
+
+    // dropping adds marker bytes (complete:false, revisions_dropped, an
+    // OUTPUT_BUDGET warning) — reserve for them before computing
+    const MARKER_RESERVE: usize = 300;
+    let effective = budget.saturating_sub(base_len + MARKER_RESERVE);
+    // accumulate from the OLDEST end; keep the longest newest-prefix that
+    // fits, keeping at least the newest revision
+    let mut kept_len = 0usize;
+    let mut drop_count = sizes.len();
+    for (kept_count, size) in sizes.iter().enumerate().rev() {
+        if kept_len + size <= effective {
+            kept_len += size;
+            drop_count = revisions - kept_count;
+        } else {
+            break;
         }
     }
+    if drop_count >= revisions {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!(
+                "history of {} does not fit the output budget ({total} > {budget} bytes) even for one revision",
+                file.display()
+            ),
+        )
+        .with_hint("Raise --max-bytes or narrow the history with --note."));
+    }
+
+    {
+        let array = value["revisions"]
+            .as_array_mut()
+            .ok_or_else(|| UmError::internal("history revisions must be an array".to_owned()))?;
+        array.truncate(revisions - drop_count);
+    }
+    value["complete"] = json!(false);
+    value["revisions_dropped"] = json!(drop_count);
+    let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
+    warnings.push(json!({
+        "code": "OUTPUT_BUDGET",
+        "message": format!(
+            "{drop_count} oldest revision(s) dropped to fit the output budget; pass --max-bytes to raise it"
+        ),
+    }));
+    value["warnings"] = json!(warnings);
+    // enforce the contract on the final document: the reserve estimate can
+    // be optimistic — drop one more, but never the last revision
+    let final_len = serde_json::to_string(value)
+        .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
+    if final_len.len() > budget {
+        let array_len = value["revisions"].as_array().map(|a| a.len()).unwrap_or(0);
+        if array_len > 1 {
+            if let Some(array) = value["revisions"].as_array_mut() {
+                array.truncate(array_len - 1);
+            }
+            value["revisions_dropped"] = json!(drop_count + 1);
+        }
+    }
+    Ok(())
 }
 
 /// RFC 3339 UTC from epoch seconds (no local clock, deterministic).

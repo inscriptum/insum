@@ -130,6 +130,15 @@ pub fn run(
         }
     }
 
+    // walk errors are appended after the walked files — §5.3 requires the
+    // files[] array globally sorted by path
+    file_results.sort_by_key(|entry| {
+        entry["path"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_default()
+    });
+
     // An empty file set validated nothing: the report must not claim the
     // schema level for a run without a single validated file.
     let top_level_schema = all_schema && !file_results.is_empty();
@@ -351,8 +360,8 @@ fn warnings_as_errors(warnings: &[insum_core::Diag]) -> Vec<Value> {
         .iter()
         .map(|warning| {
             json!({
-                "code": "NOTE_DOC_INVALID",
-                "message": format!("strict: {} ({})", warning.message, warning.code)
+                "code": warning.code,
+                "message": format!("strict: {}", warning.message)
             })
         })
         .collect()

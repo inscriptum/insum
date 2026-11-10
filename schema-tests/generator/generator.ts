@@ -55,64 +55,126 @@ const isInline = (name: string): boolean =>
   (artifact.nodes[name]?.groups ?? []).includes("inline");
 const inlineNodeNames = nodeNames.filter(isInline);
 
-const schema = new Schema({
-  topNode: artifact.top_node,
-  nodes: Object.fromEntries(
-    nodeNames.map((name) => {
-      const spec = artifact.nodes[name];
-      return [
-        name,
-        {
-          content: spec.content ?? undefined,
-          group: (spec.groups ?? []).join(" "),
-          marks: (spec.marks ?? []).join(" "),
-          attrs: Object.fromEntries(
-            Object.entries(spec.attrs ?? {}).map(([attr, spec2]) => [
-              // the artifact omits `default` for required attributes —
-              // pass the key through only when it exists
-              attr,
-              "default" in (spec2 as object)
-                ? { default: (spec2 as { default?: unknown }).default }
-                : {},
-            ]),
-          ),
-          inline: isInline(name),
-        },
-      ];
-    }),
-  ),
-  marks: Object.fromEntries(
-    markNames.map((name) => {
-      const spec = artifact.marks[name];
-      return [
-        name,
-        {
-          group: spec.group ?? undefined,
-          attrs: Object.fromEntries(
-            Object.entries(spec.attrs ?? {}).map(([attr, spec2]) => [
-              attr,
-              "default" in (spec2 as object)
-                ? { default: (spec2 as { default?: unknown }).default }
-                : {},
-            ]),
-          ),
-        },
-      ];
-    }),
-  ),
-});
+// ── synthetic supplement artifact (T-09/P-04) ────────────────────────────
+// The real artifact declares no required attributes and no {m,n} content
+// ranges, so the differential corpus cannot exercise those semantics from
+// it alone. This small declared-here artifact supplements the coverage;
+// the node/mark INVENTORY rule (§4.7 — no hand copies) is untouched: the
+// reference verdicts still come from the real prosemirror-model, and the
+// provenance record carries the synthetic artifact's hash.
+const syntheticArtifact = {
+  schema_id: "insum-corpus-synthetic",
+  schema_version: 1,
+  schema_hash: "",
+  top_node: "doc",
+  validation_capability: "partial",
+  nodes: {
+    doc: { content: "req* multi*", groups: [], attrs: {}, marks: [],
+           addressable: false, inline_content: false, searchable: false },
+    req: { content: "inline*", groups: ["block"],
+           attrs: { key: {} }, // no default → REQUIRED (PM computeAttrs throws)
+           marks: ["bold"], addressable: true, inline_content: true,
+           searchable: true },
+    multi: { content: "para{2,3}", groups: ["block"], attrs: {}, marks: [],
+             addressable: true, inline_content: false, searchable: false },
+    para: { content: "inline*", groups: ["block"], attrs: {}, marks: [],
+            addressable: true, inline_content: true, searchable: true },
+    atom: { content: null, groups: ["inline"], attrs: { path: { default: "" } },
+            marks: [], addressable: false, inline_content: true,
+            searchable: false },
+    text: { content: null, groups: ["inline"], attrs: {}, marks: [],
+            addressable: false, inline_content: true, searchable: false }
+  },
+  marks: { bold: { group: null, attrs: {} } }
+};
+syntheticArtifact.schema_hash = (() => {
+  // reuse the same canonicalization the real generator applies? The
+  // artifact hash is computed by the plugin in production; for the
+  // synthetic supplement the CLI's compute_hash contract is replicated
+  // here via a minimal RFC-8785-ish canonical form. The gate does NOT
+  // verify this hash against Rust — it is informational for the
+  // synthetic cases only.
+  const copy = { ...syntheticArtifact };
+  const canonical = JSON.stringify(copy, Object.keys(copy).sort());
+  // eslint-disable-next-line no-undef
+  return "synthetic:" + Buffer.from(canonical).toString("base64").slice(0, 32);
+})();
+
+
+function buildSchemaSpec(artifactSpec: typeof artifact): ConstructorParameters<typeof Schema>[0] {
+  const names = Object.keys(artifactSpec.nodes);
+  const inline = (name: string): boolean =>
+    (artifactSpec.nodes[name]?.groups ?? []).includes("inline");
+  return {
+    topNode: artifactSpec.top_node,
+    nodes: Object.fromEntries(
+      names.map((name) => {
+        const spec = artifactSpec.nodes[name];
+        return [
+          name,
+          {
+            content: spec.content ?? undefined,
+            group: (spec.groups ?? []).join(" "),
+            marks: (spec.marks ?? []).join(" "),
+            attrs: Object.fromEntries(
+              Object.entries(spec.attrs ?? {}).map(([attr, spec2]) => [
+                // the artifact omits `default` for required attributes —
+                // pass the key through only when it exists
+                attr,
+                "default" in (spec2 as object)
+                  ? { default: (spec2 as { default?: unknown }).default }
+                  : {},
+              ]),
+            ),
+            inline: inline(name),
+          },
+        ];
+      }),
+    ),
+    marks: Object.fromEntries(
+      Object.keys(artifactSpec.marks).map((name) => {
+        const spec = artifactSpec.marks[name];
+        return [
+          name,
+          {
+            group: spec.group ?? undefined,
+            attrs: Object.fromEntries(
+              Object.entries(spec.attrs ?? {}).map(([attr, spec2]) => [
+                attr,
+                "default" in (spec2 as object)
+                  ? { default: (spec2 as { default?: unknown }).default }
+                  : {},
+              ]),
+            ),
+          },
+        ];
+      }),
+    ),
+  };
+}
 
 // ── verdict: the REAL library decides ────────────────────────────────────
-function pmVerdict(doc: unknown): { ok: boolean; error?: string } {
+const schema = new Schema(buildSchemaSpec(artifact));
+const syntheticSchema = new Schema(
+  buildSchemaSpec(syntheticArtifact as unknown as typeof artifact),
+);
+
+function pmVerdict(doc: unknown, forSchema: Schema = schema): { ok: boolean; error?: string } {
   try {
-    Node.fromJSON(schema, doc).check();
+    Node.fromJSON(forSchema, doc).check();
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
-const cases: { id: string; category: string; doc: unknown; expected: "valid" | "invalid" }[] = [];
+const cases: {
+  id: string;
+  category: string;
+  doc: unknown;
+  expected: "valid" | "invalid";
+  schema: "main" | "synthetic";
+}[] = [];
 
 // Scope guard: cases the differential corpus deliberately does not judge.
 // 1) noteDoc roots must lead with noteTitle — the artifact's content rule
@@ -155,13 +217,28 @@ function assertInScope(doc: unknown): void {
 function emit(category: string, doc: unknown, expectation?: "valid" | "invalid"): void {
   assertInScope(doc);
   const verdict = pmVerdict(doc);
+  pushCase(category, doc, verdict, expectation, "main");
+}
+
+function emitSynthetic(category: string, doc: unknown, expectation?: "valid" | "invalid"): void {
+  const verdict = pmVerdict(doc, syntheticSchema);
+  pushCase(category, doc, verdict, expectation, "synthetic");
+}
+
+function pushCase(
+  category: string,
+  doc: unknown,
+  verdict: { ok: boolean; error?: string },
+  expectation: "valid" | "invalid" | undefined,
+  schemaTag: "main" | "synthetic",
+): void {
   const expected = expectation ?? (verdict.ok ? "valid" : "invalid");
   if (expectation && expectation !== (verdict.ok ? "valid" : "invalid")) {
     throw new Error(
       `builder/disagreement for ${category}: expected ${expectation}, PM says ${verdict.ok ? "valid" : `invalid (${verdict.error})`}`,
     );
   }
-  cases.push({ id: nextId(), category, doc, expected });
+  cases.push({ id: nextId(), category, doc, expected, schema: schemaTag });
 }
 
 // ── builders (inventories come from the artifact, never hand-copied) ─────
@@ -552,6 +629,65 @@ emit("valid-title-plus-block-required", {
   content: [node("noteTitle", text("Только заголовок")), node("paragraph", text("и блок"))],
 }, "valid");
 
+// ── synthetic supplement cases (T-09/P-04): required attributes, {m,n}
+// content ranges, marks on an inline atom — semantics the real artifact
+// does not declare. Verdicts still come from the real prosemirror-model,
+// built over the synthetic artifact declared above.
+emitSynthetic("synthetic-attr-required-given", {
+  type: "doc",
+  content: [
+    { type: "req", attrs: { key: "v1" }, content: [text("ok")] },
+    { type: "req", attrs: { key: "v2" }, content: [text("тоже")] },
+  ],
+}, "valid");
+emitSynthetic("synthetic-attr-required-missing", {
+  type: "doc",
+  content: [{ type: "req", content: [text("нет key")] }],
+});
+emitSynthetic("synthetic-attr-required-empty-attrs", {
+  type: "doc",
+  content: [{ type: "req", attrs: {}, content: [text("attrs {}")] }],
+});
+emitSynthetic("synthetic-range-min-ok", {
+  type: "doc",
+  content: [
+    { type: "multi", content: [paragraphLike(), paragraphLike()] },
+  ],
+}, "valid");
+emitSynthetic("synthetic-range-max-ok", {
+  type: "doc",
+  content: [
+    { type: "multi", content: [paragraphLike(), paragraphLike(), paragraphLike()] },
+  ],
+}, "valid");
+emitSynthetic("synthetic-range-below-min", {
+  type: "doc",
+  content: [{ type: "multi", content: [paragraphLike()] }],
+});
+emitSynthetic("synthetic-range-above-max", {
+  type: "doc",
+  content: [
+    { type: "multi",
+      content: [paragraphLike(), paragraphLike(), paragraphLike(), paragraphLike()] },
+  ],
+});
+emitSynthetic("synthetic-mark-on-inline-atom", {
+  type: "doc",
+  content: [
+    { type: "req", attrs: { key: "k" }, content: [
+        { type: "atom", attrs: { path: "x" }, marks: [{ type: "bold" }] },
+    ] },
+  ],
+}, "valid");
+
+function paragraphLike(): unknown {
+  return { type: "para", content: [text("x")] };
+}
+
+if (cases.filter((c) => c.schema === "synthetic").length < 6) {
+  throw new Error("the synthetic supplement lost its cases (T-09/P-04)");
+}
+
 // coverage guards (P-02): the differential corpus must actually exercise
 // the parent-mark-set rule — a silent dead emit shows up here
 const markSetNegatives = cases.filter((c) =>
@@ -584,13 +720,26 @@ const provenance = {
   plugin_version: artifact.plugin_version ?? null,
   prosemirror_model: pmPackage.version,
   seed: 20261109,
+  // T-09/P-04 supplement: the synthetic artifact is declared in this
+  // generator (see syntheticArtifact) and embedded whole — its cases are
+  // tagged schema:"synthetic" and replayed against a validator built from
+  // THIS embedded artifact
+  synthetic_schema_id: syntheticArtifact.schema_id,
+  synthetic_artifact: syntheticArtifact,
+  synthetic_cases: cases.filter((c) => c.schema === "synthetic").length,
 };
 
 const outDir = join(here, "..", "fixtures");
 mkdirSync(outDir, { recursive: true });
 const lines = [
   JSON.stringify(provenance),
-  ...cases.map((c) => JSON.stringify({ id: c.id, category: c.category, doc: c.doc, expected: c.expected })),
+  ...cases.map((c) =>
+    JSON.stringify(
+      c.schema === "main"
+        ? { id: c.id, category: c.category, doc: c.doc, expected: c.expected }
+        : { id: c.id, category: c.category, doc: c.doc, expected: c.expected, schema: c.schema },
+    ),
+  ),
 ];
 writeFileSync(join(outDir, "corpus.jsonl"), lines.join("\n") + "\n");
 console.log(`written: ${join(outDir, "corpus.jsonl")}`);

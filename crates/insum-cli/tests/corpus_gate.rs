@@ -59,6 +59,23 @@ fn rust_validator_agrees_with_prosemirror_on_the_whole_corpus() {
         "provenance names the reference library and the seed"
     );
 
+    // the synthetic supplement (T-09/P-04) carries its whole artifact:
+    // cases tagged schema:"synthetic" are replayed against a second
+    // validator built from it
+    let pm_synthetic = if provenance["synthetic_artifact"].is_object() {
+        Some(
+            insum_core::pmschema::PmSchema::build(
+                &insum_core::schema::SchemaArtifact::parse(
+                    provenance["synthetic_artifact"].clone(),
+                )
+                .expect("the embedded synthetic artifact parses"),
+            )
+            .expect("the embedded synthetic artifact compiles"),
+        )
+    } else {
+        None
+    };
+
     let mut total = 0usize;
     let mut mismatches: Vec<String> = Vec::new();
     for line in lines {
@@ -74,8 +91,16 @@ fn rust_validator_agrees_with_prosemirror_on_the_whole_corpus() {
         let expected_valid = case["expected"].as_str() == Some("valid");
         let doc = &case["doc"];
 
-        let validation = insum_core::validate_note_doc_with_schema(doc, false, &limits, Some(&pm))
-            .expect("corpus documents stay within read limits");
+        let case_schema = case["schema"].as_str().unwrap_or("main");
+        let replay_schema: Option<&insum_core::pmschema::PmSchema> = match case_schema {
+            "main" => Some(&pm),
+            "synthetic" => pm_synthetic.as_ref(),
+            other => panic!("unknown schema tag {other:?} in the corpus"),
+        };
+
+        let validation =
+            insum_core::validate_note_doc_with_schema(doc, false, &limits, replay_schema)
+                .expect("corpus documents stay within read limits");
         let actual_valid = validation.valid();
         total += 1;
 

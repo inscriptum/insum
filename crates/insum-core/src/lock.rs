@@ -127,6 +127,13 @@ impl Sidecar {
         file.write_all(&body)
             .and_then(|_| file.flush())
             .map_err(UmError::from)?;
+        // the sidecar records hostname and pid — owner-only (S-08)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(UmError::from)?;
+        }
         Ok(())
     }
 }
@@ -189,6 +196,11 @@ fn current_hostname() -> Option<String> {
 /// Is `pid` alive on this machine? Only meaningful when the recorded
 /// hostname matches (or is unknown).
 fn pid_alive(pid: u32) -> bool {
+    // pid 0 is a signal target meaning "my process group", not a process;
+    // u32::MAX is -1 (all groups). Both would report "alive" forever.
+    if pid == 0 || pid == u32::MAX {
+        return false;
+    }
     #[cfg(unix)]
     {
         // kill(pid, 0): ESRCH = no such process, EPERM = exists (other user)
@@ -218,6 +230,15 @@ fn pid_alive(pid: u32) -> bool {
             alive
         }
     }
+}
+
+/// (device, inode) of the sidecar, when the platform exposes it.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|meta| {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    })
 }
 
 fn sidecar_path(target: &Path, suffix: &str) -> PathBuf {
@@ -395,6 +416,11 @@ pub fn break_stale_lease(target: &Path, stale_after: Duration) -> Result<bool, U
 pub struct FileLock {
     path: PathBuf,
     op_id: String,
+    /// The sidecar's identity at acquire time (unix): release refuses to
+    /// unlink when the path now carries a different file (a broken-and-
+    /// reacquired lock) — the op_id check narrows to same-file only.
+    #[cfg(unix)]
+    identity: Option<(u64, u64)>,
     released: bool,
 }
 
@@ -421,6 +447,7 @@ impl FileLock {
             match sidecar.write_atomic(&path) {
                 Ok(()) => {
                     return Ok(FileLock {
+                        identity: file_identity(&path),
                         path,
                         op_id: sidecar.op_id,
                         released: false,
@@ -492,12 +519,20 @@ impl FileLock {
     pub fn release(mut self) -> Result<(), UmError> {
         self.released = true;
         let sidecar = read_sidecar(&self.path)?;
-        match sidecar {
-            Some(recorded) if recorded.op_id == self.op_id => {
-                std::fs::remove_file(&self.path).map_err(UmError::from)
-            }
-            _ => Ok(()), // gone or replaced: nothing to release
+        let op_matches = sidecar.as_ref().is_some_and(|s| s.op_id == self.op_id);
+        #[cfg(unix)]
+        let same_file = match (self.identity, file_identity(&self.path)) {
+            (Some(created), Some(current)) => created == current,
+            // no identity info (non-unix): fall back to the op id check
+            (None, _) => true,
+            (Some(_), None) => false, // the file vanished: nothing to do
+        };
+        #[cfg(not(unix))]
+        let same_file = true;
+        if op_matches && same_file {
+            std::fs::remove_file(&self.path).map_err(UmError::from)?;
         }
+        Ok(())
     }
 }
 
@@ -896,6 +931,64 @@ mod tests {
         assert!(name.starts_with('.'), "hidden per §9.2/§9.3: {name}");
         assert!(name.contains("page.um"), "target-bound: {name}");
         lock.release().unwrap();
+    }
+
+    #[test]
+    fn zero_pid_holder_is_not_alive_forever() {
+        // T-06/C-04: pid 0 means "the process group" to kill(2) — a holder
+        // recording pid 0 must not wedge the file forever
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LOCK_SUFFIX);
+        let mut sidecar = Sidecar::new("lock", "cli", Some("zero-pid"));
+        sidecar.holder.pid = 0;
+        write_sidecar(&path, &sidecar);
+        let lock = FileLock::acquire(&target, "apply", &fast_config()).unwrap();
+        lock.release().unwrap();
+        assert!(!path.exists(), "the zero-pid lock is broken, not eternal");
+    }
+
+    #[test]
+    fn sidecar_is_owner_only() {
+        // S-08: hostname+pid are not world-readable
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let lock = FileLock::acquire(&target, "apply", &fast_config()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(sidecar_path(&target, LOCK_SUFFIX))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "mode is {mode:o}, expected 0600");
+        }
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn break_stale_lease_never_touches_a_live_replacement() {
+        // S-07 contract, deterministic form: after a stale lease is broken
+        // and a fresh live lease appears, a second break must leave the
+        // live lease alone (the in-function re-read aborts on any change)
+        let dir = tempfile::tempdir().unwrap();
+        let target = temp_target(dir.path());
+        let path = sidecar_path(&target, LEASE_SUFFIX);
+        let mut stale = Sidecar::new("lease", "plugin", Some("old"));
+        stale.holder.pid = dead_pid();
+        write_sidecar(&path, &stale);
+        assert!(break_stale_lease(&target, fast_config().stale_after).unwrap());
+
+        // a fresh live lease from another editor
+        let fresh = Sidecar::new("lease", "plugin", Some("dirty"));
+        write_sidecar(&path, &fresh);
+        assert!(!break_stale_lease(&target, fast_config().stale_after).unwrap());
+        assert!(path.exists(), "a live lease is never removed");
+        assert_eq!(
+            read_sidecar(&path).unwrap().unwrap().op_id,
+            fresh.op_id,
+            "the live lease survives verbatim"
+        );
     }
 
     #[test]

@@ -53,8 +53,14 @@ source path, plugin version and `validation_capability`, plus `hash_verified`:
 the hash is recomputed (SHA-256 over RFC 8785 canonical JSON without
 `schema_hash` and `plugin_version`) and compared with the declared value. A
 mismatch keeps the command working and adds a `SCHEMA_MISMATCH` warning — a
-stale artifact is shown, not hidden. `--type <node>` prints the node
+stale artifact is shown, not hidden. `hash_verified` proves integrity
+against accidental drift, not authenticity: inside an untrusted workspace
+the vault rule trusts the workspace's own artifact; pin a trusted one with
+`--schema`. A document root whose type differs from the artifact's
+`top_node` is a `SCHEMA_ROOT_MISMATCH` warning (document families are
+application semantics, §4.7). `--type <node>` prints the node
 descriptor (content rule, groups, attrs, marks, `addressable`,
+`top_node`,
 `inline_content`, `searchable` and the example when the artifact carries
 one); an unknown type fails with exit 6 and lists the available types.
 
@@ -72,7 +78,8 @@ one); an unknown type fails with exit 6 and lists the available types.
   type the artifact does not declare is an error — unless it is a known
   legacy type observed in real on-disk documents (reported as
   `SCHEMA_NODE_LEGACY`: document version semantics are outside the
-  artifact). Undeclared attributes are dropped by the editor — reported as
+  artifact; the legacy dictionary is the observed-inventory list the
+  structural level uses, maintained with `.instruments/um-format.md`). Undeclared attributes are dropped by the editor — reported as
   `SCHEMA_ATTR_UNKNOWN` warnings. A noteDoc root outside the title family
   (no leading `noteTitle`, or carrying legacy types) is outside the
   artifact's content rule by its own declaration — the root content match
@@ -152,7 +159,9 @@ error), `HAS_MORE_REVISIONS` (older revisions exist beyond `--limit`),
 `LOG_RECORDS_SKIPPED` (a malformed git record — object names that are not
 hex — was ignored), `BLOB_NOT_PARSEABLE` / `PARENT_BLOB_NOT_PARSEABLE`
 (a revision or its parent is not a parseable .um/.note — its diff is not
-judged). `--limit` bounds the revision count (default 20, cap 200); the
+judged), `NOTE_NOT_FOUND_IN_HISTORY` (the `--note` filter matched no
+revision — check the id or exact title), `OUTPUT_BUDGET` (the oldest
+revisions were dropped to fit the budget). `--limit` bounds the revision count (default 20, cap 200); the
 output budget never truncates silently — the oldest revisions are dropped
 with `complete: false`, `revisions_dropped` and an `OUTPUT_BUDGET`
 warning, and a single revision that cannot fit is a `LIMIT_EXCEEDED`

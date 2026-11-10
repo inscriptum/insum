@@ -1019,12 +1019,19 @@ fn validate_strict_turns_warnings_into_errors() {
     let warnings = &plain["files"][0]["notes"][0]["warnings"];
     assert_eq!(warnings.as_array().unwrap().len(), 1);
 
-    // with --strict: invalid, error carries the warning text
+    // with --strict: invalid, the error keeps the warning's own code with
+    // a strict prefix in the message (K-02)
     let strict = run_json(&["validate", "--strict", file.to_string_lossy().as_ref()]);
     assert_eq!(strict["valid"], Value::Bool(false));
     assert_eq!(strict["files"][0]["valid"], Value::Bool(false));
     let errors = strict["files"][0]["notes"][0]["errors"].as_array().unwrap();
-    assert_eq!(errors[0]["code"], "NOTE_DOC_INVALID");
+    assert_eq!(errors[0]["code"], "UNKNOWN_NODE_TYPE");
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("strict:")
+    );
 }
 
 #[test]

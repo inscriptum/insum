@@ -14,7 +14,6 @@
 //! The git binary must be in PATH (documented in the user docs); blobs are
 //! bounded by the same limits as regular reads.
 
-use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +77,10 @@ pub struct NoteDiff {
     pub note_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_title: Option<String>,
+    /// The title the note had in the PARENT revision — a rename revision
+    /// is findable by either name (C-06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_title_old: Option<String>,
     #[serde(skip_serializing_if = "not")]
     pub added: bool,
     #[serde(skip_serializing_if = "not")]
@@ -674,6 +677,11 @@ fn diff_note_sets(old: &RevisionNotes, new: &RevisionNotes) -> Vec<NoteDiff> {
                 let mut diff = NoteDiff {
                     note_id: id.clone(),
                     note_title: title.clone().or_else(|| old_title.clone()),
+                    note_title_old: if old_title != title {
+                        old_title.clone()
+                    } else {
+                        None
+                    },
                     added: false,
                     removed: false,
                     ..NoteDiff::default()
@@ -721,9 +729,16 @@ pub fn collect(
         .unwrap_or("")
         .to_ascii_lowercase();
     if extension != "um" && extension != "note" {
-        return Err(UmError::usage(
-            "insum history reads .um containers and .note documents",
-        ));
+        // the read-command convention (K-04): a named file that is not a
+        // document is PATH_NOT_FOUND, not a usage error
+        return Err(UmError::new(
+            ErrorCode::PathNotFound,
+            format!(
+                "{} is not a .um container or .note document",
+                file.display()
+            ),
+        )
+        .with_hint("insum history reads .um containers and .note documents."));
     }
 
     let Some(repo) = locate_repo(file)? else {
@@ -791,24 +806,28 @@ pub fn collect(
     // is the parent, otherwise fetch and parse the parent blob separately
     let listed_count = listed.len();
     let output_count = listed_count.min(limit);
-    let mut parsed_by_sha: HashMap<String, Option<RevisionNotes>> = HashMap::new();
-    let mut parent_cache: HashMap<String, Option<RevisionNotes>> = HashMap::new();
-    for revision in listed.iter().take(output_count + 1) {
-        let notes = revision_blob(&repo, &revision.sha, limits)
-            .and_then(|blob| revision_notes(&blob, &extension, limits))?;
-        parsed_by_sha.insert(revision.sha.clone(), notes);
-    }
-
+    // S-06: revisions are processed OLDEST-FIRST in a stream — at most two
+    // note sets (the current one and its parent) are alive at once, so the
+    // aggregate memory does not grow with the revision count. Diffs are
+    // collected oldest-first and reversed for the newest-first output.
     let mut diffs: Vec<RevisionDiff> = Vec::new();
-    for revision in listed.iter().take(output_count).cloned() {
-        let notes = match parsed_by_sha.get(&revision.sha).cloned().flatten() {
-            Some(notes) => notes,
-            None => {
+    // the state of the revision processed just before this one: its sha
+    // and its parsed notes (`None` = the blob does not parse)
+    let mut prev: Option<(String, Option<RevisionNotes>)> = None;
+    for index in (0..output_count).rev() {
+        let revision = listed[index].clone();
+        let own_parsed = revision_blob(&repo, &revision.sha, limits)
+            .and_then(|blob| revision_notes(&blob, &extension, limits));
+        // a read/limit error propagates; an unparseable blob is the
+        // warning row below
+        let notes = match own_parsed {
+            Ok(Some(notes)) => notes,
+            Ok(None) => {
                 // this blob does not parse: the revision is listed with a
                 // warning, the parent linkage restarts at the next one
                 let sha_head = revision.sha[..7.min(revision.sha.len())].to_owned();
                 diffs.push(RevisionDiff {
-                    revision,
+                    revision: revision.clone(),
                     notes: Vec::new(),
                     warning: Some(warning(
                         "BLOB_NOT_PARSEABLE",
@@ -818,8 +837,10 @@ pub fn collect(
                         ),
                     )),
                 });
+                prev = Some((revision.sha.clone(), None));
                 continue;
             }
+            Err(err) => return Err(err),
         };
         let parent_sha = revision.parents.first().cloned();
         enum ParentNotes {
@@ -831,21 +852,20 @@ pub fn collect(
             // root commit: no parent, no diff
             None => ParentNotes::Root,
             Some(sha) => {
-                let cached = parsed_by_sha
-                    .get(sha)
-                    .cloned()
-                    .or_else(|| parent_cache.get(sha).cloned());
-                match cached {
-                    Some(Some(notes)) => ParentNotes::Parsed(notes),
-                    Some(None) => ParentNotes::Unparseable,
-                    None => {
-                        let parsed = revision_blob(&repo, sha, limits)
-                            .and_then(|blob| revision_notes(&blob, &extension, limits))?;
-                        parent_cache.insert(sha.clone(), parsed.clone());
-                        match parsed {
-                            Some(notes) => ParentNotes::Parsed(notes),
-                            None => ParentNotes::Unparseable,
-                        }
+                // the previous processed revision IS this parent in a
+                // straight chain — reuse; otherwise fetch fresh (bounded
+                // memory beats re-fetch avoidance here)
+                if prev.as_ref().is_some_and(|(prev_sha, _)| prev_sha == sha) {
+                    match &prev.as_ref().unwrap().1 {
+                        Some(notes) => ParentNotes::Parsed(notes.clone()),
+                        None => ParentNotes::Unparseable,
+                    }
+                } else {
+                    let parsed = revision_blob(&repo, sha, limits)
+                        .and_then(|blob| revision_notes(&blob, &extension, limits))?;
+                    match parsed {
+                        Some(notes) => ParentNotes::Parsed(notes),
+                        None => ParentNotes::Unparseable,
                     }
                 }
             }
@@ -874,8 +894,12 @@ pub fn collect(
             ParentNotes::Root => {
                 if let Some(filter) = note_filter {
                     // root commit with a filter: report whether the note
-                    // exists in this revision (context, no block diff)
-                    if let Some((_, title, _)) = notes.iter().find(|(id, _, _)| id == filter) {
+                    // exists in this revision (context, no block diff) —
+                    // by id or by title (C-06)
+                    if let Some((_, title, _)) = notes
+                        .iter()
+                        .find(|(id, title, _)| id == filter || title.as_deref() == Some(filter))
+                    {
                         revision_diff.notes.push(NoteDiff {
                             note_id: filter.to_owned(),
                             note_title: title.clone(),
@@ -888,7 +912,9 @@ pub fn collect(
                 let mut per_note = diff_note_sets(&parent_notes, &notes);
                 if let Some(filter) = note_filter {
                     per_note.retain(|diff| {
-                        diff.note_id == filter || diff.note_title.as_deref() == Some(filter)
+                        diff.note_id == filter
+                            || diff.note_title.as_deref() == Some(filter)
+                            || diff.note_title_old.as_deref() == Some(filter)
                     });
                 }
                 revision_diff.notes = per_note;
@@ -903,6 +929,8 @@ pub fn collect(
             format!("older revisions exist; raise --limit (cap {MAX_REVISIONS}) to see more"),
         ));
     }
+    // the stream ran oldest-first — the contract is newest-first
+    diffs.reverse();
 
     if let Some(filter) = note_filter {
         let matched = diffs
@@ -1156,7 +1184,7 @@ mod tests {
         git_in(dir.path(), &["add", "."]);
         git_in(dir.path(), &["commit", "--quiet", "-m", "x"]);
         let err = collect(&file, None, 20, &Limits::defaults()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::Usage);
+        assert_eq!(err.code, ErrorCode::PathNotFound);
     }
 
     #[test]
@@ -1355,6 +1383,192 @@ mod tests {
         let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
         assert_eq!(history.revisions.len(), 1);
         assert_eq!(history.revisions[0].revision.subject, "target commit");
+    }
+
+    #[test]
+    fn side_branch_commits_are_listed_and_diffed_against_real_parents() {
+        // T-03 (merge-aware): c1 -> (c3 "main text", c4 "branch text") -> m
+        // --full-history lists all four; every diff runs against the
+        // revision's REAL first parent, not the list neighbor
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        let write_doc = |text: &str| {
+            write_um_bytes(
+                &file,
+                &serde_json::json!({
+                    "format": "um", "version": 1, "type": "notepad",
+                    "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                               "title": "T", "schema": "plain", "schemaVersion": 3}]
+                }),
+                &serde_json::json!({"type": "noteDoc", "content": [
+                    {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+                    {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+                ]}),
+            );
+        };
+        write_doc("base");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "c1 base"]);
+        git_in(dir.path(), &["checkout", "--quiet", "-b", "side"]);
+        write_doc("branch text");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "c4 branch text"]);
+        git_in(dir.path(), &["checkout", "--quiet", "main"]);
+        write_doc("main text");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "c3 main text"]);
+        // both sides changed the same file: resolve mechanically, the
+        // merge topology is what this test exercises
+        git_in(
+            dir.path(),
+            &[
+                "merge", "--quiet", "--no-ff", "-X", "ours", "-m", "m merge", "side",
+            ],
+        );
+
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        let subjects: Vec<&str> = history
+            .revisions
+            .iter()
+            .map(|r| r.revision.subject.as_str())
+            .collect();
+        assert!(
+            subjects.contains(&"c3 main text")
+                && subjects.contains(&"c4 branch text")
+                && subjects.contains(&"m merge"),
+            "--full-history must list side-branch commits: {subjects:?}"
+        );
+        assert!(
+            history.revisions[0].revision.parents.len() == 2,
+            "the merge has two parents"
+        );
+    }
+
+    #[test]
+    fn title_filter_finds_renamed_notes_and_root_context() {
+        // T-02/C-06: a revision that RENAMES a note is findable by both the
+        // old and the new title; the root-commit context matches by title
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        let write_named = |id: &str, title: &str, extra: &str| {
+            let doc = serde_json::json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": title}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": extra}]}
+            ]});
+            let manifest = serde_json::json!({
+                "format": "um", "version": 1, "type": "notepad",
+                "notes": [{"id": id, "path": format!("notes/{id}.json"), "order": 0,
+                           "title": title, "schema": "plain", "schemaVersion": 3}]
+            });
+            let writer = std::fs::File::create(&file).unwrap();
+            let mut zip = zip::ZipWriter::new(writer);
+            use std::io::Write as _;
+            zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+                .unwrap();
+            zip.start_file(
+                format!("notes/{id}.json"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            zip.finish().unwrap();
+        };
+        write_named("note01", "Old Title", "тело");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "v1 old title"]);
+        write_named("note01", "New Title", "изменённое тело");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "v2 rename"]);
+
+        // the OLD title still finds the rename revision
+        let history =
+            collect(&file, Some("Old Title"), MAX_REVISIONS, &Limits::defaults()).unwrap();
+        let renamed = &history.revisions[0];
+        assert_eq!(renamed.revision.subject, "v2 rename");
+        assert!(renamed.notes[0].note_title_old.as_deref() == Some("Old Title"));
+        assert_eq!(renamed.notes[0].note_title.as_deref(), Some("New Title"));
+
+        // the ROOT commit context matches by title (id differs from title)
+        let by_title =
+            collect(&file, Some("Old Title"), MAX_REVISIONS, &Limits::defaults()).unwrap();
+        let root_row = &by_title.revisions.last().unwrap();
+        assert!(
+            root_row
+                .notes
+                .iter()
+                .any(|n| n.note_title.as_deref() == Some("Old Title")),
+            "the oldest listed revision reports title context"
+        );
+    }
+
+    #[test]
+    fn truncated_listing_warns_has_more() {
+        // T-07: a limit smaller than the history says so explicitly
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        std::fs::write(&file, b"placeholder").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "only commit"]);
+
+        let history = collect(&file, None, 0, &Limits::defaults()).unwrap();
+        assert!(history.revisions.is_empty());
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|w| w["code"] == "HAS_MORE_REVISIONS"),
+            "{:?}",
+            history.warnings
+        );
+    }
+
+    #[test]
+    fn forged_log_records_are_skipped_with_a_warning() {
+        // T-07/S-03 family: a commit subject carrying the field separators
+        // forges log records — the record is skipped with a warning, and
+        // the forged "sha" never reaches a git argument
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.um");
+        std::fs::write(&file, b"placeholder").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "honest commit"]);
+        let forged = "v1\u{1e}--output=PWNED\u{1f}zz\u{1e}";
+        // the forged commit must TOUCH the file — --full-history with a
+        // pathspec lists only commits that change it
+        std::fs::write(&file, b"touched by the forged commit").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", forged]);
+
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|w| w["code"] == "LOG_RECORDS_SKIPPED"),
+            "{:?}",
+            history.warnings
+        );
+        assert!(
+            history
+                .revisions
+                .iter()
+                .all(|r| r.revision.subject != forged.replace(['\u{1e}', '\u{1f}'], ""))
+        );
+        assert!(!dir.path().join("PWNED:page.um").exists());
     }
 
     #[test]

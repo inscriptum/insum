@@ -604,3 +604,29 @@ fn validate_degrades_a_non_compilable_artifact_to_structural() {
     assert_eq!(strict_value["files"][0]["valid"], false);
     assert_eq!(strict_value["valid"], false);
 }
+
+#[test]
+fn annotated_format_rejects_max_bytes() {
+    // T-08: the refusal is explicit (USAGE), never a silent ignore
+    let dir = tempfile::tempdir().unwrap();
+    let um = fixture_um(dir.path());
+    let output = insum()
+        .arg("history")
+        .arg(&um)
+        .arg("--format")
+        .arg("annotated")
+        .arg("--max-bytes")
+        .arg("5000")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["code"], "USAGE");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("annotated")
+    );
+}

@@ -318,14 +318,17 @@ fn parse_expr_atom(
         }
     };
     let indices = resolve_name(&name, type_index, groups)?;
-    // PM: the whole expression must not mix inline and block content
-    let first_inline = stream.type_inline[indices[0]];
-    match inline {
-        None => *inline = Some(first_inline),
-        Some(current) if *current != first_inline => {
-            return Err("Mixing inline and block content".to_owned());
+    // PM: the whole expression must not mix inline and block content —
+    // EVERY group member is checked, not just the first (C-05)
+    for &idx in &indices {
+        let member_inline = stream.type_inline[idx];
+        match inline {
+            None => *inline = Some(member_inline),
+            Some(current) if *current != member_inline => {
+                return Err("Mixing inline and block content".to_owned());
+            }
+            _ => {}
         }
-        _ => {}
     }
     stream.pos += 1;
     Ok(if indices.len() == 1 {
@@ -832,45 +835,38 @@ impl PmSchema {
 
         // Attributes: `create` computes from the spec — unknown input keys
         // are dropped silently (warning), a required attribute missing from
-        // the JSON throws (error). Explicit `null` counts as given.
-        match map.get("attrs") {
-            Some(Value::Object(attrs)) => {
-                for (key, _) in attrs {
-                    if !node_type.attrs.iter().any(|(name, _)| name == key) {
-                        out.warnings.push(Diag {
-                            code: "SCHEMA_ATTR_UNKNOWN",
-                            message: format!(
-                                "attr {key:?} on node type {type_name:?} is not declared in the applicable schema artifact (the editor drops it)"
-                            ),
-                        });
-                    }
-                }
-                for (name, has_default) in &node_type.attrs {
-                    if !has_default && !attrs.contains_key(name) {
-                        out.errors.push(Diag {
-                            code: "ATTR_REQUIRED",
-                            message: format!(
-                                "no value supplied for required attribute {name:?} of node type {type_name:?}"
-                            ),
-                        });
-                    }
+        // a PRESENT attrs object throws (error). Verified against PM
+        // 1.25.12 computeAttrs (schema.ts): `create(undefined)` defaults
+        // attrs to null and `null && value[name]` yields null, which is
+        // NOT undefined — so ABSENT attrs never throw, the required
+        // attribute just ends up null; only attrs:{} (or a partial object)
+        // leaves `given` undefined and throws.
+        if let Some(Value::Object(attrs)) = map.get("attrs") {
+            for (key, _) in attrs {
+                if !node_type.attrs.iter().any(|(name, _)| name == key) {
+                    out.warnings.push(Diag {
+                        code: "SCHEMA_ATTR_UNKNOWN",
+                        message: format!(
+                            "attr {key:?} on node type {type_name:?} is not declared in the applicable schema artifact (the editor drops it)"
+                        ),
+                    });
                 }
             }
-            // attrs absent entirely: PM computeAttrs receives null —
-            // required attributes still throw
-            _ => {
-                for (name, has_default) in &node_type.attrs {
-                    if !has_default {
-                        out.errors.push(Diag {
-                            code: "ATTR_REQUIRED",
-                            message: format!(
-                                "no value supplied for required attribute {name:?} of node type {type_name:?}"
-                            ),
-                        });
-                    }
+            for (name, has_default) in &node_type.attrs {
+                if !has_default && !attrs.contains_key(name) {
+                    out.errors.push(Diag {
+                        code: "ATTR_REQUIRED",
+                        message: format!(
+                            "no value supplied for required attribute {name:?} of node type {type_name:?}"
+                        ),
+                    });
                 }
             }
         }
+        // attrs absent entirely: PM receives null — the required
+        // attribute resolves to null without an error. Marks are
+        // different (markFromJSON passes the raw json.attrs through,
+        // undefined stays undefined) — handled in check_marks.
 
         // Text nodes: `schema.text` ignores attrs entirely, requires a
         // non-empty string, and has no content of its own.
