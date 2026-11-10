@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use insum_core::container::peek_um_manifest;
+use insum_core::container::{argument_stat_error, peek_um_manifest};
 use insum_core::{ErrorCode, Limits, NoteFile, UmContainer, UmError};
 
 use crate::support::{error_value, hidden_below, mtime_iso, render_path};
@@ -17,19 +17,7 @@ pub fn run(path: Option<String>, hidden: bool, limits: &Limits) -> Result<Value,
     let path = PathBuf::from(path.unwrap_or_else(|| ".".to_owned()));
     // the explicit argument is opened directly (even a symlink); traversal
     // inside directories still never follows symlinks
-    let metadata = std::fs::metadata(&path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            UmError::new(
-                ErrorCode::PathNotFound,
-                format!("path not found: {}", path.display()),
-            )
-        } else {
-            UmError::new(
-                ErrorCode::IoError,
-                format!("cannot stat {}: {err}", path.display()),
-            )
-        }
-    })?;
+    let metadata = std::fs::metadata(&path).map_err(|err| argument_stat_error(&path, &err))?;
 
     if metadata.is_dir() {
         list_directory(&path, hidden, limits)

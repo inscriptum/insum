@@ -19,7 +19,7 @@ use insum_core::pmschema::PmSchema;
 use insum_core::schema::{ResolvedSchema, SchemaSource, resolve};
 use insum_core::{Limits, UmError};
 
-use crate::support::{Revs, collect_files, read_notes, render_path};
+use crate::support::{Revs, collect_files, error_value, read_notes, render_path};
 
 pub fn run(
     paths: &[PathBuf],
@@ -120,10 +120,7 @@ pub fn run(
                     "valid": false,
                     "validation_level": "structural",
                     "notes": [],
-                    "errors": [{
-                        "code": err.code.as_str(),
-                        "message": err.message,
-                    }],
+                    "errors": [error_value(&err)],
                     "warnings": [],
                 }));
             }

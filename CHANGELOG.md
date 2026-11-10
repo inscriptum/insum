@@ -7,6 +7,19 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `READ_TORN` error code (exit 4): an absent, empty, or cut-off `.um`
+  container (and an absent or empty `.note`) answers a single speaking
+  diagnosis from every reading command (`ls`, `tree`, `block get`, `read`,
+  `search`, `validate`) with a machine-readable `cause`
+  (`absent`/`empty`/`truncated`) and a retry hint, instead of the
+  misleading `NOTE_NOT_FOUND` (or a bare `NOT_A_ZIP`) the non-atomic
+  rewrites of um-build produced. A `.note` with torn JSON content still
+  answers `NOTE_JSON_INVALID` — a JSON document has no signature to detect
+  truncation. `history` is intentionally exempt: it reads git, not the
+  live container bytes, and keeps its reviewed absent-path contract.
+  `search`/`validate` fold the new code into their existing per-file
+  `skipped`/`files[]` entries; error entries in those reports now carry
+  `details` too.
 - Differential TS×Rust corpus (§4.8): a TypeScript harness builds a real
   prosemirror-model Schema from the artifact and records its verdicts for
   122 documents (valid compositions, targeted mutations, unknown types,
