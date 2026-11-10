@@ -144,6 +144,9 @@ value (ids, titles, types, texts, paths, git metadata) is escaped through
 the same boundary function before interpolation.
 `insum history` reads the git history of the repository containing the
 file — read-only: the working tree, the index and HEAD are never touched;
+a file deleted from the working copy (including `rm -r` together with its
+directory) is still served from git, with a
+`FILE_ABSENT_IN_WORKING_COPY` warning;
 revision blobs come from `git show <sha>:<path>`, and the git environment
 is scrubbed of `GIT_*` variables so an inherited `GIT_DIR` cannot redirect
 the read. The git binary must be in PATH (CI runners and agent machines
@@ -163,9 +166,11 @@ error), `HAS_MORE_REVISIONS` (older revisions exist beyond `--limit`),
 `LOG_RECORDS_SKIPPED` (a malformed git record — object names that are not
 hex — was ignored), `BLOB_NOT_PARSEABLE` / `PARENT_BLOB_NOT_PARSEABLE`
 (a revision or its parent is not a parseable .um/.note — its diff is not
-judged), `NOTE_NOT_FOUND_IN_HISTORY` (the `--note` filter matched no
-revision — check the id or exact title), `OUTPUT_BUDGET` (the oldest
-revisions were dropped to fit the budget). `--limit` bounds the revision count (default 20, cap 200); the
+judged), `FILE_ABSENT_IN_REVISION` (the revision deleted the file — the
+diff against its parent shows the content removed),
+`NOTE_NOT_FOUND_IN_HISTORY` (the `--note` filter matched no revision —
+check the id or exact title), `OUTPUT_BUDGET` (the oldest revisions were
+dropped to fit the budget). `--limit` bounds the revision count (default 20, cap 200); the
 output budget never truncates silently — the oldest revisions are dropped
 with `complete: false`, `revisions_dropped` and an `OUTPUT_BUDGET`
 warning, and a single revision that cannot fit is a `LIMIT_EXCEEDED`

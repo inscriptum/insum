@@ -230,16 +230,42 @@ struct RepoLocation {
 
 /// Locate the repository and the file path inside it; `Ok(None)` — the
 /// file is not inside a work tree (the caller answers with a warning).
+/// The file is resolved against the current directory BEFORE any
+/// decomposition (G-01 — a bare name from a repo subdirectory belongs to
+/// that subdirectory), and git probes run from the nearest EXISTING
+/// ancestor directory (G-02 — the file or its directory may be deleted
+/// together with the directory); the peeled components are re-attached to
+/// the probe directory's position inside the repository.
 fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
-    let dir = if file.is_dir() {
-        file
+    let file = std::path::absolute(file).map_err(UmError::from)?;
+
+    // walk up to the nearest existing directory, remembering what was
+    // peeled (deepest first)
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = file.clone();
+    while !probe.is_dir() {
+        match (probe.file_name(), probe.parent()) {
+            (Some(name), Some(parent)) if !name.is_empty() => {
+                tail.push(name.to_os_string());
+                probe = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    let probe_dir = if probe.is_dir() {
+        probe.clone()
     } else {
-        file.parent().unwrap_or(Path::new("."))
+        // the filesystem root: no existing ancestor found
+        probe
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| probe.clone())
     };
+
     // inside a work tree? `rev-parse --is-inside-work-tree` answers
     // "true"/"false" with exit 0 (bare → false) and fails outside any
     // repository — every non-"true" outcome means "no vault" here
-    let inside = match git(dir, &["rev-parse", "--is-inside-work-tree"]) {
+    let inside = match git(&probe_dir, &["rev-parse", "--is-inside-work-tree"]) {
         Ok(out) => out,
         // a git-level failure means "no work tree" — expected outcome; a
         // spawn failure (git missing from PATH) is a real IO error and
@@ -250,35 +276,31 @@ fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
     if String::from_utf8_lossy(&inside).trim() != "true" {
         return Ok(None);
     }
-    let root_bytes = git(dir, &["rev-parse", "--show-toplevel"])?;
+    let root_bytes = git(&probe_dir, &["rev-parse", "--show-toplevel"])?;
     let root_text = String::from_utf8_lossy(&root_bytes).trim().to_owned();
     let root = PathBuf::from(root_text);
-    // an absent (deleted) file cannot be canonicalized itself —
-    // canonicalize its parent directory (which exists) and keep the file
-    // name; this also resolves symlinked prefixes (/var → /private/var)
+
+    // the probe directory exists — canonicalizing it resolves symlinked
+    // prefixes (/var → /private/var)
+    let probe_canonical = probe_dir.canonicalize().map_err(UmError::from)?;
     let canonical_root = root.canonicalize().map_err(UmError::from)?;
-    let file_name = file
-        .file_name()
-        .ok_or_else(|| UmError::new(ErrorCode::IoError, "path has no file name".to_owned()))?;
-    let parent = file
-        .parent()
-        .ok_or_else(|| UmError::new(ErrorCode::IoError, "path has no parent".to_owned()))?;
-    let canonical_parent = if parent.exists() {
-        parent.canonicalize().map_err(UmError::from)?
-    } else {
-        root.canonicalize().map_err(UmError::from)?
-    };
-    let full_path = canonical_parent.join(file_name);
-    let relative = full_path.strip_prefix(&canonical_root).map_err(|_| {
-        UmError::new(
-            ErrorCode::IoError,
-            format!(
-                "file {} is outside the repository at {}",
-                full_path.display(),
-                canonical_root.display()
-            ),
-        )
-    })?;
+    let mut relative = probe_canonical
+        .strip_prefix(&canonical_root)
+        .map_err(|_| {
+            UmError::new(
+                ErrorCode::IoError,
+                format!(
+                    "file {} is outside the repository at {}",
+                    file.display(),
+                    canonical_root.display()
+                ),
+            )
+        })?
+        .to_path_buf();
+    // re-attach the peeled components (stored deepest first)
+    for name in tail.iter().rev() {
+        relative = relative.join(name);
+    }
     let file_in_repo = relative
         .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -353,39 +375,11 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<(Vec<Revision>, u
 /// failure (F-01 — "path not in that tree" must never surface as
 /// IO_ERROR from `git show`).
 fn path_in_tree(repo: &RepoLocation, sha: &str) -> Result<bool, UmError> {
-    let object = format!("{sha}:{}", repo.file_in_repo);
-    let mut child = git_command(&repo.root, &["cat-file", "-e", &object])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                UmError::new(
-                    ErrorCode::IoError,
-                    "git binary not found in PATH".to_owned(),
-                )
-                .with_hint(
-                    "insum history reads the git history of the file; install git or add it to PATH.",
-                )
-            } else {
-                UmError::from(err)
-            }
-        })?;
-    let status = child.wait().map_err(UmError::from)?;
-    match status.code() {
-        Some(0) => Ok(true),
-        // 1 = object missing; 128 = the rev:path combination does not
-        // resolve ("path does not exist in <sha>"). The sha is already
-        // hex-validated, so both safely mean "absent from that tree"
-        Some(1) | Some(128) => Ok(false),
-        _ => Err(UmError::new(
-            ErrorCode::IoError,
-            format!(
-                "git cat-file -e {object} failed (exit {})",
-                status.code().unwrap_or(-1)
-            ),
-        )),
-    }
+    // G-07: `git ls-tree` exits 0 with EMPTY output when the path is
+    // absent from the tree and fails only on repository-level problems —
+    // the "path absent" and "repo fatal" cases are cleanly separated
+    let out = git(&repo.root, &["ls-tree", sha, "--", &repo.file_in_repo])?;
+    Ok(!out.is_empty())
 }
 
 /// Extract the blob of one revision: `git show <sha>:<path>`. The stream
@@ -823,7 +817,16 @@ pub fn collect(
     // one extra revision gives the oldest listed one its real parent
     // an unborn HEAD (no commits yet) is an empty history, not an error:
     // probe cheaply before streaming the log
-    if git(&repo.root, &["rev-parse", "--verify", "HEAD"]).is_err() {
+    let head_probe = git(&repo.root, &["rev-parse", "--verify", "HEAD"]);
+    if file_absent && head_probe.is_err() {
+        // G-03: an absent path in a repository with no commits never
+        // existed — PATH_NOT_FOUND, not a soft empty history
+        return Err(UmError::new(
+            ErrorCode::PathNotFound,
+            format!("path not found: {}", file.display()),
+        ));
+    }
+    if head_probe.is_err() {
         warnings.push(warning(
             "NO_GIT_HISTORY",
             format!(
@@ -840,6 +843,16 @@ pub fn collect(
         });
     }
     let (listed, skipped) = list_revisions(&repo, limit + 1)?;
+    if file_absent && listed.is_empty() {
+        // G-03: no commit ever touched this path — it never existed
+        return Err(UmError::new(
+            ErrorCode::PathNotFound,
+            format!(
+                "path not found: {} (no commit touches this path)",
+                file.display()
+            ),
+        ));
+    }
     if skipped > 0 {
         warnings.push(warning(
             "LOG_RECORDS_SKIPPED",
@@ -880,20 +893,28 @@ pub fn collect(
         let revision = listed[index].clone();
         let sha = revision.sha.clone();
         // the path may be absent from this revision's tree entirely (a
-        // deleting revision) — that is empty content, not an error (F-01
-        // site 2); the diff against the parent then shows removals
-        let own_present = path_in_tree(&repo, &sha)?;
-        let own_parsed = if own_present {
-            revision_blob(&repo, &sha, limits)
-                .and_then(|blob| revision_notes(&blob, &extension, limits))
-        } else {
-            Ok(Some(Vec::new()))
+        // deleting revision, F-01 site 2) — that is empty content and the
+        // diff against the parent shows removals. `git show` is tried
+        // FIRST (the common case is one spawn per revision, G-06); only
+        // its failure triggers the absent probe to tell "deleting
+        // revision" from a real failure
+        let own_parsed = match revision_blob(&repo, &sha, limits)
+            .and_then(|blob| revision_notes(&blob, &extension, limits))
+        {
+            Ok(parsed) => Some(parsed),
+            Err(show_err) => {
+                if path_in_tree(&repo, &sha)? {
+                    // the path exists in this tree: the failure is real
+                    return Err(show_err);
+                }
+                // absent: empty content with an explicit marker
+                None
+            }
         };
-        // a read/limit error propagates; an unparseable blob is the
-        // warning row below
+        let mut deleted_here = false;
         let notes = match own_parsed {
-            Ok(Some(notes)) => notes,
-            Ok(None) => {
+            Some(Some(notes)) => notes,
+            Some(None) => {
                 // this blob does not parse: the revision is listed with a
                 // warning, the parent linkage restarts at the next one
                 let sha_head = sha[..7.min(sha.len())].to_owned();
@@ -911,8 +932,12 @@ pub fn collect(
                 prev = Some((revision.sha.clone(), None));
                 continue;
             }
-            Err(err) => return Err(err),
+            None => {
+                deleted_here = true;
+                Vec::new()
+            }
         };
+        let _ = deleted_here;
         let parent_sha = revision.parents.first().cloned();
         enum ParentNotes {
             Root,
@@ -937,8 +962,20 @@ pub fn collect(
                 } else if !path_in_tree(&repo, sha)? {
                     ParentNotes::Parsed(Vec::new())
                 } else {
-                    let parsed = revision_blob(&repo, sha, limits)
-                        .and_then(|blob| revision_notes(&blob, &extension, limits))?;
+                    // try the blob first (the common case, G-06); on
+                    // failure the probe tells a parent tree without the
+                    // path (added later / via a second parent — F-01
+                    // sites 1 and 3: empty parent, everything added)
+                    // from a real failure
+                    let parsed = match revision_blob(&repo, sha, limits) {
+                        Ok(blob) => revision_notes(&blob, &extension, limits)?,
+                        Err(show_err) => {
+                            if path_in_tree(&repo, sha)? {
+                                return Err(show_err);
+                            }
+                            Some(Vec::new())
+                        }
+                    };
                     match parsed {
                         Some(notes) => ParentNotes::Parsed(notes),
                         None => ParentNotes::Unparseable,
@@ -951,6 +988,15 @@ pub fn collect(
             notes: Vec::new(),
             warning: None,
         };
+        if deleted_here {
+            revision_diff.warning = Some(warning(
+                "FILE_ABSENT_IN_REVISION",
+                format!(
+                    "revision {} does not contain the file (a deleting revision); the diff against its parent shows the content removed",
+                    &sha[..7.min(sha.len())]
+                ),
+            ));
+        }
         match parent {
             // the parent blob does not parse: this revision's diff is not
             // judged — said explicitly, never silently
@@ -1033,7 +1079,7 @@ pub fn collect(
             .iter()
             .any(|revision_diff| revision_diff.notes.iter().any(|note| !note.is_empty()))
             || diffs.is_empty();
-        if !matched && warnings.is_empty() {
+        if !matched {
             // the filter matched nothing anywhere: say so explicitly
             warnings.push(warning(
                 "NOTE_NOT_FOUND_IN_HISTORY",
@@ -1574,6 +1620,43 @@ mod tests {
         git_in(dir.path(), &["commit", "--quiet", "-m", "delete page"]);
 
         // the file is gone, but the history is still answerable
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert_eq!(history.revisions.len(), 2);
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|w| w["code"] == "FILE_ABSENT_IN_WORKING_COPY"),
+            "{:?}",
+            history.warnings
+        );
+    }
+
+    #[test]
+    fn file_deleted_with_its_directory_is_served() {
+        // G-02: rm -r of the directory is the most common deletion shape;
+        // the git probe must run from the nearest EXISTING ancestor
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let sub = dir.path().join("doomed");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("doomed.note");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "create doomed"]);
+        std::fs::remove_dir_all(&sub).unwrap();
+        git_in(dir.path(), &["add", "--all"]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "rm -r doomed"]);
+
         let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
         assert_eq!(history.revisions.len(), 2);
         assert!(

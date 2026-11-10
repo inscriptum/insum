@@ -563,3 +563,75 @@ fn git_output(dir: &Path, args: &[&str]) -> String {
         .unwrap();
     String::from_utf8(output.stdout).unwrap()
 }
+
+#[test]
+fn history_bare_filename_from_subdirectory_resolves_against_cwd() {
+    // G-01: `cd sub; insum history page.um` belongs to sub/, not the repo
+    // root — the round-3 regression silently returned an empty or foreign
+    // history. A `..`-prefixed variant resolves the same way
+    let dir = tempfile::tempdir().unwrap();
+    git_in(dir.path(), &["init", "--quiet"]);
+    git_in(dir.path(), &["config", "user.email", "test@insum"]);
+    git_in(dir.path(), &["config", "user.name", "insum test"]);
+    // a DIFFERENT file at the repo root: the regression would return its
+    // history silently
+    std::fs::write(dir.path().join("root.um"), b"placeholder").unwrap();
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "root.um commit"]);
+    // the target file lives in sub/, two commits of its own
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let manifest = json!({
+        "format": "um", "version": 1, "type": "notepad",
+        "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                   "title": "T", "schema": "plain", "schemaVersion": 3}]
+    });
+    let write_doc = |para: &str| {
+        let doc = json!({"type": "noteDoc", "content": [
+            {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": para}]}
+        ]});
+        let writer = std::fs::File::create(sub.join("page.um")).unwrap();
+        let mut zip = zip::ZipWriter::new(writer);
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        zip.start_file("notes/note01.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        zip.finish().unwrap();
+    };
+    write_doc("v1");
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "sub v1"]);
+    write_doc("v2");
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "sub v2"]);
+
+    // bare name from INSIDE the subdirectory
+    let output = insum()
+        .arg("history")
+        .arg("page.um")
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["file_in_repo"], "sub/page.um");
+    assert_eq!(value["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        value["revisions"][0]["subject"], "sub v2",
+        "the sub file's own history, not the root file's"
+    );
+
+    // ..-prefixed variant resolves identically
+    let output = insum()
+        .arg("history")
+        .arg("../sub/page.um")
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["file_in_repo"], "sub/page.um");
+}
