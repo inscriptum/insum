@@ -7,6 +7,12 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- Search attribution invariant pinned: repeated stress runs over a
+  multi-note corpus (heavy text sharing, `--note` filter, `.um`+`.note`
+  mix) verify every match resolves `block get` by its own `note_id` and
+  `pointer`; manifest-faithful attribution (including the foreign
+  descriptor-path data class) is pinned by test — audit outcome for the
+  cli-feedback `search-note-attribution-flake` report.
 - `READ_TORN` error code (exit 4): an absent, empty, or cut-off `.um`
   container (and an absent or empty `.note`) answers a single speaking
   diagnosis from every reading command (`ls`, `tree`, `block get`, `read`,
