@@ -353,8 +353,8 @@ fn read_manifest_value(
         )
     })?;
     // capacity is bounded: the declared entry size is attacker-controlled
-    let mut text = String::with_capacity(entry.size().min(1 << 20) as usize);
-    entry.read_to_string(&mut text).map_err(|err| {
+    let mut bytes = Vec::with_capacity(entry.size().min(1 << 20) as usize);
+    entry.read_to_end(&mut bytes).map_err(|err| {
         // decompression stopped mid-stream: the archive was cut off between
         // the central directory (parsed fine) and this entry's payload
         torn_error(
@@ -363,6 +363,8 @@ fn read_manifest_value(
             format!("manifest.json cannot be decompressed: {err}"),
         )
     })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| UmError::new(ErrorCode::ManifestInvalid, "manifest is not UTF-8"))?;
     parse_json_limited(&text, limits.max_depth, ErrorCode::ManifestInvalid)
 }
 
@@ -476,6 +478,36 @@ fn path_error(path: &Path, err: std::io::Error) -> UmError {
         UmError::new(
             ErrorCode::IoError,
             format!("cannot read {}: {err}", path.display()),
+        )
+    }
+}
+
+/// Classify a `stat` failure of a CLI path argument. An absent `.um`/`.note`
+/// is the same transient writer window the container readers report
+/// (READ_TORN, cause `absent`); anything else keeps the plain path
+/// diagnosis. Readers deliberately do NOT consult sidecar locks
+/// (`insum_core::lock`): today no writer creates them (um-build is
+/// non-cooperative, `apply` is a later stage), a live lease does not make
+/// the on-disk state unreadable, and READ_TORN detection covers the
+/// millisecond commit window — see lock-protocol.um and the task Result.
+pub fn argument_stat_error(path: &Path, err: &std::io::Error) -> UmError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        if classify_extension(path).is_some() {
+            torn_error(
+                "absent",
+                path,
+                "container file is absent (possibly being rewritten)".to_owned(),
+            )
+        } else {
+            UmError::new(
+                ErrorCode::PathNotFound,
+                format!("path not found: {}", path.display()),
+            )
+        }
+    } else {
+        UmError::new(
+            ErrorCode::IoError,
+            format!("cannot stat {}: {err}", path.display()),
         )
     }
 }
@@ -632,17 +664,24 @@ mod tests {
     use super::*;
     use insum_test_utils::{FixtureNote, ulid_seq, write_legacy_note, write_um};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn fixture() -> (PathBuf, Vec<u8>) {
+    /// Wall-clock ticks repeat on this platform granularity — tests running
+    /// in parallel need a collision-free scratch directory name.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "insum-torn-{}-{}",
+            "insum-torn-{}-{}-{}",
+            tag,
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fixture() -> (PathBuf, Vec<u8>) {
+        let dir = scratch_dir("fixture");
         let path = dir.join("fixture.um");
         write_um(
             &path,
@@ -737,8 +776,7 @@ mod tests {
 
     #[test]
     fn absent_and_empty_report_read_torn() {
-        let dir = std::env::temp_dir().join(format!("insum-torn-absent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("absent");
         let limits = Limits::defaults();
 
         let absent = dir.join("missing.um");
@@ -781,8 +819,7 @@ mod tests {
     /// swallow the "wrong file type" diagnosis.
     #[test]
     fn not_a_zip_is_preserved() {
-        let dir = std::env::temp_dir().join(format!("insum-torn-notzip-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("notzip");
         let path = dir.join("texty.um");
         std::fs::write(
             &path,
@@ -793,6 +830,42 @@ mod tests {
         let err = UmContainer::open(&path, &limits).map(|_| ()).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAZip);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A manifest that is valid ZIP but not UTF-8 keeps MANIFEST_INVALID —
+    /// READ_TORN must stay scoped to container-integrity failures, not
+    /// swallow the content diagnosis (a permanent error must not advise a
+    /// retry).
+    #[test]
+    fn manifest_encoding_error_is_preserved() {
+        let (path, bytes) = fixture();
+        // corrupt inside the manifest payload: find its local header and
+        // flip bytes of the stored (deflate) stream — decompression may
+        // still succeed; the honest check is a valid zip with a non-UTF-8
+        // manifest entry, so build one directly
+        let dir = path.parent().unwrap().to_path_buf();
+        let bad = dir.join("bad-manifest.um");
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&bad).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .last_modified_time(zip::DateTime::default());
+            writer.start_file("manifest.json", options).unwrap();
+            writer
+                .write_all(&[0x7B, 0x22, 0x66, 0xFF, 0xFE, 0x22, 0x3A, 0x31, 0x7D])
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let limits = Limits::defaults();
+        let err = UmContainer::open(&bad, &limits).map(|_| ()).unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::ManifestInvalid,
+            "not READ_TORN: {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = bytes;
     }
 
     /// A valid container still opens and its note payload still parses —
@@ -811,8 +884,7 @@ mod tests {
     /// container-integrity classes move to READ_TORN.
     #[test]
     fn note_encoding_error_is_preserved() {
-        let dir = std::env::temp_dir().join(format!("insum-torn-noteutf-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("noteutf");
         let path = dir.join("bad.note");
         std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
         let limits = Limits::defaults();

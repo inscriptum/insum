@@ -56,7 +56,7 @@ fn assert_search_skipped_torn(path: &str, cause: &str) {
 
 /// `validate` reports per-file failures inside `files[]` entries (§6.6) —
 /// the torn file shows up with the READ_TORN code and `valid: false`.
-fn assert_validate_reports_torn(path: &str) {
+fn assert_validate_reports_torn(path: &str, cause: &str) {
     // validate's exit code stays 0 unless the run itself fails — the
     // validity signal is `valid: false` plus the per-file error entry
     let output = insum().args(["validate", path]).output().unwrap();
@@ -66,6 +66,8 @@ fn assert_validate_reports_torn(path: &str) {
     let files = value["files"].as_array().expect("files is a list");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["errors"][0]["code"], "READ_TORN");
+    assert_eq!(files[0]["errors"][0]["details"]["cause"], cause);
+    assert!(files[0]["errors"][0]["hint"].is_string());
 }
 
 struct Fixture {
@@ -152,7 +154,7 @@ fn empty_um_answers_read_torn_for_every_reader() {
     }
     // existing-but-broken files ride the best-effort paths (§11)
     assert_search_skipped_torn(&path, "empty");
-    assert_validate_reports_torn(&path);
+    assert_validate_reports_torn(&path, "empty");
 }
 
 #[test]
@@ -168,7 +170,7 @@ fn truncated_um_answers_read_torn_for_every_reader() {
             assert_torn(&args, "truncated");
         }
         assert_search_skipped_torn(&path, "truncated");
-        assert_validate_reports_torn(&path);
+        assert_validate_reports_torn(&path, "truncated");
     }
 }
 
@@ -201,33 +203,55 @@ fn absent_directory_stays_path_not_found() {
 }
 
 /// history reads git, not the live container bytes: a torn working file
-/// never surfaces as NOTE_NOT_FOUND (its absent-path contract is the
-/// reviewed G-03 behavior and stays).
+/// serves its (empty, non-git) history like any untracked file — no
+/// container-integrity error, and never NOTE_NOT_FOUND. The absent path
+/// keeps the reviewed G-03 contract (PATH_NOT_FOUND, no git evidence).
 #[test]
 fn history_never_answers_note_not_found_on_torn_or_absent() {
     let fixture = Fixture::new("history");
     let torn = fixture.rewrite(&fixture.bytes[..fixture.bytes.len() / 2]);
     let output = insum().args(["history", &torn]).output().unwrap();
-    if let Some(stderr) = if output.stderr.is_empty() {
-        None
-    } else {
-        Some(output.stderr.clone())
-    } {
-        let value: Value = serde_json::from_slice(&stderr).unwrap();
-        assert_ne!(value["error"]["code"], "NOTE_NOT_FOUND");
-        assert_ne!(value["error"]["code"], "NOTE_FILE_MISSING");
-    }
+    assert!(
+        output.status.success(),
+        "a torn working file does not block history: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["revisions"].as_array().map(Vec::len), Some(0));
+    assert!(
+        value["warnings"]
+            .as_array()
+            .expect("warnings is a list")
+            .iter()
+            .any(|w| w["code"] == "NO_GIT_REPOSITORY"),
+        "non-git directory explains the empty history"
+    );
     let absent = fixture
         .dir
         .join("missing.um")
         .to_string_lossy()
         .into_owned();
     let output = insum().args(["history", &absent]).output().unwrap();
-    if output.stderr.is_empty() {
-        return; // soft empty history (git repo context) is fine
-    }
-    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_ne!(value["error"]["code"], "NOTE_NOT_FOUND");
+    assert_eq!(output.status.code(), Some(3), "G-03: absent path exits 3");
+    assert_eq!(stderr_code(&output), "PATH_NOT_FOUND");
+}
+
+/// A `.note` is not a container: torn JSON content answers NOTE_JSON_INVALID
+/// (truncation of a JSON document is undetectable from a signature). Empty
+/// and absent .note files are covered above; this pins the content-error
+/// class so the READ_TORN scope stays explicit.
+#[test]
+fn torn_note_content_answers_note_json_invalid() {
+    let fixture = Fixture::new("notejson");
+    let torn = fixture.dir.join("torn.note");
+    fs::write(&torn, b"{\"type\":\"noteDoc\",\"con").unwrap();
+    let output = insum()
+        .arg("read")
+        .arg(torn.to_string_lossy().into_owned())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(stderr_code(&output), "NOTE_JSON_INVALID");
 }
 
 /// Control: the same commands succeed on the intact container.

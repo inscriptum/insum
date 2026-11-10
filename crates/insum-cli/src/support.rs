@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use serde_json::{Value, json};
 
-use insum_core::container::classify_extension;
+use insum_core::container::{argument_stat_error, classify_extension};
 use insum_core::model::note_title;
 use insum_core::{ErrorCode, Limits, NoteDescriptor, NoteFile, UmContainer, UmError};
 
@@ -83,29 +83,7 @@ pub fn collect_files(
     let mut walk_errors = Vec::new();
     for path in paths {
         // follow symlinks for the argument itself (ls parity)
-        let metadata = std::fs::metadata(path).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                if classify_extension(path).is_some() {
-                    // an absent .um/.note argument is the same transient
-                    // writer window the container readers report
-                    insum_core::container::torn_error(
-                        "absent",
-                        path,
-                        "container file is absent (possibly being rewritten)".to_owned(),
-                    )
-                } else {
-                    UmError::new(
-                        ErrorCode::PathNotFound,
-                        format!("path not found: {}", path.display()),
-                    )
-                }
-            } else {
-                UmError::new(
-                    ErrorCode::IoError,
-                    format!("cannot stat {}: {err}", path.display()),
-                )
-            }
-        })?;
+        let metadata = std::fs::metadata(path).map_err(|err| argument_stat_error(path, &err))?;
         // resolve once so WalkDir does not see a symlink root
         let walk_root: PathBuf = if metadata.is_dir() {
             std::fs::canonicalize(path)?
