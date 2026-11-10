@@ -898,46 +898,51 @@ pub fn collect(
         // FIRST (the common case is one spawn per revision, G-06); only
         // its failure triggers the absent probe to tell "deleting
         // revision" from a real failure
-        let own_parsed = match revision_blob(&repo, &sha, limits)
-            .and_then(|blob| revision_notes(&blob, &extension, limits))
-        {
-            Ok(parsed) => Some(parsed),
-            Err(show_err) => {
-                if path_in_tree(&repo, &sha)? {
-                    // the path exists in this tree: the failure is real
-                    return Err(show_err);
-                }
-                // absent: empty content with an explicit marker
-                None
-            }
-        };
+        // H-01: for a path with glob metacharacters ([ ] ? *) git show
+        // may exit 0 with UNRELATED content when the path is absent from
+        // the tree — so the literal ls-tree probe is the authority on
+        // presence, and it is consulted whenever the blob is empty or
+        // unparseable. Its verdict wins over any show symptom.
+        // H-01: for a path with glob metacharacters ([ ] ? *) git show
+        // may exit 0 with UNRELATED content when the path is absent from
+        // the tree — so the literal ls-tree probe is the authority on
+        // presence and is consulted whenever the blob is empty or
+        // unparseable. Its verdict wins over any show symptom.
+        let own_present = path_in_tree(&repo, &sha)?;
         let mut deleted_here = false;
-        let notes = match own_parsed {
-            Some(Some(notes)) => notes,
-            Some(None) => {
-                // this blob does not parse: the revision is listed with a
-                // warning, the parent linkage restarts at the next one
-                let sha_head = sha[..7.min(sha.len())].to_owned();
-                diffs.push(RevisionDiff {
-                    revision: revision.clone(),
-                    notes: Vec::new(),
-                    warning: Some(warning(
-                        "BLOB_NOT_PARSEABLE",
-                        format!(
-                            "revision {sha_head} does not parse as a {} file; its diff is not judged",
-                            if extension == "note" { ".note" } else { ".um" }
-                        ),
-                    )),
-                });
-                prev = Some((revision.sha.clone(), None));
-                continue;
-            }
-            None => {
-                deleted_here = true;
-                Vec::new()
+        let notes = if !own_present {
+            // absent from this tree (a deleting revision): empty content —
+            // the diff against the parent shows the content removed
+            deleted_here = true;
+            Vec::new()
+        } else {
+            match revision_blob(&repo, &sha, limits)
+                .and_then(|blob| revision_notes(&blob, &extension, limits))
+            {
+                Ok(Some(notes)) => notes,
+                // the path EXISTS in this tree but the blob does not
+                // parse: the revision is listed with a warning, the
+                // parent linkage restarts at the next one
+                Ok(None) => {
+                    let sha_head = sha[..7.min(sha.len())].to_owned();
+                    diffs.push(RevisionDiff {
+                        revision: revision.clone(),
+                        notes: Vec::new(),
+                        warning: Some(warning(
+                            "BLOB_NOT_PARSEABLE",
+                            format!(
+                                "revision {sha_head} does not parse as a {} file; its diff is not judged",
+                                if extension == "note" { ".note" } else { ".um" }
+                            ),
+                        )),
+                    });
+                    prev = Some((revision.sha.clone(), None));
+                    continue;
+                }
+                // the probe said present but show failed: a real error
+                Err(show_err) => return Err(show_err),
             }
         };
-        let _ = deleted_here;
         let parent_sha = revision.parents.first().cloned();
         enum ParentNotes {
             Root,
@@ -1667,6 +1672,84 @@ mod tests {
             "{:?}",
             history.warnings
         );
+    }
+
+    #[test]
+    fn absent_path_never_committed_is_path_not_found() {
+        // H-02/G-03: an absent working-copy path that NO commit ever
+        // touched is PATH_NOT_FOUND — "deleted" and "never existed" are
+        // distinguishable again
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        // a repo with commits, but none touching ghost.note
+        std::fs::write(dir.path().join("other.txt"), b"x").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "no ghost"]);
+        let err = collect(
+            &dir.path().join("ghost.note"),
+            None,
+            MAX_REVISIONS,
+            &Limits::defaults(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PathNotFound);
+        assert!(err.message.contains("no commit touches this path"));
+    }
+
+    #[test]
+    fn absent_path_in_a_repo_without_commits_is_path_not_found() {
+        // H-02/G-03 second branch: unborn HEAD + absent path
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        let err = collect(
+            &dir.path().join("ghost.note"),
+            None,
+            MAX_REVISIONS,
+            &Limits::defaults(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PathNotFound);
+    }
+
+    #[test]
+    fn note_filter_miss_is_not_suppressed_by_other_warnings() {
+        // H-03/G-05: a --note miss on a deleted-file history must carry
+        // NOTE_NOT_FOUND_IN_HISTORY even though FILE_ABSENT_IN_WORKING_COPY
+        // is already present
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.note");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "create page"]);
+        std::fs::remove_file(&file).unwrap();
+        git_in(dir.path(), &["add", "--all"]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "delete page"]);
+
+        let history = collect(
+            &file,
+            Some("NoSuchNote"),
+            MAX_REVISIONS,
+            &Limits::defaults(),
+        )
+        .unwrap();
+        let codes: Vec<&str> = history
+            .warnings
+            .iter()
+            .map(|w| w["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"NOTE_NOT_FOUND_IN_HISTORY"), "{codes:?}");
     }
 
     #[test]

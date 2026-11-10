@@ -139,14 +139,12 @@ data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 ## History (git-backed)
 
 `insum history` reads the git history of the repository containing the
-file; its annotated projection is forge-proof — every document-controlled
-value (ids, titles, types, texts, paths, git metadata) is escaped through
-the same boundary function before interpolation.
-`insum history` reads the git history of the repository containing the
 file — read-only: the working tree, the index and HEAD are never touched;
-a file deleted from the working copy (including `rm -r` together with its
-directory) is still served from git, with a
-`FILE_ABSENT_IN_WORKING_COPY` warning;
+its annotated projection is forge-proof (every document-controlled value
+— ids, titles, types, texts, paths, git metadata — is escaped through the
+same boundary function before interpolation); a file deleted from the
+working copy (including `rm -r` together with its directory) is still
+served from git, with a `FILE_ABSENT_IN_WORKING_COPY` warning;
 revision blobs come from `git show <sha>:<path>`, and the git environment
 is scrubbed of `GIT_*` variables so an inherited `GIT_DIR` cannot redirect
 the read. The git binary must be in PATH (CI runners and agent machines
