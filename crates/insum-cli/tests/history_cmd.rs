@@ -428,6 +428,9 @@ fn history_annotated_escapes_forged_block_ids() {
         .unwrap();
     zip.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
     zip.finish().unwrap();
+    // F-02: commit the forged content so it actually reaches the renderer
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "forged attrs.id"]);
 
     let output = insum()
         .arg("history")
@@ -439,9 +442,20 @@ fn history_annotated_escapes_forged_block_ids() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
+    // no output line may START with the forged revision-line prefix
+    // (an unescaped \n would create exactly such a line)
+    let forged_line = text
+        .lines()
+        .find(|line| line.starts_with("@deadbe7 2026-01-01T00:00:00Z forged"));
     assert!(
-        !text.contains("@deadbe7 2026-01-01T00:00:00Z forged"),
-        "the forged attrs.id must not render a fake revision line: {text}"
+        forged_line.is_none(),
+        "forged line boundary: {forged_line:?}"
+    );
+    // the escaped value must appear inline — the renderer processed it
+    assert!(
+        text.lines()
+            .any(|line| line.contains("@deadbe7 2026-01-01T00:00:00Z forged")),
+        "the forged id should appear escaped inline: {text}"
     );
 }
 
@@ -509,6 +523,10 @@ fn history_annotated_escapes_document_controlled_values() {
         .unwrap();
     zip.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
     zip.finish().unwrap();
+    // F-02: the forged content MUST be committed — history reads blobs,
+    // and an uncommitted overwrite never reaches the renderer
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "forged content"]);
 
     let output = insum()
         .arg("history")
@@ -520,13 +538,19 @@ fn history_annotated_escapes_document_controlled_values() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
+    // no output line may start with a forged revision-line prefix
+    let forged_line = text
+        .lines()
+        .find(|line| line.starts_with("FORGED-LINE") || line.starts_with("@deadbeef"));
     assert!(
-        !text.contains("\nFORGED-LINE"),
-        "a document value must not create an output line: {text}"
+        forged_line.is_none(),
+        "forged line boundary: {forged_line:?}"
     );
+    // and the escaped value must appear INLINE — proving the renderer
+    // actually processed it through the boundary function
     assert!(
-        !text.contains("@deadbeef"),
-        "the forged revision line must be neutralized: {text}"
+        text.lines().any(|line| line.contains("FORGED-LINE")),
+        "the forged value should appear escaped inline: {text}"
     );
 }
 

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::{ErrorCode, UmError};
 use crate::limits::Limits;
@@ -253,14 +253,28 @@ fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
     let root_bytes = git(dir, &["rev-parse", "--show-toplevel"])?;
     let root_text = String::from_utf8_lossy(&root_bytes).trim().to_owned();
     let root = PathBuf::from(root_text);
-    let canonical_file = file.canonicalize().map_err(UmError::from)?;
+    // an absent (deleted) file cannot be canonicalized itself —
+    // canonicalize its parent directory (which exists) and keep the file
+    // name; this also resolves symlinked prefixes (/var → /private/var)
     let canonical_root = root.canonicalize().map_err(UmError::from)?;
-    let relative = canonical_file.strip_prefix(&canonical_root).map_err(|_| {
+    let file_name = file
+        .file_name()
+        .ok_or_else(|| UmError::new(ErrorCode::IoError, "path has no file name".to_owned()))?;
+    let parent = file
+        .parent()
+        .ok_or_else(|| UmError::new(ErrorCode::IoError, "path has no parent".to_owned()))?;
+    let canonical_parent = if parent.exists() {
+        parent.canonicalize().map_err(UmError::from)?
+    } else {
+        root.canonicalize().map_err(UmError::from)?
+    };
+    let full_path = canonical_parent.join(file_name);
+    let relative = full_path.strip_prefix(&canonical_root).map_err(|_| {
         UmError::new(
             ErrorCode::IoError,
             format!(
                 "file {} is outside the repository at {}",
-                canonical_file.display(),
+                full_path.display(),
                 canonical_root.display()
             ),
         )
@@ -332,6 +346,46 @@ fn list_revisions(repo: &RepoLocation, limit: usize) -> Result<(Vec<Revision>, u
         });
     }
     Ok((revisions, skipped))
+}
+
+/// Does `<sha>:<path>` exist in the git object database? `git cat-file
+/// -e` exits 0 for present, 1 for absent; any other exit is a real
+/// failure (F-01 — "path not in that tree" must never surface as
+/// IO_ERROR from `git show`).
+fn path_in_tree(repo: &RepoLocation, sha: &str) -> Result<bool, UmError> {
+    let object = format!("{sha}:{}", repo.file_in_repo);
+    let mut child = git_command(&repo.root, &["cat-file", "-e", &object])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                UmError::new(
+                    ErrorCode::IoError,
+                    "git binary not found in PATH".to_owned(),
+                )
+                .with_hint(
+                    "insum history reads the git history of the file; install git or add it to PATH.",
+                )
+            } else {
+                UmError::from(err)
+            }
+        })?;
+    let status = child.wait().map_err(UmError::from)?;
+    match status.code() {
+        Some(0) => Ok(true),
+        // 1 = object missing; 128 = the rev:path combination does not
+        // resolve ("path does not exist in <sha>"). The sha is already
+        // hex-validated, so both safely mean "absent from that tree"
+        Some(1) | Some(128) => Ok(false),
+        _ => Err(UmError::new(
+            ErrorCode::IoError,
+            format!(
+                "git cat-file -e {object} failed (exit {})",
+                status.code().unwrap_or(-1)
+            ),
+        )),
+    }
 }
 
 /// Extract the blob of one revision: `git show <sha>:<path>`. The stream
@@ -719,12 +773,11 @@ pub fn collect(
     limit: usize,
     limits: &Limits,
 ) -> Result<History, UmError> {
-    if !file.exists() {
-        return Err(UmError::new(
-            ErrorCode::PathNotFound,
-            format!("path not found: {}", file.display()),
-        ));
-    }
+    // A file missing from the working copy may still have history (a
+    // deleted or renamed-away file): the git check happens after repo
+    // location — PATH_NOT_FOUND is answered only when git has nothing
+    // either (F-01 adjacent gap).
+    let file_absent = !file.exists();
     let limit = limit.min(MAX_REVISIONS);
     let extension = file
         .extension()
@@ -745,6 +798,12 @@ pub fn collect(
     }
 
     let Some(repo) = locate_repo(file)? else {
+        if file_absent {
+            return Err(UmError::new(
+                ErrorCode::PathNotFound,
+                format!("path not found: {}", file.display()),
+            ));
+        }
         return Ok(History {
             repo_root: String::new(),
             file_in_repo: String::new(),
@@ -820,8 +879,16 @@ pub fn collect(
     for index in (0..output_count).rev() {
         let revision = listed[index].clone();
         let sha = revision.sha.clone();
-        let own_parsed = revision_blob(&repo, &revision.sha, limits)
-            .and_then(|blob| revision_notes(&blob, &extension, limits));
+        // the path may be absent from this revision's tree entirely (a
+        // deleting revision) — that is empty content, not an error (F-01
+        // site 2); the diff against the parent then shows removals
+        let own_present = path_in_tree(&repo, &sha)?;
+        let own_parsed = if own_present {
+            revision_blob(&repo, &sha, limits)
+                .and_then(|blob| revision_notes(&blob, &extension, limits))
+        } else {
+            Ok(Some(Vec::new()))
+        };
         // a read/limit error propagates; an unparseable blob is the
         // warning row below
         let notes = match own_parsed {
@@ -858,12 +925,17 @@ pub fn collect(
             Some(sha) => {
                 // the previous processed revision IS this parent in a
                 // straight chain — reuse; otherwise fetch fresh (bounded
-                // memory beats re-fetch avoidance here)
+                // memory beats re-fetch avoidance here). A parent whose
+                // tree lacks the path (the file was added after it, or it
+                // arrived via a merge's second parent) is an empty parent:
+                // the diff shows everything added (F-01 sites 1 and 3)
                 if prev.as_ref().is_some_and(|(prev_sha, _)| prev_sha == sha) {
                     match &prev.as_ref().unwrap().1 {
                         Some(notes) => ParentNotes::Parsed(notes.clone()),
                         None => ParentNotes::Unparseable,
                     }
+                } else if !path_in_tree(&repo, sha)? {
+                    ParentNotes::Parsed(Vec::new())
                 } else {
                     let parsed = revision_blob(&repo, sha, limits)
                         .and_then(|blob| revision_notes(&blob, &extension, limits))?;
@@ -934,6 +1006,19 @@ pub fn collect(
         diffs.push(revision_diff);
     }
 
+    if file_absent
+        && !warnings
+            .iter()
+            .any(|w| w["code"] == json!("NO_GIT_HISTORY"))
+    {
+        warnings.push(warning(
+            "FILE_ABSENT_IN_WORKING_COPY",
+            format!(
+                "{} is missing from the working copy; the history below is from git",
+                file.display()
+            ),
+        ));
+    }
     if listed_count > limit {
         warnings.push(warning(
             "HAS_MORE_REVISIONS",
@@ -1341,6 +1426,163 @@ mod tests {
                 .get_envs()
                 .any(|(key, _)| key.to_string_lossy().to_ascii_uppercase() == "PATH"),
             "PATH must survive the scrub"
+        );
+    }
+
+    #[test]
+    fn file_added_after_the_root_commit_has_full_history() {
+        // F-01 site 1: the file is absent from the root commit's tree —
+        // the parent blob fetch must not surface as IO_ERROR; the diff
+        // shows everything added
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        // base commit with a DIFFERENT file
+        std::fs::write(dir.path().join("other.txt"), b"base").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(
+            dir.path(),
+            &["commit", "--quiet", "-m", "base without page"],
+        );
+        // "add page" in the second commit
+        let file = dir.path().join("page.note");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "add page"]);
+
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert_eq!(history.revisions.len(), 1);
+        assert_eq!(history.revisions[0].revision.subject, "add page");
+        assert!(history.revisions[0].warning.is_none());
+    }
+
+    #[test]
+    fn deleting_revision_shows_removals_not_io_error() {
+        // F-01 site 2: the revision that DELETES the file has no blob for
+        // it — the diff shows the notes removed, the command survives
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.note");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "create page"]);
+        std::fs::remove_file(&file).unwrap();
+        git_in(dir.path(), &["add", "--all"]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "delete page"]);
+
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert_eq!(history.revisions.len(), 2);
+        let delete_row = &history.revisions[0];
+        assert_eq!(delete_row.revision.subject, "delete page");
+        assert!(
+            delete_row.notes.iter().any(|n| n.removed),
+            "the deletion shows as removed notes: {:?}",
+            delete_row
+        );
+    }
+
+    #[test]
+    fn merge_bringing_the_file_from_second_parent_works() {
+        // F-01 site 3: the file arrives via a merge whose FIRST parent
+        // does not have it
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        // main: no page.um at all
+        std::fs::write(dir.path().join("readme.txt"), b"x").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "main base"]);
+        // side branch adds page.um
+        git_in(dir.path(), &["checkout", "--quiet", "-b", "side"]);
+        write_um_bytes(
+            &dir.path().join("page.um"),
+            &json!({"format": "um", "version": 1, "type": "notepad",
+                    "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                               "title": "T", "schema": "plain", "schemaVersion": 3}]}),
+            &json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}),
+        );
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "side adds page"]);
+        // merge into main (first parent = main without the file)
+        git_in(dir.path(), &["checkout", "--quiet", "main"]);
+        git_in(
+            dir.path(),
+            &[
+                "merge", "--quiet", "--no-ff", "-X", "ours", "-m", "m", "side",
+            ],
+        );
+
+        let history = collect(
+            &dir.path().join("page.um"),
+            None,
+            MAX_REVISIONS,
+            &Limits::defaults(),
+        )
+        .unwrap();
+        let subjects: Vec<&str> = history
+            .revisions
+            .iter()
+            .map(|r| r.revision.subject.as_str())
+            .collect();
+        assert!(
+            subjects.contains(&"side adds page") && subjects.contains(&"m"),
+            "{subjects:?}"
+        );
+    }
+
+    #[test]
+    fn deleted_file_history_is_served_with_a_warning() {
+        // F-01 adjacent gap: a file missing from the working copy but
+        // present in git history is served with FILE_ABSENT_IN_WORKING_COPY
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "--quiet"]);
+        git_in(dir.path(), &["config", "user.email", "test@insum"]);
+        git_in(dir.path(), &["config", "user.name", "insum test"]);
+        let file = dir.path().join("page.note");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"type": "noteDoc", "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "create page"]);
+        std::fs::remove_file(&file).unwrap();
+        git_in(dir.path(), &["add", "--all"]);
+        git_in(dir.path(), &["commit", "--quiet", "-m", "delete page"]);
+
+        // the file is gone, but the history is still answerable
+        let history = collect(&file, None, MAX_REVISIONS, &Limits::defaults()).unwrap();
+        assert_eq!(history.revisions.len(), 2);
+        assert!(
+            history
+                .warnings
+                .iter()
+                .any(|w| w["code"] == "FILE_ABSENT_IN_WORKING_COPY"),
+            "{:?}",
+            history.warnings
         );
     }
 

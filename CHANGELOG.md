@@ -27,11 +27,6 @@ Format — Keep a Changelog; versioning — SemVer.
   markdown link.
 - New limit `UM_MAX_SCHEMA_BYTES` (default 1 MiB) caps schema artifact
   files loaded by `insum schema` and `insum validate`.
-- `wikiLink` is a known node: no unknown-type warnings, its label
-  participates in text and search, annotated reading renders it as a
-  markdown link.
-- New limit `UM_MAX_SCHEMA_BYTES` (default 1 MiB) caps schema artifact
-  files loaded by `insum schema` and `insum validate`.
 - Lock/dirty-lease protocol prototype (§9.2) in `insum-core`: hidden
   sidecar files (`.<name>.insum-lock`, `.<name>.insum-lease`) next to the
   target, atomic create-new acquisition, wait/timeout with `WRITE_LOCKED`,
