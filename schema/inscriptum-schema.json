@@ -1,0 +1,950 @@
+{
+  "schema_id": "inscriptum",
+  "schema_version": 1,
+  "schema_hash": "sha256:05ee561d1c02d6441863ba1e9bdcd42e456a6f963f7871aee3b1b72b08dbee96",
+  "schema_hash_scope": "sha256 of the RFC 8785 canonical JSON of this artifact, excluding the schema_hash and plugin_version fields (plugin_version changes every release and must not destabilize the schema fingerprint)",
+  "plugin_version": "0.14.1",
+  "top_node": "noteDoc",
+  "validation_capability": "partial",
+  "validation_limits": [
+    "The noteDoc content expression recorded here is the title-family rule (title, optional properties, then blocks); it also accepts note-family documents. Legacy plain-family pages without a title node are outside this rule.",
+    "Document families (note, title, plain) and their versions are application semantics and are not represented in this artifact; the schema_hash covers the shared node/mark inventory of the title profile, which is a superset.",
+    "Attribute value types are not constrained by the ProseMirror schema; only presence, defaults and PM validate rules (none today) are recorded.",
+    "Constraints enforced by editor code outside the schema (attachment keys assigned at creation, image/attachment asset state, comment thread ids) are not represented.",
+    "validation_capability stays 'partial' until the differential corpus (insum spec §4.8) proves parity with prosemirror-model."
+  ],
+  "id_rules": {
+    "attrs_key": "id",
+    "dom_attribute": "data-id",
+    "pattern": "^[a-z0-9]{8,12}$",
+    "recommended_length": 10,
+    "uniqueness": "note",
+    "encoding": "opaque"
+  },
+  "nodes": {
+    "attachment": {
+      "content": null,
+      "groups": [
+        "noteDoc"
+      ],
+      "attrs": {
+        "data": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        },
+        "key": {
+          "default": null
+        },
+        "state": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "attachment",
+        "attrs": {
+          "id": null,
+          "state": null,
+          "data": null
+        }
+      }
+    },
+    "blockquote": {
+      "content": "block+",
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "blockquote",
+        "attrs": {
+          "id": null
+        },
+        "content": [
+          {
+            "type": "paragraph",
+            "attrs": {
+              "id": null,
+              "align": null
+            }
+          }
+        ]
+      }
+    },
+    "bulletList": {
+      "content": "listItem+",
+      "groups": [
+        "block",
+        "list"
+      ],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "bulletList",
+        "attrs": {
+          "id": null
+        },
+        "content": [
+          {
+            "type": "listItem",
+            "attrs": {
+              "id": null
+            },
+            "content": [
+              {
+                "type": "paragraph",
+                "attrs": {
+                  "id": null,
+                  "align": null
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "hardBreak": {
+      "content": null,
+      "groups": [
+        "inline"
+      ],
+      "attrs": {},
+      "marks": [],
+      "addressable": false,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "hardBreak"
+      }
+    },
+    "heading": {
+      "content": "inline*",
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "align": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        },
+        "level": {
+          "default": 1
+        }
+      },
+      "marks": [
+        "bold",
+        "code",
+        "comment",
+        "highlight",
+        "hljsMark",
+        "italic",
+        "link",
+        "strike",
+        "textStyle",
+        "underline"
+      ],
+      "addressable": true,
+      "inline_content": true,
+      "searchable": true,
+      "example": {
+        "type": "heading",
+        "attrs": {
+          "id": null,
+          "align": null,
+          "level": 1
+        }
+      }
+    },
+    "hljsCodeBlock": {
+      "content": "(hljsCodeBlockRow | paragraph?)+",
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "autocapitalize": {
+          "default": "off"
+        },
+        "autocomplete": {
+          "default": "off"
+        },
+        "autocorrect": {
+          "default": "off"
+        },
+        "class": {
+          "default": ""
+        },
+        "id": {
+          "default": null
+        },
+        "spellcheck": {
+          "default": "false"
+        },
+        "wrap": {
+          "default": false
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "hljsCodeBlock",
+        "attrs": {
+          "id": null,
+          "autocomplete": "off",
+          "autocorrect": "off",
+          "autocapitalize": "off",
+          "spellcheck": "false",
+          "class": "",
+          "wrap": false
+        }
+      }
+    },
+    "hljsCodeBlockRow": {
+      "content": "inline*",
+      "groups": [
+        "hljsCodeBlock"
+      ],
+      "attrs": {
+        "class": {
+          "default": "l"
+        },
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [
+        "hljsMark"
+      ],
+      "addressable": true,
+      "inline_content": true,
+      "searchable": true,
+      "example": {
+        "type": "hljsCodeBlockRow",
+        "attrs": {
+          "id": null,
+          "class": "l"
+        }
+      }
+    },
+    "horizontalRule": {
+      "content": null,
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "horizontalRule",
+        "attrs": {
+          "id": null
+        }
+      }
+    },
+    "image": {
+      "content": null,
+      "groups": [
+        "noteDoc"
+      ],
+      "attrs": {
+        "align": {
+          "default": "left"
+        },
+        "data": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        },
+        "key": {
+          "default": null
+        },
+        "state": {
+          "default": null
+        },
+        "width": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "image",
+        "attrs": {
+          "key": null,
+          "id": null,
+          "state": null,
+          "align": "left",
+          "width": null,
+          "data": null
+        }
+      }
+    },
+    "listItem": {
+      "content": "paragraph block*",
+      "groups": [],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "listItem",
+        "attrs": {
+          "id": null
+        },
+        "content": [
+          {
+            "type": "paragraph",
+            "attrs": {
+              "id": null,
+              "align": null
+            }
+          }
+        ]
+      }
+    },
+    "mermaid": {
+      "content": null,
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "align": {
+          "default": "left"
+        },
+        "code": {
+          "default": ""
+        },
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "mermaid",
+        "attrs": {
+          "id": null,
+          "code": "",
+          "align": "left"
+        }
+      }
+    },
+    "noteDoc": {
+      "content": "noteTitle noteProperty* (block | attachment | image)+",
+      "groups": [],
+      "top_node": true,
+      "attrs": {},
+      "marks": [],
+      "addressable": false,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "noteDoc",
+        "content": [
+          {
+            "type": "noteTitle",
+            "attrs": {
+              "id": null
+            }
+          },
+          {
+            "type": "paragraph",
+            "attrs": {
+              "id": null,
+              "align": null
+            }
+          }
+        ]
+      }
+    },
+    "noteProperty": {
+      "content": "notePropertyName notePropertyValue*",
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "id": {
+          "default": null
+        },
+        "type": {
+          "default": "text"
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "noteProperty",
+        "attrs": {
+          "id": null,
+          "type": "text"
+        },
+        "content": [
+          {
+            "type": "notePropertyName",
+            "attrs": {
+              "id": null
+            }
+          }
+        ]
+      }
+    },
+    "notePropertyName": {
+      "content": "inline*",
+      "groups": [],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [
+        "bold",
+        "code",
+        "comment",
+        "highlight",
+        "hljsMark",
+        "italic",
+        "link",
+        "strike",
+        "textStyle",
+        "underline"
+      ],
+      "addressable": true,
+      "inline_content": true,
+      "searchable": true,
+      "example": {
+        "type": "notePropertyName",
+        "attrs": {
+          "id": null
+        }
+      }
+    },
+    "notePropertyValue": {
+      "content": "inline*",
+      "groups": [],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [
+        "bold",
+        "code",
+        "comment",
+        "highlight",
+        "hljsMark",
+        "italic",
+        "link",
+        "strike",
+        "textStyle",
+        "underline"
+      ],
+      "addressable": true,
+      "inline_content": true,
+      "searchable": true,
+      "example": {
+        "type": "notePropertyValue",
+        "attrs": {
+          "id": null
+        }
+      }
+    },
+    "noteTitle": {
+      "content": "inline*",
+      "groups": [],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [
+        "bold",
+        "code",
+        "comment",
+        "highlight",
+        "hljsMark",
+        "italic",
+        "link",
+        "strike",
+        "textStyle",
+        "underline"
+      ],
+      "addressable": true,
+      "inline_content": true,
+      "searchable": true,
+      "example": {
+        "type": "noteTitle",
+        "attrs": {
+          "id": null
+        }
+      }
+    },
+    "orderedList": {
+      "content": "listItem+",
+      "groups": [
+        "block",
+        "list"
+      ],
+      "attrs": {
+        "id": {
+          "default": null
+        },
+        "start": {
+          "default": 1
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "orderedList",
+        "attrs": {
+          "id": null,
+          "start": 1
+        },
+        "content": [
+          {
+            "type": "listItem",
+            "attrs": {
+              "id": null
+            },
+            "content": [
+              {
+                "type": "paragraph",
+                "attrs": {
+                  "id": null,
+                  "align": null
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "paragraph": {
+      "content": "inline*",
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "align": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [
+        "bold",
+        "code",
+        "comment",
+        "highlight",
+        "hljsMark",
+        "italic",
+        "link",
+        "strike",
+        "textStyle",
+        "underline"
+      ],
+      "addressable": true,
+      "inline_content": true,
+      "searchable": true,
+      "example": {
+        "type": "paragraph",
+        "attrs": {
+          "id": null,
+          "align": null
+        }
+      }
+    },
+    "table": {
+      "content": "tableRow+",
+      "groups": [
+        "block"
+      ],
+      "attrs": {
+        "borders": {
+          "default": null
+        },
+        "data": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "table",
+        "attrs": {
+          "id": null,
+          "data": null,
+          "borders": null
+        },
+        "content": [
+          {
+            "type": "tableRow",
+            "attrs": {
+              "id": null
+            }
+          }
+        ]
+      }
+    },
+    "tableCell": {
+      "content": "(block | image)+",
+      "groups": [],
+      "attrs": {
+        "backgroundColor": {
+          "default": null
+        },
+        "borders": {
+          "default": null
+        },
+        "colspan": {
+          "default": 1
+        },
+        "colwidth": {
+          "default": [
+            50
+          ]
+        },
+        "dataColor": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        },
+        "rowspan": {
+          "default": 1
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "tableCell",
+        "attrs": {
+          "id": null,
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+            50
+          ],
+          "dataColor": null,
+          "backgroundColor": null,
+          "borders": null
+        },
+        "content": [
+          {
+            "type": "paragraph",
+            "attrs": {
+              "id": null,
+              "align": null
+            }
+          }
+        ]
+      }
+    },
+    "tableHeader": {
+      "content": "(block | image)+",
+      "groups": [],
+      "attrs": {
+        "backgroundColor": {
+          "default": null
+        },
+        "borders": {
+          "default": null
+        },
+        "colspan": {
+          "default": 1
+        },
+        "colwidth": {
+          "default": [
+            50
+          ]
+        },
+        "dataColor": {
+          "default": null
+        },
+        "id": {
+          "default": null
+        },
+        "rowspan": {
+          "default": 1
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "tableHeader",
+        "attrs": {
+          "id": null,
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+            50
+          ],
+          "dataColor": null,
+          "backgroundColor": null,
+          "borders": null
+        },
+        "content": [
+          {
+            "type": "paragraph",
+            "attrs": {
+              "id": null,
+              "align": null
+            }
+          }
+        ]
+      }
+    },
+    "tableRow": {
+      "content": "(tableCell | tableHeader)*",
+      "groups": [],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "tableRow",
+        "attrs": {
+          "id": null
+        }
+      }
+    },
+    "taskItem": {
+      "content": "paragraph block*",
+      "groups": [],
+      "attrs": {
+        "checked": {
+          "default": false
+        },
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "taskItem",
+        "attrs": {
+          "id": null,
+          "checked": false
+        },
+        "content": [
+          {
+            "type": "paragraph",
+            "attrs": {
+              "id": null,
+              "align": null
+            }
+          }
+        ]
+      }
+    },
+    "taskList": {
+      "content": "taskItem+",
+      "groups": [
+        "block",
+        "list"
+      ],
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      },
+      "marks": [],
+      "addressable": true,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "taskList",
+        "attrs": {
+          "id": null
+        },
+        "content": [
+          {
+            "type": "taskItem",
+            "attrs": {
+              "id": null,
+              "checked": false
+            },
+            "content": [
+              {
+                "type": "paragraph",
+                "attrs": {
+                  "id": null,
+                  "align": null
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "text": {
+      "content": null,
+      "groups": [
+        "inline"
+      ],
+      "attrs": {},
+      "marks": [],
+      "addressable": false,
+      "inline_content": false,
+      "searchable": false,
+      "example": null
+    },
+    "wikiLink": {
+      "content": null,
+      "groups": [
+        "inline"
+      ],
+      "attrs": {
+        "path": {
+          "default": ""
+        },
+        "text": {
+          "default": ""
+        }
+      },
+      "marks": [],
+      "addressable": false,
+      "inline_content": false,
+      "searchable": false,
+      "example": {
+        "type": "wikiLink",
+        "attrs": {
+          "path": "",
+          "text": ""
+        }
+      }
+    }
+  },
+  "marks": {
+    "bold": {
+      "group": null,
+      "attrs": {}
+    },
+    "code": {
+      "group": null,
+      "attrs": {}
+    },
+    "comment": {
+      "group": null,
+      "attrs": {
+        "id": {
+          "default": null
+        }
+      }
+    },
+    "highlight": {
+      "group": null,
+      "attrs": {
+        "color": {
+          "default": null
+        }
+      }
+    },
+    "hljsMark": {
+      "group": "hljsCodeBlock hljsCodeBlockRow",
+      "attrs": {
+        "class": {
+          "default": null
+        }
+      }
+    },
+    "italic": {
+      "group": null,
+      "attrs": {}
+    },
+    "link": {
+      "group": null,
+      "attrs": {
+        "class": {
+          "default": null
+        },
+        "href": {
+          "default": null
+        },
+        "rel": {
+          "default": "noopener noreferrer nofollow"
+        },
+        "target": {
+          "default": "_blank"
+        }
+      }
+    },
+    "strike": {
+      "group": null,
+      "attrs": {}
+    },
+    "textStyle": {
+      "group": null,
+      "attrs": {
+        "color": {
+          "default": null
+        }
+      }
+    },
+    "underline": {
+      "group": null,
+      "attrs": {}
+    }
+  }
+}

@@ -1,8 +1,12 @@
 //! Note validation — structural checks and coded diagnostics.
 //!
 //! Stage A implements Container and Structural JSON checks plus ID checks
-//! for documents marked `features.block_ids`; Schema checks require a schema
-//! artifact and arrive with the schema-cli task.
+//! for documents marked `features.block_ids`. With an applicable schema
+//! artifact (§6.6) the document additionally goes through the
+//! ProseMirror-parity check (`pmschema`): content expressions, mark sets
+//! and attribute semantics as the editor's real schema judges them. The
+//! structural classification of unknown node types (dictionary warnings)
+//! is superseded by the parity result when an artifact applies.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -11,6 +15,7 @@ use crate::UmError;
 use crate::error::ErrorCode;
 use crate::limits::Limits;
 use crate::model::{INLINE_NODE_TYPES, KNOWN_NODE_TYPES};
+use crate::pmschema::PmSchema;
 
 /// A single diagnostic: `code` is a stable registry name, `message` is
 /// human-facing. Severity follows: a rule is either an
@@ -42,10 +47,32 @@ pub fn validate_note_doc(
     block_ids_enabled: bool,
     limits: &Limits,
 ) -> Result<NoteValidation, UmError> {
+    validate_note_doc_with_schema(doc, block_ids_enabled, limits, None)
+}
+
+/// The structural walk plus, when `schema` is `Some`, the
+/// ProseMirror-parity check of the whole document (§6.6 "schema" level).
+/// The parity result supersedes the structural unknown-type warnings.
+pub fn validate_note_doc_with_schema(
+    doc: &Value,
+    block_ids_enabled: bool,
+    limits: &Limits,
+    schema: Option<&PmSchema>,
+) -> Result<NoteValidation, UmError> {
     let mut result = NoteValidation::default();
     walk_structure(doc, 0, limits, &mut result)?;
     if block_ids_enabled {
         validate_block_ids(doc, limits, &mut result);
+    }
+    if let Some(schema) = schema {
+        let parity = schema.check_document(doc);
+        // the parity check judges types against the artifact — drop the
+        // dictionary-based structural warnings it supersedes
+        result
+            .warnings
+            .retain(|warning| warning.code != "UNKNOWN_NODE_TYPE");
+        result.errors.extend(parity.errors);
+        result.warnings.extend(parity.warnings);
     }
     Ok(result)
 }
@@ -72,6 +99,10 @@ fn walk_structure(
 
     match map.get("type") {
         Some(Value::String(node_type)) => {
+            // The observed dictionary is the structural knowledge: unknown
+            // types stay warnings (preserved as-is). With an applicable
+            // artifact the parity check classifies them properly and these
+            // warnings are superseded (dropped there).
             if !KNOWN_NODE_TYPES.contains(&node_type.as_str())
                 && !INLINE_NODE_TYPES.contains(&node_type.as_str())
             {
@@ -91,13 +122,21 @@ fn walk_structure(
         }),
     }
 
-    if map.get("type").and_then(Value::as_str) == Some("text")
-        && !map.get("text").is_some_and(Value::is_string)
-    {
-        result.errors.push(Diag {
-            code: "NOTE_DOC_INVALID",
-            message: "text node is missing string `text`".to_owned(),
-        });
+    if map.get("type").and_then(Value::as_str) == Some("text") {
+        if !map.get("text").is_some_and(Value::is_string) {
+            result.errors.push(Diag {
+                code: "NOTE_DOC_INVALID",
+                message: "text node is missing string `text`".to_owned(),
+            });
+        } else if map["text"].as_str().unwrap().is_empty() {
+            // prosemirror-model rejects empty text nodes outright
+            result.errors.push(Diag {
+                code: "NOTE_DOC_INVALID",
+                message:
+                    "text node has an empty `text` (the editor schema rejects empty text nodes)"
+                        .to_owned(),
+            });
+        }
     }
 
     match map.get("attrs") {
@@ -241,5 +280,154 @@ mod tests {
         let marked = validate_note_doc(&doc, true, &limits).unwrap();
         let codes: Vec<&str> = marked.errors.iter().map(|e| e.code).collect();
         assert!(codes.contains(&"BLOCK_ID_INVALID"));
+    }
+
+    /// A minimal artifact fixture: noteDoc root, paragraph with `id` attr,
+    /// bold mark.
+    fn fixture_schema() -> crate::pmschema::PmSchema {
+        let raw = json!({
+            "schema_id": "inscriptum",
+            "schema_version": 1,
+            "schema_hash": "sha256:00",
+            "top_node": "noteDoc",
+            "validation_capability": "partial",
+            "nodes": {
+                "noteDoc": {"content": "noteTitle block*", "groups": [], "attrs": {},
+                            "marks": [], "addressable": false, "inline_content": false,
+                            "searchable": false},
+                "noteTitle": {"content": "inline*", "groups": ["block"], "attrs": {},
+                              "marks": [], "addressable": false, "inline_content": true,
+                              "searchable": true},
+                "paragraph": {"content": "inline*", "groups": ["block"],
+                              "attrs": {"id": {"default": null}}, "marks": ["bold"],
+                              "addressable": true, "inline_content": true, "searchable": true},
+                "text": {"content": null, "groups": ["inline"], "attrs": {},
+                         "marks": [], "addressable": false, "inline_content": true,
+                         "searchable": false}
+            },
+            "marks": {"bold": {"group": null, "attrs": {}}}
+        });
+        crate::pmschema::PmSchema::build(&crate::schema::SchemaArtifact::parse(raw).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn schema_level_unknown_node_type_is_an_error() {
+        let limits = Limits::defaults();
+        let schema = fixture_schema();
+        let doc = json!({
+            "type": "noteDoc",
+            "content": [{"type": "exoticWidget", "content": [{"type": "text", "text": "?"}]}]
+        });
+        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        assert!(!result.valid());
+        assert!(result.errors.iter().any(|e| e.code == "UNKNOWN_NODE_TYPE"));
+        // the same document without an artifact stays a warning
+        let structural = validate_note_doc(&doc, false, &limits).unwrap();
+        assert!(structural.valid());
+    }
+
+    #[test]
+    fn schema_level_unknown_attr_is_a_warning() {
+        let limits = Limits::defaults();
+        let schema = fixture_schema();
+        let doc = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+                {"type": "paragraph", "attrs": {"id": "abcdefghij", "color": "red"},
+                 "content": [{"type": "text", "text": "hi", "marks": [{"type": "bold"}]}]}
+            ]
+        });
+        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        assert!(result.valid(), "warnings do not flip validity");
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code).collect();
+        assert!(codes.contains(&"SCHEMA_ATTR_UNKNOWN"), "{codes:?}");
+    }
+
+    #[test]
+    fn schema_level_unknown_and_restricted_marks_are_errors() {
+        let limits = Limits::defaults();
+        let schema = fixture_schema();
+        // strike is not in the artifact's mark inventory at all
+        let unknown_mark = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "hi", "marks": [{"type": "strike"}]}
+                ]}
+            ]
+        });
+        let result =
+            validate_note_doc_with_schema(&unknown_mark, false, &limits, Some(&schema)).unwrap();
+        assert!(
+            !result.valid(),
+            "unknown mark types fail like prosemirror fromJSON"
+        );
+        let codes: Vec<&str> = result.errors.iter().map(|e| e.code).collect();
+        assert!(codes.contains(&"UNKNOWN_MARK_TYPE"), "{codes:?}");
+
+        // the paragraph mark set is [bold] — a bold title child would fail
+        let restricted = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "hi", "marks": [{"type": "bold"}]}
+                ]}
+            ]
+        });
+        let result =
+            validate_note_doc_with_schema(&restricted, false, &limits, Some(&schema)).unwrap();
+        assert!(result.valid());
+    }
+
+    #[test]
+    fn schema_level_legacy_type_is_a_warning_not_an_error() {
+        let limits = Limits::defaults();
+        let schema = fixture_schema();
+        // noteSummary is observed in real on-disk documents but the current
+        // artifact does not declare it (title v3 replaced it) — document
+        // version semantics the artifact cannot judge.
+        let doc = json!({
+            "type": "noteDoc",
+            "content": [{"type": "noteSummary", "content": [{"type": "text", "text": "old"}]}]
+        });
+        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        assert!(result.valid());
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code).collect();
+        assert!(codes.contains(&"SCHEMA_NODE_LEGACY"), "{codes:?}");
+    }
+
+    #[test]
+    fn schema_level_root_mismatch_is_a_warning() {
+        let limits = Limits::defaults();
+        let schema = fixture_schema();
+        // the root type is known to the artifact but differs from top_node
+        let doc = json!({
+            "type": "paragraph",
+            "content": [{"type": "text", "text": "x"}]
+        });
+        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code).collect();
+        assert!(codes.contains(&"SCHEMA_ROOT_MISMATCH"), "{codes:?}");
+    }
+
+    #[test]
+    fn schema_level_known_inventory_is_clean() {
+        let limits = Limits::defaults();
+        let schema = fixture_schema();
+        let doc = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+                {"type": "paragraph", "attrs": {"id": "abcdefghij"},
+                 "content": [{"type": "text", "text": "ok", "marks": [{"type": "bold"}]}]}
+            ]
+        });
+        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        assert!(result.valid());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 }

@@ -75,3 +75,63 @@ fn unknown_flag_is_json_usage_error() {
     let value: Value = serde_json::from_str(&String::from_utf8(output.stderr).unwrap()).unwrap();
     assert_eq!(value["error"]["code"], "USAGE");
 }
+
+#[test]
+fn named_non_um_file_is_reported_not_silently_dropped() {
+    // §3.5: an explicitly named input that is not a .um/.note must not
+    // produce a silent valid:true / complete:true (K-01)
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.txt");
+    std::fs::write(&plain, b"not a document").unwrap();
+
+    // validate: the file is an invalid entry, not an empty success
+    let output = Command::cargo_bin("insum")
+        .unwrap()
+        .arg("validate")
+        .arg(&plain)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["valid"],
+        false,
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let file = &value["files"][0];
+    // the rendered path is normalized to forward slashes on every OS
+    assert_eq!(
+        file["path"].as_str().unwrap(),
+        plain.display().to_string().replace('\\', "/")
+    );
+    assert_eq!(file["valid"], false);
+    assert!(
+        !file["errors"].as_array().unwrap().is_empty(),
+        "an error names the unsupported input: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // search: the skipped entry lowers complete — zero matches with
+    // complete:true would be a false absence proof
+    let output = Command::cargo_bin("insum")
+        .unwrap()
+        .arg("search")
+        .arg("-F")
+        .arg("anything")
+        .arg(&plain)
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["complete"],
+        false,
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !value["skipped"].as_array().unwrap().is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

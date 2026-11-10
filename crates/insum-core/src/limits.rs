@@ -14,8 +14,9 @@ pub struct LimitSpec {
 }
 
 const GIB: usize = 1024 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
 
-const LIMITS: [LimitSpec; 9] = [
+const LIMITS: [LimitSpec; 10] = [
     LimitSpec {
         env: "UM_MAX_ENTRY_BYTES",
         default: 33_554_432,
@@ -61,6 +62,11 @@ const LIMITS: [LimitSpec; 9] = [
         default: 3,
         cap: 100,
     },
+    LimitSpec {
+        env: "UM_MAX_SCHEMA_BYTES",
+        default: MIB,
+        cap: 16 * MIB,
+    },
 ];
 
 /// The resolved limit values for one process run.
@@ -75,6 +81,8 @@ pub struct Limits {
     pub max_search_matches: usize,
     pub max_apply_ops: usize,
     pub max_commit_retries: usize,
+    /// Cap for schema artifact files; enforced when loading an artifact.
+    pub max_schema_bytes: usize,
 }
 
 impl Limits {
@@ -93,6 +101,7 @@ impl Limits {
             (&mut limits.max_search_matches, &LIMITS[6]),
             (&mut limits.max_apply_ops, &LIMITS[7]),
             (&mut limits.max_commit_retries, &LIMITS[8]),
+            (&mut limits.max_schema_bytes, &LIMITS[9]),
         ] {
             if let Some(value) = read_limit(spec) {
                 *slot = value;
@@ -112,6 +121,7 @@ impl Limits {
             max_search_matches: 1_000,
             max_apply_ops: 1_000,
             max_commit_retries: 3,
+            max_schema_bytes: 1024 * 1024,
         }
     }
 
@@ -152,6 +162,7 @@ mod tests {
         assert_eq!(limits.max_search_matches, 1_000);
         assert_eq!(limits.max_apply_ops, 1_000);
         assert_eq!(limits.max_commit_retries, 3);
+        assert_eq!(limits.max_schema_bytes, 1024 * 1024);
     }
 
     #[test]

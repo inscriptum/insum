@@ -11,7 +11,7 @@ use insum_core::model::{BlockEntry, INLINE_NODE_TYPES};
 use insum_core::{ErrorCode, Limits, UmError};
 
 use crate::cursor::Cursor;
-use crate::support::{Output, Revs, SourceReader, render_path};
+use crate::support::{Output, Revs, SourceReader, escape_comment_value, render_path};
 
 pub fn run(
     path: &Path,
@@ -495,25 +495,6 @@ fn render_block(
             ));
         }
     }
-}
-
-/// Escape a document-controlled value interpolated into a CLI comment
-/// template: both comment delimiters are broken so the value can neither
-/// open a forged comment nor close the CLI's own one early (review X-01
-/// class 3). Double quotes and newlines are also neutralized (review
-/// Y-01/Y-02): a quote cannot terminate an attribute to inject a new one,
-/// and a newline cannot split the header into a separate forged line.
-fn escape_comment_value(value: &str) -> String {
-    value
-        // deletions first: no later step can reassemble what was removed
-        .replace('\r', "")
-        // structural escapes: backslash before quote (Z-05), then delimiters
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace("<!--", "<! --")
-        .replace("-->", "-- >")
-        .replace("--!>", "-- !>")
-        .replace('\n', " ")
 }
 
 /// Apply projection marks to a text piece; unknown mark types are collected
