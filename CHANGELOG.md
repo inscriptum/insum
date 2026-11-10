@@ -22,6 +22,16 @@ Format — Keep a Changelog; versioning — SemVer.
   (title-less noteDoc roots, legacy node types) are reported with
   `SCHEMA_FAMILY_UNCOVERED` / `SCHEMA_NODE_LEGACY` warnings instead of
   invented verdicts.
+- `wikiLink` is a known node: no unknown-type warnings, its label
+  participates in text and search, annotated reading renders it as a
+  markdown link.
+- New limit `UM_MAX_SCHEMA_BYTES` (default 1 MiB) caps schema artifact
+  files loaded by `insum schema` and `insum validate`.
+- `wikiLink` is a known node: no unknown-type warnings, its label
+  participates in text and search, annotated reading renders it as a
+  markdown link.
+- New limit `UM_MAX_SCHEMA_BYTES` (default 1 MiB) caps schema artifact
+  files loaded by `insum schema` and `insum validate`.
 - Lock/dirty-lease protocol prototype (§9.2) in `insum-core`: hidden
   sidecar files (`.<name>.insum-lock`, `.<name>.insum-lease`) next to the
   target, atomic create-new acquisition, wait/timeout with `WRITE_LOCKED`,
@@ -62,12 +72,6 @@ Format — Keep a Changelog; versioning — SemVer.
   oversized marker (documented exception), instead of silently exceeding the
   budget.
 - CI: skip a unix-only symlink test on Windows (was red under `-D warnings`).
-
-### Added
-
-- `wikiLink` is a known node: no unknown-type warnings, its label
-  participates in text and search, annotated reading renders it as a
-  markdown link.
 - Annotated reading (`read --format annotated`) renders tables as markdown —
   kanban-style pages stay readable with cell text and escaped pipes.
 - Read API — six commands over any `.um`/`.note` knowledge base: `ls`,
@@ -80,3 +84,4 @@ Format — Keep a Changelog; versioning — SemVer.
   output, errors arrive as a single JSON object with stable codes.
 - Fixture generator produces valid `.um` containers (minimal, empty, regular)
   and legacy/envelope `.note` documents for tests.
+

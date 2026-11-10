@@ -1321,7 +1321,9 @@ mod tests {
             }
         });
         let schema = PmSchema::build(&SchemaArtifact::parse(raw).unwrap()).unwrap();
-        // attrs absent entirely → required missing → error
+        // node attrs ABSENT: PM computeAttrs receives null — `null &&
+        // value[key]` is null, which is not undefined, so the required
+        // attribute resolves to null without an error
         let absent = json!({"type": "doc", "content": [{"type": "para", "content": []}]});
         let result = schema.check_document(&absent);
         assert!(
@@ -1329,11 +1331,8 @@ mod tests {
             "para declares no attrs — nothing is required"
         );
 
-        // a mark with a required attr: absent attrs object → error
-        let missing_mark_attr = json!({"type": "doc", "content": [
-            {"type": "para", "content": []}
-        ]});
-        let _ = missing_mark_attr;
+        // a mark with a required attr: markFromJSON passes the raw
+        // json.attrs through, so absent → undefined → computeAttrs throws
         let with_mark = json!({"type": "doc", "content": [
             {"type": "para", "content": [], "marks": [{"type": "req"}]}
         ]});

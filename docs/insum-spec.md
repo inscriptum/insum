@@ -79,7 +79,7 @@ one); an unknown type fails with exit 6 and lists the available types.
   legacy type observed in real on-disk documents (reported as
   `SCHEMA_NODE_LEGACY`: document version semantics are outside the
   artifact; the legacy dictionary is the observed-inventory list the
-  structural level uses, maintained with `.instruments/um-format.md`). Undeclared attributes are dropped by the editor — reported as
+  structural level uses, maintained in the project knowledge base). Undeclared attributes are dropped by the editor — reported as
   `SCHEMA_ATTR_UNKNOWN` warnings. A noteDoc root outside the title family
   (no leading `noteTitle`, or carrying legacy types) is outside the
   artifact's content rule by its own declaration — the root content match
@@ -138,6 +138,10 @@ data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 
 ## History (git-backed)
 
+`insum history` reads the git history of the repository containing the
+file; its annotated projection is forge-proof — every document-controlled
+value (ids, titles, types, texts, paths, git metadata) is escaped through
+the same boundary function before interpolation.
 `insum history` reads the git history of the repository containing the
 file — read-only: the working tree, the index and HEAD are never touched;
 revision blobs come from `git show <sha>:<path>`, and the git environment

@@ -241,7 +241,10 @@ fn locate_repo(file: &Path) -> Result<Option<RepoLocation>, UmError> {
     // repository — every non-"true" outcome means "no vault" here
     let inside = match git(dir, &["rev-parse", "--is-inside-work-tree"]) {
         Ok(out) => out,
-        // exit 128: not a repository (or other probe failure) — no vault
+        // a git-level failure means "no work tree" — expected outcome; a
+        // spawn failure (git missing from PATH) is a real IO error and
+        // must not masquerade as an empty history (D-04)
+        Err(err) if err.message.contains("git binary not found") => return Err(err),
         Err(_) => return Ok(None),
     };
     if String::from_utf8_lossy(&inside).trim() != "true" {
@@ -338,7 +341,7 @@ fn revision_blob(repo: &RepoLocation, sha: &str, limits: &Limits) -> Result<Vec<
     let object = format!("{sha}:{}", repo.file_in_repo);
     let mut child = git_command(&repo.root, &["show", &object])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null()) // drained nowhere → no hang
         .spawn()
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -816,6 +819,7 @@ pub fn collect(
     let mut prev: Option<(String, Option<RevisionNotes>)> = None;
     for index in (0..output_count).rev() {
         let revision = listed[index].clone();
+        let sha = revision.sha.clone();
         let own_parsed = revision_blob(&repo, &revision.sha, limits)
             .and_then(|blob| revision_notes(&blob, &extension, limits));
         // a read/limit error propagates; an unparseable blob is the
@@ -825,7 +829,7 @@ pub fn collect(
             Ok(None) => {
                 // this blob does not parse: the revision is listed with a
                 // warning, the parent linkage restarts at the next one
-                let sha_head = revision.sha[..7.min(revision.sha.len())].to_owned();
+                let sha_head = sha[..7.min(sha.len())].to_owned();
                 diffs.push(RevisionDiff {
                     revision: revision.clone(),
                     notes: Vec::new(),
@@ -896,12 +900,14 @@ pub fn collect(
                     // root commit with a filter: report whether the note
                     // exists in this revision (context, no block diff) —
                     // by id or by title (C-06)
-                    if let Some((_, title, _)) = notes
+                    if let Some((id, title, _)) = notes
                         .iter()
                         .find(|(id, title, _)| id == filter || title.as_deref() == Some(filter))
                     {
+                        // machine-readable identity stays the real note id;
+                        // the title matched the filter — never the reverse (D-05)
                         revision_diff.notes.push(NoteDiff {
-                            note_id: filter.to_owned(),
+                            note_id: id.clone(),
                             note_title: title.clone(),
                             ..NoteDiff::default()
                         });
@@ -920,6 +926,11 @@ pub fn collect(
                 revision_diff.notes = per_note;
             }
         }
+        // remember this revision's notes: in a straight chain it IS the
+        // parent of the next processed revision (D-03 — without this the
+        // fast-path reuse was dead and every revision spawned its parent
+        // blob twice)
+        prev = Some((sha, Some(notes)));
         diffs.push(revision_diff);
     }
 

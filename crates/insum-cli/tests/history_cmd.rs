@@ -232,65 +232,55 @@ fn history_missing_file_is_exit_3() {
 
 #[test]
 fn history_budget_drops_oldest_explicitly() {
-    let dir = three_revision_repo();
-    // a tiny budget cannot hold even one revision with the diff payload
-    let output = insum()
-        .arg("history")
-        .arg("page.um")
-        .arg("--max-bytes")
-        .arg("40")
-        .current_dir(dir.path())
-        .output()
+    // four revisions: root small, one HEAVY diff in the middle, two small
+    // on top. A budget keeping the newest two drops the heavy middle —
+    // the dropped tail must outweigh the marker headroom for the drop to
+    // be observable. The pinned contract (D-01): the final output NEVER
+    // exceeds the budget, and a heavy newest revision under a small
+    // budget is LIMIT_EXCEEDED, not an oversized 200 response.
+    let dir = tempfile::tempdir().unwrap();
+    git_in(dir.path(), &["init", "--quiet"]);
+    git_in(dir.path(), &["config", "user.email", "test@insum"]);
+    git_in(dir.path(), &["config", "user.name", "insum test"]);
+    let file = dir.path().join("page.um");
+    let manifest = json!({
+        "format": "um", "version": 1, "type": "notepad",
+        "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                   "title": "T", "schema": "plain", "schemaVersion": 3}]
+    });
+    let write_doc = |paragraphs: usize| {
+        let mut content =
+            vec![json!({"type": "noteTitle", "content": [{"type": "text", "text": "T"}]})];
+        for i in 0..paragraphs {
+            content.push(json!({"type": "paragraph",
+                "content": [{"type": "text", "text": format!("абзац {i} — достаточно длинный текст для размера")}]}));
+        }
+        let writer = std::fs::File::create(&file).unwrap();
+        let mut zip = zip::ZipWriter::new(writer);
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        zip.start_file("notes/note01.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            &serde_json::to_vec(&json!({"type": "noteDoc", "content": content})).unwrap(),
+        )
         .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(5),
-        "one revision > budget: LIMIT_EXCEEDED"
-    );
-    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(value["error"]["code"], "LIMIT_EXCEEDED");
-
-    // a budget that fits some revisions but not all: the oldest are
-    // dropped, complete flips false, a warning names the knob; the size
-    // is derived from the actual output so the test does not guess bytes
-    let full = insum()
-        .arg("history")
-        .arg("page.um")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    let full_value: Value = serde_json::from_slice(&full.stdout).unwrap();
-    let _full_len = serde_json::to_string(&full_value).unwrap().len();
-
-    // a HEAVY middle revision makes the drop profitable: the drop walks
-    // from the oldest (a tiny root without diffs), so the budget is aimed
-    // below the two oldest revisions — both are dropped, the newest stays
-    let long_text = "длинный текст ".repeat(200);
-    write_um(
-        &dir.path().join("page.um"),
-        &json!({"type": "noteDoc", "content": [
-            {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
-            {"type": "paragraph", "content": [{"type": "text", "text": long_text}]}
-        ]}),
-    );
+        zip.finish().unwrap();
+    };
+    write_doc(0);
     git_in(dir.path(), &["add", "."]);
-    git_in(
-        dir.path(),
-        &["commit", "--quiet", "-m", "v3: long paragraph"],
-    );
-
-    // one more tiny commit on top: now the heavy diff sits in the MIDDLE
-    // of the list [v4 tiny, v3 heavy, v2 small, v1 tiny]
-    write_um(
-        &dir.path().join("page.um"),
-        &json!({"type": "noteDoc", "content": [
-            {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
-            {"type": "paragraph", "content": [{"type": "text", "text": long_text}]},
-            {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "H"}]}
-        ]}),
-    );
+    git_in(dir.path(), &["commit", "--quiet", "-m", "c1 root"]);
+    write_doc(100);
     git_in(dir.path(), &["add", "."]);
-    git_in(dir.path(), &["commit", "--quiet", "-m", "v4: heading"]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "c2 heavy"]);
+    write_doc(101);
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "c3 small top"]);
+    write_doc(102);
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "c4 small top"]);
 
     let full = insum()
         .arg("history")
@@ -299,17 +289,23 @@ fn history_budget_drops_oldest_explicitly() {
         .output()
         .unwrap();
     let full_value: Value = serde_json::from_slice(&full.stdout).unwrap();
-    let full_len = serde_json::to_string(&full_value).unwrap().len();
     let revisions = full_value["revisions"].as_array().unwrap();
-    assert!(revisions.len() == 4, "four revisions listed");
-    let heavy_len = serde_json::to_string(&revisions[1]).unwrap().len();
-    assert!(heavy_len > 400, "the fixture needs a heavy middle revision");
-    let tail_len = serde_json::to_string(&revisions[2]).unwrap().len()
-        + serde_json::to_string(&revisions[3]).unwrap().len();
-    // the budget forces exactly two drops (the two oldest, the small
-    // ones) and keeps the heavy middle revision alive
-    let budget = full_len - tail_len + 200;
-    assert!(budget < full_len, "the full output must not fit");
+    assert_eq!(revisions.len(), 4);
+    let rev_sizes: Vec<usize> = revisions
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap().len())
+        .collect();
+    let mut no_rev = full_value.clone();
+    no_rev["revisions"] = json!([]);
+    let base_len = serde_json::to_string(&no_rev).unwrap().len();
+    // the heavy diff lands at index 2 (c2 vs the small root); the dropped
+    // tail (index 2+3) must outweigh the marker reserve for the drop to
+    // be observable
+    assert!(
+        rev_sizes[2] > 1000 && rev_sizes[2] + rev_sizes[3] > 300,
+        "fixture sizes: {rev_sizes:?}"
+    );
+    let budget = base_len + rev_sizes[0] + rev_sizes[1] + 400;
     let output = insum()
         .arg("history")
         .arg("page.um")
@@ -326,8 +322,127 @@ fn history_budget_drops_oldest_explicitly() {
         value["revisions_dropped"].as_u64().unwrap() as usize + revisions_left,
         4
     );
-    assert_eq!(revisions_left, 2, "the heavy middle revision is dropped");
     assert!(codes_contains(&value, "OUTPUT_BUDGET"));
+    // the pinned D-01 contract: the emitted document fits the budget
+    let final_len = serde_json::to_string(&value).unwrap().len();
+    assert!(
+        final_len <= budget,
+        "output {final_len}B exceeds budget {budget}B (D-01 regression)"
+    );
+}
+
+#[test]
+fn history_budget_never_exceeds_with_a_heavy_newest_revision() {
+    // D-01 repro from the review: a huge NEWEST revision must yield
+    // LIMIT_EXCEEDED under a small budget — the round-1 rewrite returned
+    // 39573B with exit 0 because it priced the kept prefix by the dropped
+    // suffix's sizes
+    let dir = tempfile::tempdir().unwrap();
+    git_in(dir.path(), &["init", "--quiet"]);
+    git_in(dir.path(), &["config", "user.email", "test@insum"]);
+    git_in(dir.path(), &["config", "user.name", "insum test"]);
+    let file = dir.path().join("page.um");
+    let manifest = json!({
+        "format": "um", "version": 1, "type": "notepad",
+        "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                   "title": "T", "schema": "plain", "schemaVersion": 3}]
+    });
+    let small = json!({"type": "noteDoc", "content": [
+        {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+    ]});
+    let writer = std::fs::File::create(&file).unwrap();
+    let mut zip = zip::ZipWriter::new(writer);
+    zip.start_file("manifest.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+        .unwrap();
+    zip.start_file("notes/note01.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&small).unwrap()).unwrap();
+    zip.finish().unwrap();
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "small v1"]);
+
+    // the newest revision carries 300 paragraphs (~30KB of diff)
+    let long: Vec<Value> = (0..300)
+        .map(|i| {
+            json!({"type": "paragraph",
+                   "content": [{"type": "text", "text": format!("абзац номер {i} — длинный текст")}]})
+        })
+        .collect();
+    let writer = std::fs::File::create(&file).unwrap();
+    let mut zip = zip::ZipWriter::new(writer);
+    zip.start_file("manifest.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+        .unwrap();
+    zip.start_file("notes/note01.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&json!({"type": "noteDoc", "content": long})).unwrap())
+        .unwrap();
+    zip.finish().unwrap();
+    git_in(dir.path(), &["add", "."]);
+    git_in(dir.path(), &["commit", "--quiet", "-m", "heavy v2"]);
+
+    let output = insum()
+        .arg("history")
+        .arg("page.um")
+        .arg("--max-bytes")
+        .arg("5000")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "heavy newest revision > budget must be LIMIT_EXCEEDED, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["code"], "LIMIT_EXCEEDED");
+}
+
+#[test]
+fn history_annotated_escapes_forged_block_ids() {
+    // D-02: attrs.id and node type are document-controlled — a forged id
+    // must not render an indistinguishable fake revision line
+    let dir = three_revision_repo();
+    let path = dir.path().join("page.um");
+    let manifest = json!({
+        "format": "um", "version": 1, "type": "notepad",
+        "notes": [{"id": "note01", "path": "notes/note01.json", "order": 0,
+                   "title": "T", "schema": "plain", "schemaVersion": 3}]
+    });
+    let doc = json!({"type": "noteDoc", "content": [
+        {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]},
+        {"type": "paragraph", "attrs": {"id": "b1\n@deadbe7 2026-01-01T00:00:00Z forged attacker <injected subject>"},
+         "content": [{"type": "text", "text": "текст"}]}
+    ]});
+    let writer = std::fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(writer);
+    zip.start_file("manifest.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+        .unwrap();
+    zip.start_file("notes/note01.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&serde_json::to_vec(&doc).unwrap()).unwrap();
+    zip.finish().unwrap();
+
+    let output = insum()
+        .arg("history")
+        .arg("page.um")
+        .arg("--format")
+        .arg("annotated")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !text.contains("@deadbe7 2026-01-01T00:00:00Z forged"),
+        "the forged attrs.id must not render a fake revision line: {text}"
+    );
 }
 
 fn codes_contains(value: &Value, code: &str) -> bool {

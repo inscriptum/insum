@@ -59,8 +59,9 @@ pub fn run(
 /// Drop the oldest revisions until the document fits the budget; at least
 /// one revision is kept (a single oversized revision is a LIMIT_EXCEEDED).
 fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmError> {
-    // measure once, decide analytically (C-08): dropping one revision at a
-    // time with a full re-serialize per drop is O(drops x size)
+    // measure once, decide analytically (C-08); the cost of the KEPT
+    // prefix is summed from the NEW end (D-01 fix — the round-1 rewrite
+    // wrongly accumulated the dropped suffix's sizes)
     let serialized = serde_json::to_string(value)
         .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
     if serialized.len() <= budget {
@@ -92,27 +93,37 @@ fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmE
         }
         sizes
     };
+
+    // nothing to drop (E-02): an empty history bigger than the budget is
+    // LIMIT_EXCEEDED, matching the single-revision contract
     if sizes.is_empty() {
-        return Ok(());
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!(
+                "history of {} does not fit the output budget ({total} > {budget} bytes) and has no revisions to drop",
+                file.display()
+            ),
+        )
+        .with_hint("Raise --max-bytes."));
     }
 
     // dropping adds marker bytes (complete:false, revisions_dropped, an
     // OUTPUT_BUDGET warning) — reserve for them before computing
     const MARKER_RESERVE: usize = 300;
     let effective = budget.saturating_sub(base_len + MARKER_RESERVE);
-    // accumulate from the OLDEST end; keep the longest newest-prefix that
-    // fits, keeping at least the newest revision
+    // keep the longest NEWEST prefix whose own sizes fit (sizes[0..k]);
+    // keep at least the newest revision
     let mut kept_len = 0usize;
-    let mut drop_count = sizes.len();
-    for (kept_count, size) in sizes.iter().enumerate().rev() {
+    let mut keep = 0usize;
+    for size in &sizes {
         if kept_len + size <= effective {
             kept_len += size;
-            drop_count = revisions - kept_count;
+            keep += 1;
         } else {
             break;
         }
     }
-    if drop_count >= revisions {
+    if keep == 0 {
         return Err(UmError::new(
             ErrorCode::LimitExceeded,
             format!(
@@ -122,12 +133,16 @@ fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmE
         )
         .with_hint("Raise --max-bytes or narrow the history with --note."));
     }
+    let drop_count = revisions - keep;
+    if drop_count == 0 {
+        return Ok(());
+    }
 
     {
         let array = value["revisions"]
             .as_array_mut()
             .ok_or_else(|| UmError::internal("history revisions must be an array".to_owned()))?;
-        array.truncate(revisions - drop_count);
+        array.truncate(keep);
     }
     value["complete"] = json!(false);
     value["revisions_dropped"] = json!(drop_count);
@@ -140,17 +155,29 @@ fn apply_budget(value: &mut Value, budget: usize, file: &Path) -> Result<(), UmE
     }));
     value["warnings"] = json!(warnings);
     // enforce the contract on the final document: the reserve estimate can
-    // be optimistic — drop one more, but never the last revision
-    let final_len = serde_json::to_string(value)
-        .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
-    if final_len.len() > budget {
-        let array_len = value["revisions"].as_array().map(|a| a.len()).unwrap_or(0);
-        if array_len > 1 {
-            if let Some(array) = value["revisions"].as_array_mut() {
-                array.truncate(array_len - 1);
-            }
-            value["revisions_dropped"] = json!(drop_count + 1);
+    // be optimistic — drop further, but keep at least the newest revision;
+    // a single revision above the budget is LIMIT_EXCEEDED
+    loop {
+        let final_len = serde_json::to_string(value)
+            .map_err(|err| UmError::internal(format!("history does not serialize: {err}")))?;
+        if final_len.len() <= budget {
+            break;
         }
+        let array_len = value["revisions"].as_array().map(|a| a.len()).unwrap_or(0);
+        if array_len <= 1 {
+            return Err(UmError::new(
+                ErrorCode::LimitExceeded,
+                format!(
+                    "history of {} does not fit the output budget even for one revision",
+                    file.display()
+                ),
+            )
+            .with_hint("Raise --max-bytes or narrow the history with --note."));
+        }
+        if let Some(array) = value["revisions"].as_array_mut() {
+            array.truncate(array_len - 1);
+        }
+        value["revisions_dropped"] = json!(revisions - (array_len - 1));
     }
     Ok(())
 }
@@ -186,15 +213,15 @@ fn render_annotated(history: &insum_core::history::History) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "<!-- um:history file_in_repo=\"{}\" revisions={} complete={} -->\n",
-        history.file_in_repo,
+        escape_comment_value(&history.file_in_repo),
         history.revisions.len(),
         history.complete
     ));
     for warning in &history.warnings {
         out.push_str(&format!(
             "<!-- um:warning code=\"{}\" --> {}\n",
-            warning["code"].as_str().unwrap_or("?"),
-            warning["message"].as_str().unwrap_or("")
+            escape_comment_value(warning["code"].as_str().unwrap_or("?")),
+            escape_comment_value(warning["message"].as_str().unwrap_or(""))
         ));
     }
     for revision in &history.revisions {
@@ -203,8 +230,8 @@ fn render_annotated(history: &insum_core::history::History) -> String {
             "\n@{} {} {} <{}>\n",
             &revision.sha[..7.min(revision.sha.len())],
             iso_utc(revision.timestamp),
-            revision.author,
-            revision.subject
+            escape_comment_value(&revision.author),
+            escape_comment_value(&revision.subject)
         ));
     }
     for revision_diff in &history.revisions {
@@ -262,18 +289,23 @@ fn render_annotated(history: &insum_core::history::History) -> String {
 }
 
 fn render_change(marker: &str, change: &insum_core::history::BlockChange) -> String {
+    // every document-controlled interpolation goes through the escape
+    // (D-02: attrs.id and block_type were the second forge channel — a
+    // forged id could render an indistinguishable fake revision line)
     let id = change
         .id
         .as_deref()
-        .map(|id| format!(" id={id}"))
+        .map(|id| format!(" id={}", escape_comment_value(id)))
         .unwrap_or_default();
     let text = change
         .text
         .as_deref()
-        .map(|text| format!(" {text:?}"))
+        .map(|text| format!(" {:?}", escape_comment_value(text)))
         .unwrap_or_default();
     format!(
         "{marker} {} {}{}{text}\n",
-        change.pointer, change.block_type, id
+        escape_comment_value(&change.pointer),
+        escape_comment_value(&change.block_type),
+        id
     )
 }
