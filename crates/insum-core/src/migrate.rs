@@ -1048,8 +1048,12 @@ fn stamp_manifest(
         .ok_or_else(|| UmError::new(ErrorCode::ManifestInvalid, "manifest has no notes array"))?;
     let selected_ids: BTreeSet<&str> = selected.iter().map(|d| d.id.as_str()).collect();
     for entry in notes.iter_mut() {
-        let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
-        if !selected_ids.contains(id) {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !selected_ids.contains(id.as_str()) {
             continue;
         }
         let object = entry.as_object_mut().ok_or_else(|| {
@@ -1064,16 +1068,28 @@ fn stamp_manifest(
         let features = object
             .entry("features".to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(map) = features.as_object_mut() {
-            map.insert("block_ids".to_owned(), json!(1));
-            map.insert(
-                "schema".to_owned(),
-                json!({
-                    "id": meta.id,
-                    "schema_version": meta.schema_version,
-                    "schema_hash": meta.schema_hash,
-                }),
-            );
+        match features {
+            Value::Object(map) => {
+                map.insert("block_ids".to_owned(), json!(1));
+                map.insert(
+                    "schema".to_owned(),
+                    json!({
+                        "id": meta.id,
+                        "schema_version": meta.schema_version,
+                        "schema_hash": meta.schema_hash,
+                    }),
+                );
+            }
+            _ => {
+                // refuse-don't-skip: a selected note must not report success
+                // without its marker (same rule as the payload attrs path)
+                return Err(UmError::new(
+                    ErrorCode::ManifestInvalid,
+                    format!(
+                        "descriptor {id:?} has a non-object features field; fix the manifest before migration"
+                    ),
+                ));
+            }
         }
     }
     Ok(manifest)

@@ -757,6 +757,175 @@ fn block_get_by_id_is_gated_on_the_marker() {
 }
 
 #[test]
+fn regression_attrs_null_refuses_the_migration() {
+    // M-02: a non-object attrs must refuse (the marker would lie), in
+    // dry-run and commit alike
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let path = fixture.dir.path().join("badattrs.um");
+    let doc = json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "noteTitle", "attrs": null, "content": [{"type": "text", "text": "X"}]}
+        ]
+    });
+    let notes = [FixtureNote {
+        id: insum_test_utils::ulid_seq(1),
+        title: "X".to_owned(),
+        schema: "title",
+        doc,
+    }];
+    write_um(&path, &notes).unwrap();
+    let file = path.to_string_lossy().into_owned();
+    let before = fs::read(&file).unwrap();
+
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+        args.extend(extra.iter());
+        let output = insum().args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(4), "NOTE_DOC_INVALID exits 4");
+        assert_eq!(stderr_json(&output)["error"]["code"], "NOTE_DOC_INVALID");
+    }
+    assert_eq!(
+        before,
+        fs::read(&file).unwrap(),
+        "refused writes leave the file alone"
+    );
+}
+
+#[test]
+fn regression_envelope_unknown_fields_survive_and_broken_shapes_refuse() {
+    // M-04/M-06: an envelope keeps its unknown fields and is selected by
+    // marker state, not envelope presence
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let path = fixture.dir.path().join("envelope.note");
+    let envelope = json!({
+        "format": "inscriptum-note",
+        "version": 1,
+        "features": {"block_ids": 1, "custom": "kept"},
+        "schema": {"id": "inscriptum", "schema_version": 1, "schema_hash": "sha256:abc"},
+        "document": {"type": "noteDoc", "content": [
+            {"type": "noteTitle", "attrs": {"id": "BAD_ID_00"}, "content": [{"type": "text", "text": "T"}]}
+        ]},
+        "x_owner_field": {"keep": "me"}
+    });
+    fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    let file = path.to_string_lossy().into_owned();
+
+    // marker set + an invalid id: fixes ids, keeps the unknown field and
+    // the envelope's own schema metadata
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        after["x_owner_field"]["keep"], "me",
+        "unknown envelope fields survive"
+    );
+    assert_eq!(
+        after["schema"]["schema_hash"], "sha256:abc",
+        "envelope schema metadata kept"
+    );
+    assert_eq!(after["features"]["block_ids"], 1);
+    let ids = collect_ids(&after["document"]);
+    assert!(
+        !ids.contains(&"BAD_ID_00".to_owned()),
+        "invalid id replaced"
+    );
+
+    // envelope without the marker + complete ids → still selected (M-06)
+    let path2 = fixture.dir.path().join("envelope-nomarker.note");
+    let envelope2 = json!({
+        "format": "inscriptum-note",
+        "version": 1,
+        "features": {"custom": "x"},
+        "schema": {"id": "inscriptum", "schema_version": 1, "schema_hash": "sha256:abc"},
+        "document": {"type": "noteDoc", "content": [
+            {"type": "noteTitle", "attrs": {"id": "completeid1"}, "content": [{"type": "text", "text": "T"}]}
+        ]}
+    });
+    fs::write(&path2, serde_json::to_vec(&envelope2).unwrap()).unwrap();
+    let file2 = path2.to_string_lossy().into_owned();
+    let output = insum()
+        .args(["migrate-ids", &file2, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&file2).unwrap()).unwrap();
+    assert_eq!(
+        after["features"]["block_ids"], 1,
+        "the marker is reachable for this class"
+    );
+    assert_eq!(
+        after["features"]["custom"], "x",
+        "existing features values survive"
+    );
+}
+
+#[test]
+fn regression_broken_features_descriptor_refuses_the_marker() {
+    // N-01: a non-object features field on a selected descriptor refuses
+    // the stamp instead of silently skipping it
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    // corrupt the first descriptor's features to a string
+    let manifest = read_entry(&file, "manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    manifest["notes"][0]["features"] = json!("corrupt");
+    patch_entry(
+        &file,
+        "manifest.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "MANIFEST_INVALID exits 4");
+    assert_eq!(stderr_json(&output)["error"]["code"], "MANIFEST_INVALID");
+}
+
+#[test]
+fn regression_sidecar_lock_files_are_cleaned_up() {
+    // M-01: release on success, no-op and refusal — no sidecar litter
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let run = |args: &[&str]| {
+        let output = insum().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["migrate-ids", &file, "--schema", &artifact]);
+    run(&["migrate-ids", &file, "--schema", &artifact]); // no-op
+    let sidecars: Vec<_> = fs::read_dir(fixture.dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().contains("insum-lock"))
+        .collect();
+    assert!(
+        sidecars.is_empty(),
+        "lock sidecars are released: {sidecars:?}"
+    );
+}
+
+#[test]
 fn note_filter_is_rejected_for_note_files() {
     let fixture = Fixture::new();
     let path = fixture.dir.path().join("single.note");
