@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use insum_core::container::peek_um_manifest;
+use insum_core::container::torn_error;
+use insum_core::container::{classify_extension, peek_um_manifest};
 use insum_core::{ErrorCode, Limits, NoteFile, UmContainer, UmError};
 
 use crate::support::{error_value, hidden_below, mtime_iso, render_path};
@@ -19,10 +20,20 @@ pub fn run(path: Option<String>, hidden: bool, limits: &Limits) -> Result<Value,
     // inside directories still never follows symlinks
     let metadata = std::fs::metadata(&path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
-            UmError::new(
-                ErrorCode::PathNotFound,
-                format!("path not found: {}", path.display()),
-            )
+            if classify_extension(&path).is_some() {
+                // an absent .um/.note argument is the same transient
+                // writer window the container readers report
+                torn_error(
+                    "absent",
+                    &path,
+                    "container file is absent (possibly being rewritten)".to_owned(),
+                )
+            } else {
+                UmError::new(
+                    ErrorCode::PathNotFound,
+                    format!("path not found: {}", path.display()),
+                )
+            }
         } else {
             UmError::new(
                 ErrorCode::IoError,

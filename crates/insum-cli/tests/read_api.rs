@@ -511,13 +511,15 @@ fn limits_and_error_codes_are_enforced() {
     let error = stderr_json(&output);
     assert_eq!(error["error"]["code"], "LIMIT_EXCEEDED");
 
-    // PATH_NOT_FOUND exits 3
+    // an absent .um answers READ_TORN (exit 4) — the transient writer
+    // window must not masquerade as a path diagnosis; PATH_NOT_FOUND stays
+    // for absent non-container paths (see read_resilience.rs)
     let output = insum()
         .args(["tree", &corpus.path("missing.um")])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(3));
-    assert_eq!(stderr_json(&output)["error"]["code"], "PATH_NOT_FOUND");
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(stderr_json(&output)["error"]["code"], "READ_TORN");
 
     // NOT_A_ZIP exits 4
     let output = insum()

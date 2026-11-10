@@ -85,10 +85,20 @@ pub fn collect_files(
         // follow symlinks for the argument itself (ls parity)
         let metadata = std::fs::metadata(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
-                UmError::new(
-                    ErrorCode::PathNotFound,
-                    format!("path not found: {}", path.display()),
-                )
+                if classify_extension(path).is_some() {
+                    // an absent .um/.note argument is the same transient
+                    // writer window the container readers report
+                    insum_core::container::torn_error(
+                        "absent",
+                        path,
+                        "container file is absent (possibly being rewritten)".to_owned(),
+                    )
+                } else {
+                    UmError::new(
+                        ErrorCode::PathNotFound,
+                        format!("path not found: {}", path.display()),
+                    )
+                }
             } else {
                 UmError::new(
                     ErrorCode::IoError,
@@ -333,6 +343,9 @@ pub fn error_value(err: &UmError) -> Value {
     });
     if let Some(hint) = &err.hint {
         error["hint"] = json!(hint);
+    }
+    if let Some(details) = &err.details {
+        error["details"] = details.clone();
     }
     error
 }

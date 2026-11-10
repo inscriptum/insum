@@ -39,20 +39,12 @@ pub struct UmContainer {
 
 impl UmContainer {
     pub fn open(path: &Path, limits: &Limits) -> Result<Self, UmError> {
-        let bytes = std::fs::metadata(path)
-            .map_err(|err| path_error(path, err))?
-            .len();
-        let mut archive = ZipArchive::new(File::open(path).map_err(|err| path_error(path, err))?)
-            .map_err(|err| {
-            UmError::new(
-                ErrorCode::NotAZip,
-                format!("file with .um extension is not a valid ZIP archive: {err}"),
-            )
-            .with_hint("Check the file type or restore a valid UM container.")
-        })?;
+        let (file, bytes) = open_non_empty(path)?;
+        let mut archive =
+            ZipArchive::new(file).map_err(|err| classify_zip_open_error(path, err))?;
         check_archive_safety(&mut archive, limits)?;
 
-        let manifest = Manifest::parse(read_manifest_value(&mut archive, limits)?)?;
+        let manifest = Manifest::parse(read_manifest_value(path, &mut archive, limits)?)?;
         let mut parts: Vec<String> = archive
             .file_names()
             .filter_map(|name| name.ok())
@@ -173,11 +165,21 @@ impl UmContainer {
                 format!("unsafe note payload path {:?}", note.path),
             ));
         }
-        let mut file = self.archive.by_name(&note.path).map_err(|_| {
-            UmError::new(
-                ErrorCode::NoteFileMissing,
-                format!("archive entry {:?} is missing", note.path),
-            )
+        let mut file = self.archive.by_name(&note.path).map_err(|err| {
+            if matches!(err, zip::result::ZipError::FileNotFound) {
+                UmError::new(
+                    ErrorCode::NoteFileMissing,
+                    format!("archive entry {:?} is missing", note.path),
+                )
+            } else {
+                // the central directory opened but the entry cannot be
+                // produced — a cut between directory and payload
+                torn_error(
+                    "truncated",
+                    &self.path,
+                    format!("archive entry {:?} cannot be read: {err}", note.path),
+                )
+            }
         })?;
         if file.size() > limits.max_entry_bytes as u64 {
             return Err(limit_exceeded(format!(
@@ -185,11 +187,18 @@ impl UmContainer {
                 note.path
             )));
         }
-        let mut payload = String::with_capacity(file.size() as usize);
-        file.read_to_string(&mut payload).map_err(|err| {
+        let mut payload_bytes = Vec::with_capacity(file.size() as usize);
+        file.read_to_end(&mut payload_bytes).map_err(|err| {
+            torn_error(
+                "truncated",
+                &self.path,
+                format!("note payload {} cannot be decompressed: {err}", note.path),
+            )
+        })?;
+        let payload = String::from_utf8(payload_bytes).map_err(|_| {
             UmError::new(
                 ErrorCode::NoteJsonInvalid,
-                format!("note payload is not UTF-8: {err}"),
+                format!("note payload is not UTF-8: {}", note.path),
             )
         })?;
         Ok(payload)
@@ -306,6 +315,13 @@ fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
     taken
         .read_to_end(&mut buffer)
         .map_err(|err| path_error(path, err))?;
+    if buffer.is_empty() {
+        return Err(torn_error(
+            "empty",
+            path,
+            "container file is empty (write in progress or interrupted)".to_owned(),
+        ));
+    }
     if buffer.len() > limits.max_entry_bytes {
         return Err(limit_exceeded(format!(
             "{} exceeds UM_MAX_ENTRY_BYTES ({} bytes)",
@@ -324,7 +340,11 @@ fn hex(digest: &[u8]) -> String {
     out
 }
 
-fn read_manifest_value(archive: &mut ZipArchive<File>, limits: &Limits) -> Result<Value, UmError> {
+fn read_manifest_value(
+    path: &Path,
+    archive: &mut ZipArchive<File>,
+    limits: &Limits,
+) -> Result<Value, UmError> {
     let _depth = limits.max_depth;
     let mut entry = archive.by_name("manifest.json").map_err(|_| {
         UmError::new(
@@ -335,9 +355,12 @@ fn read_manifest_value(archive: &mut ZipArchive<File>, limits: &Limits) -> Resul
     // capacity is bounded: the declared entry size is attacker-controlled
     let mut text = String::with_capacity(entry.size().min(1 << 20) as usize);
     entry.read_to_string(&mut text).map_err(|err| {
-        UmError::new(
-            ErrorCode::ManifestInvalid,
-            format!("manifest is not UTF-8: {err}"),
+        // decompression stopped mid-stream: the archive was cut off between
+        // the central directory (parsed fine) and this entry's payload
+        torn_error(
+            "truncated",
+            path,
+            format!("manifest.json cannot be decompressed: {err}"),
         )
     })?;
     parse_json_limited(&text, limits.max_depth, ErrorCode::ManifestInvalid)
@@ -423,11 +446,31 @@ fn limit_exceeded(message: String) -> UmError {
     UmError::new(ErrorCode::LimitExceeded, message)
 }
 
+/// READ_TORN — the container is absent, empty, or cut off mid-write.
+///
+/// A reader hitting this is almost certainly racing a non-atomic writer
+/// (e.g. um-build removes the target and re-zips in place): the failure is
+/// transient and a short retry usually succeeds. The `cause` detail keeps
+/// the three classes machine-distinguishable; this must never surface as
+/// NOTE_NOT_FOUND, which would send agents hunting for a wrong note title.
+pub fn torn_error(cause: &str, path: &Path, message: String) -> UmError {
+    UmError::new(
+        ErrorCode::ReadTorn,
+        format!("{}: {}", path.display(), message),
+    )
+    .with_hint(
+        "The container is likely being rewritten by a non-atomic writer. \
+         Retry shortly; if it persists, restore the file from a backup.",
+    )
+    .with_details(serde_json::json!({ "cause": cause }))
+}
+
 fn path_error(path: &Path, err: std::io::Error) -> UmError {
     if err.kind() == std::io::ErrorKind::NotFound {
-        UmError::new(
-            ErrorCode::PathNotFound,
-            format!("path not found: {}", path.display()),
+        torn_error(
+            "absent",
+            path,
+            "container file is absent (possibly being rewritten)".to_owned(),
         )
     } else {
         UmError::new(
@@ -435,6 +478,67 @@ fn path_error(path: &Path, err: std::io::Error) -> UmError {
             format!("cannot read {}: {err}", path.display()),
         )
     }
+}
+
+/// Distinguish a torn ZIP from a file that was never a ZIP at all.
+///
+/// Writers stream ZIPs: local headers (`PK\x03\x04`) come first, the
+/// central directory and EOCD (`PK\x05\x06`) last. A file that starts with
+/// a ZIP signature but fails to open is a cut-off archive; a file without
+/// any ZIP signature was never an archive (NOT_A_ZIP, unchanged semantics).
+/// A non-empty `.um` shorter than the 4-byte local-header signature cannot
+/// be a legitimate artifact either — it is a write caught in its first
+/// bytes.
+fn classify_zip_open_error(path: &Path, err: zip::result::ZipError) -> UmError {
+    let looks_like_zip_start = match std::fs::File::open(path) {
+        Ok(mut file) => {
+            let mut head = [0u8; 4];
+            match file.read_exact(&mut head) {
+                Ok(()) => {
+                    head == *b"PK\x03\x04" || head == *b"PK\x01\x02" || head == *b"PK\x05\x06"
+                }
+                Err(_) => {
+                    // 1–3 bytes: shorter than the local-header signature —
+                    // never a legitimate artifact, always a cut-off write
+                    return torn_error(
+                        "truncated",
+                        path,
+                        format!("ZIP container is incomplete: {err}"),
+                    );
+                }
+            }
+        }
+        Err(_) => false,
+    };
+    if looks_like_zip_start {
+        torn_error(
+            "truncated",
+            path,
+            format!("ZIP container is incomplete or corrupt: {err}"),
+        )
+    } else {
+        UmError::new(
+            ErrorCode::NotAZip,
+            format!("file with .um extension is not a valid ZIP archive: {err}"),
+        )
+        .with_hint("Check the file type or restore a valid UM container.")
+    }
+}
+
+/// Open a file and fail with READ_TORN when it is absent or empty.
+fn open_non_empty(path: &Path) -> Result<(File, u64), UmError> {
+    let bytes = std::fs::metadata(path)
+        .map_err(|err| path_error(path, err))?
+        .len();
+    if bytes == 0 {
+        return Err(torn_error(
+            "empty",
+            path,
+            "container file is empty (write in progress or interrupted)".to_owned(),
+        ));
+    }
+    let file = File::open(path).map_err(|err| path_error(path, err))?;
+    Ok((file, bytes))
 }
 
 /// A `.note` document opened for reading (legacy raw doc or envelope).
@@ -498,16 +602,10 @@ impl NoteFile {
 /// without touching note payloads — the fast path for directory listing
 ///.
 pub fn peek_um_manifest(path: &Path, limits: &Limits) -> Result<(Manifest, Vec<String>), UmError> {
-    let mut archive = ZipArchive::new(File::open(path).map_err(|err| path_error(path, err))?)
-        .map_err(|err| {
-            UmError::new(
-                ErrorCode::NotAZip,
-                format!("file with .um extension is not a valid ZIP archive: {err}"),
-            )
-            .with_hint("Check the file type or restore a valid UM container.")
-        })?;
+    let (file, _bytes) = open_non_empty(path)?;
+    let mut archive = ZipArchive::new(file).map_err(|err| classify_zip_open_error(path, err))?;
     check_archive_safety(&mut archive, limits)?;
-    let manifest = Manifest::parse(read_manifest_value(&mut archive, limits)?)?;
+    let manifest = Manifest::parse(read_manifest_value(path, &mut archive, limits)?)?;
     let mut parts: Vec<String> = archive
         .file_names()
         .filter_map(|name| name.ok())
@@ -526,5 +624,209 @@ pub fn classify_extension(path: &Path) -> Option<&'static str> {
         "um" => Some("um"),
         "note" => Some("note"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use insum_test_utils::{FixtureNote, ulid_seq, write_legacy_note, write_um};
+    use std::path::PathBuf;
+
+    fn fixture() -> (PathBuf, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!(
+            "insum-torn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fixture.um");
+        write_um(
+            &path,
+            &[
+                FixtureNote::title_page(&ulid_seq(1), "Alpha", "first", &[]),
+                FixtureNote::plain_page(&ulid_seq(2), "Beta", &[]),
+            ],
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    }
+
+    fn assert_torn(err: UmError, cause: &str) {
+        assert_eq!(err.code, ErrorCode::ReadTorn, "code: {}", err.message);
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("cause"))
+                .and_then(|c| c.as_str()),
+            Some(cause),
+            "cause mismatch: {err:?}"
+        );
+        assert!(err.hint.is_some(), "READ_TORN carries a hint");
+    }
+
+    /// Every truncation of a valid `.um` — including the 1–3 byte stubs —
+    /// reports READ_TORN with a cause, never NOTE_NOT_FOUND /
+    /// NOTE_FILE_MISSING / MANIFEST_MISSING. (The uncut file opens fine —
+    /// covered by healthy_container_still_reads.)
+    #[test]
+    fn truncated_um_reports_read_torn_at_every_cut() {
+        let (path, bytes) = fixture();
+        let len = bytes.len();
+        for cut in 0..len {
+            std::fs::write(&path, &bytes[..cut]).unwrap();
+            let limits = Limits::defaults();
+            let err = UmContainer::open(&path, &limits).map(|_| ()).unwrap_err();
+            let expected_cause = if cut == 0 { "empty" } else { "truncated" };
+            assert_torn(err, expected_cause);
+            let err = peek_um_manifest(&path, &limits).map(|_| ()).unwrap_err();
+            assert_torn(err, expected_cause);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A central directory that survived while a payload did not: trash the
+    /// deflate stream of the first note entry (0xFF is never a valid block
+    /// header), so decompression fails mid-stream — the note read must
+    /// report READ_TORN, not a misleading per-note code.
+    #[test]
+    fn corrupted_payload_reports_read_torn() {
+        let (path, bytes) = fixture();
+        let entry = format!("notes/{}.json", ulid_seq(1));
+        let corrupted = trash_local_payload(&bytes, &entry);
+        std::fs::write(&path, &corrupted).unwrap();
+        let limits = Limits::defaults();
+        let mut container = UmContainer::open(&path, &limits).unwrap();
+        let note = container.notes_in_order()[0].clone();
+        let err = container.read_note(&note, &limits).unwrap_err();
+        assert_torn(err, "truncated");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Locate the named entry's local header and overwrite the first bytes
+    /// of its compressed data with 0xFF.
+    fn trash_local_payload(bytes: &[u8], entry: &str) -> Vec<u8> {
+        let mut i = 0;
+        while let Some(pos) = find(&bytes[i..], b"PK\x03\x04") {
+            let header = i + pos;
+            let name_len = u16::from_le_bytes([bytes[header + 26], bytes[header + 27]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[header + 28], bytes[header + 29]]) as usize;
+            let name = String::from_utf8_lossy(&bytes[header + 30..header + 30 + name_len]);
+            if name == entry {
+                let data = header + 30 + name_len + extra_len;
+                let mut out = bytes.to_vec();
+                for offset in 2..18 {
+                    out[data + offset] = 0xFF;
+                }
+                return out;
+            }
+            i = header + 4;
+        }
+        panic!("local header for {entry} not found in fixture");
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    #[test]
+    fn absent_and_empty_report_read_torn() {
+        let dir = std::env::temp_dir().join(format!("insum-torn-absent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits::defaults();
+
+        let absent = dir.join("missing.um");
+        assert_torn(
+            UmContainer::open(&absent, &limits).map(|_| ()).unwrap_err(),
+            "absent",
+        );
+        assert_torn(
+            peek_um_manifest(&absent, &limits).map(|_| ()).unwrap_err(),
+            "absent",
+        );
+
+        let empty = dir.join("empty.um");
+        std::fs::write(&empty, b"").unwrap();
+        assert_torn(
+            UmContainer::open(&empty, &limits).map(|_| ()).unwrap_err(),
+            "empty",
+        );
+
+        let absent_note = dir.join("missing.note");
+        assert_torn(
+            NoteFile::open(&absent_note, &limits, true)
+                .map(|_| ())
+                .unwrap_err(),
+            "absent",
+        );
+
+        let empty_note = dir.join("empty.note");
+        std::fs::write(&empty_note, b"").unwrap();
+        assert_torn(
+            NoteFile::open(&empty_note, &limits, true)
+                .map(|_| ())
+                .unwrap_err(),
+            "empty",
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file that was never a ZIP keeps NOT_A_ZIP — the new code must not
+    /// swallow the "wrong file type" diagnosis.
+    #[test]
+    fn not_a_zip_is_preserved() {
+        let dir = std::env::temp_dir().join(format!("insum-torn-notzip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("texty.um");
+        std::fs::write(
+            &path,
+            b"# this is a markdown file, definitely not a zip archive\n".repeat(4),
+        )
+        .unwrap();
+        let limits = Limits::defaults();
+        let err = UmContainer::open(&path, &limits).map(|_| ()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotAZip);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A valid container still opens and its note payload still parses —
+    /// the resilience rework must not disturb the healthy path.
+    #[test]
+    fn healthy_container_still_reads() {
+        let (path, _bytes) = fixture();
+        let limits = Limits::defaults();
+        let mut container = UmContainer::open(&path, &limits).unwrap();
+        let note = container.notes_in_order()[0].clone();
+        container.read_note(&note, &limits).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// `.note` corruption (not UTF-8) keeps NOTE_JSON_INVALID — only the
+    /// container-integrity classes move to READ_TORN.
+    #[test]
+    fn note_encoding_error_is_preserved() {
+        let dir = std::env::temp_dir().join(format!("insum-torn-noteutf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.note");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        let limits = Limits::defaults();
+        let err = NoteFile::open(&path, &limits, true)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoteJsonInvalid);
+        let legacy = dir.join("legacy.note");
+        write_legacy_note(
+            &legacy,
+            &serde_json::json!({ "type": "noteDoc", "content": [] }),
+        )
+        .unwrap();
+        NoteFile::open(&legacy, &limits, true).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
