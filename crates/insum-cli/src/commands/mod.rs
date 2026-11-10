@@ -3,6 +3,7 @@
 pub mod block;
 pub mod history;
 pub mod ls;
+pub mod migrate_ids;
 pub mod read;
 pub mod schema;
 pub mod search;

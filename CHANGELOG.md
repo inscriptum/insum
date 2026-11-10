@@ -7,6 +7,22 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum migrate-ids <file> [--note <id>]... [--dry-run]` (stage C, §7.2):
+  the one command allowed to stamp the `features.block_ids` marker (§4.6).
+  Plans ID fixes per note (missing/duplicate/invalid per document order —
+  the first valid ID is kept), returns the
+  `{pointer, old_id, new_id, type}` mapping; dry-run never touches bytes
+  or mtime and its preview IDs may differ from the commit. Real commit:
+  sidecar lock + dirty-lease refusal (§9), file and per-note revision
+  recheck inside the lock, atomic replace; untouched ZIP entries are
+  copied raw (byte-identical), unknown manifest fields survive. The
+  marker rides in the note descriptor's `features` object
+  (`block_ids: 1` + the schema fingerprint it was stamped under); the
+  descriptor's `schema` field (the editor profile) is untouched. Legacy
+  `.note` converts to the envelope shape of §4.6. A note whose IDs are
+  already complete still gets the marker — the marker records the
+  verification. `block get --id` now works on marker-bearing notes
+  (§6.3 gate lifted from unconditional refusal to marker-gated).
 - Search attribution invariant pinned: repeated stress runs over a
   multi-note corpus (heavy text sharing, `--note` filter, `.um`+`.note`
   mix) verify every match resolves `block get` by its own `note_id` and

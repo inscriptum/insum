@@ -543,20 +543,22 @@ fn limits_and_error_codes_are_enforced() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
 
-    // --id on stage A → USAGE exit 2
+    // --id before migration → USAGE exit 2 (the marker gate; the note must
+    // exist — resolution happens before the gate)
     let output = insum()
         .args([
             "block",
             "get",
             &corpus.path("regular.um"),
             "--note",
-            "x",
+            &fixtures::ulid_seq(1),
             "--id",
             "a1b2c3d4e5",
         ])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
 
     // validate --schema with a missing artifact → SCHEMA_UNAVAILABLE exit 6
     let output = insum()

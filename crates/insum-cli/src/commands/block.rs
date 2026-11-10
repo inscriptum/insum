@@ -20,17 +20,16 @@ pub fn run(
     raw: bool,
     limits: &Limits,
 ) -> Result<Value, UmError> {
-    if id.is_some() {
+    if pointer.is_some() && id.is_some() {
         return Err(UmError::usage(
-            "--id is not available on stage A: block IDs are not guaranteed until migration",
-        )
-        .with_hint("Address the block with --pointer for now."));
-    }
-    let Some(pointer) = pointer else {
-        return Err(UmError::usage(
-            "block get requires --pointer <pointer> (stage A)",
+            "--pointer and --id are mutually exclusive ways to address the block",
         ));
-    };
+    }
+    if pointer.is_none() && id.is_none() {
+        return Err(UmError::usage(
+            "block get requires --pointer <pointer> or --id <block-id>",
+        ));
+    }
     let rendered = render_path(path);
     let extension = path
         .extension()
@@ -56,16 +55,42 @@ pub fn run(
 
     // The block must exist as a traversable structural node.
     let all_blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
-    let entry: &BlockEntry = all_blocks
-        .iter()
-        .find(|block| block.pointer == pointer)
-        .ok_or_else(|| {
-            UmError::new(
-                ErrorCode::PointerNotFound,
-                format!("JSON Pointer {pointer:?} does not address a block of this note"),
-            )
-            .with_hint("Run `insum tree` to get valid pointers for this note revision.")
-        })?;
+    let entry: &BlockEntry = if let Some(id) = id {
+        // --id addressing is gated on the marker: before migration the IDs
+        // are not guaranteed (§4.6), after it the manifest vouches for them
+        if !view.block_ids_enabled {
+            return Err(UmError::usage(
+                "--id requires the note to carry the features.block_ids marker (run `insum migrate-ids` first)",
+            ));
+        }
+        all_blocks
+            .iter()
+            .find(|block| block.id.as_deref() == Some(id))
+            .ok_or_else(|| {
+                UmError::new(
+                    ErrorCode::BlockNotFound,
+                    format!("block id {id:?} does not address a block of this note"),
+                )
+                .with_hint(
+                    "Run `insum tree` to see the blocks and their ids for this note revision.",
+                )
+            })?
+    } else {
+        all_blocks
+            .iter()
+            .find(|block| block.pointer == pointer.unwrap())
+            .ok_or_else(|| {
+                UmError::new(
+                    ErrorCode::PointerNotFound,
+                    format!(
+                        "JSON Pointer {:?} does not address a block of this note",
+                        pointer.unwrap()
+                    ),
+                )
+                .with_hint("Run `insum tree` to get valid pointers for this note revision.")
+            })?
+    };
+    let pointer = entry.pointer.as_str();
 
     // Full node JSON at the pointer, with `attrs.id` lifted out;
     // `--raw` keeps the original document form.
