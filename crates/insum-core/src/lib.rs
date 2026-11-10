@@ -13,6 +13,7 @@ pub mod error;
 pub mod history;
 pub mod limits;
 pub mod lock;
+pub mod migrate;
 pub mod model;
 pub mod pmschema;
 pub mod pointer;

@@ -142,6 +142,19 @@ enum Command {
         #[arg(long, value_name = "NODE")]
         r#type: Option<String>,
     },
+    /// Assign guaranteed block IDs and stamp the `features.block_ids`
+    /// marker (stage C; the only writer of the marker).
+    MigrateIds {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Migrate only these notes (ids, repeatable); default: every note
+        /// that needs migration.
+        #[arg(long)]
+        note: Vec<String>,
+        /// Plan without writing; preview IDs may differ from commit IDs.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Readable change history of a file from git (read-only).
     History {
         /// A .um container or a .note file.
@@ -197,11 +210,13 @@ fn main() {
     // say so before running anything
     if !matches!(
         cli.command,
-        Some(Command::Validate { .. }) | Some(Command::Schema { .. })
+        Some(Command::Validate { .. })
+            | Some(Command::Schema { .. })
+            | Some(Command::MigrateIds { .. })
     ) && cli.schema.is_some()
     {
         let err = UmError::usage(
-            "--schema is supported by `insum schema` and `insum validate` only in this release",
+            "--schema is supported by `insum schema`, `insum validate` and `insum migrate-ids` only",
         );
         fail(&err, cli.pretty);
     }
@@ -301,6 +316,46 @@ fn main() {
         Some(Command::Schema { r#type }) => {
             commands::schema::run(cli.schema.as_deref(), r#type.as_deref(), &limits)
                 .map(Output::Json)
+        }
+        Some(Command::MigrateIds {
+            file,
+            note,
+            dry_run,
+        }) => {
+            let filters = if note.is_empty() {
+                None
+            } else {
+                Some(note.clone())
+            };
+            match file.extension().and_then(|e| e.to_str()) {
+                Some(ext) if ext.eq_ignore_ascii_case("um") => commands::migrate_ids::run_um(
+                    file,
+                    filters.as_deref(),
+                    cli.schema.as_deref(),
+                    *dry_run,
+                    &limits,
+                )
+                .map(Output::Json),
+                Some(ext) if ext.eq_ignore_ascii_case("note") => {
+                    if filters.is_some() {
+                        Err(UmError::usage(
+                            "--note is not allowed for a .note file (it holds a single document)",
+                        ))
+                    } else {
+                        commands::migrate_ids::run_note(
+                            file,
+                            cli.schema.as_deref(),
+                            *dry_run,
+                            &limits,
+                        )
+                        .map(Output::Json)
+                    }
+                }
+                _ => Err(UmError::new(
+                    insum_core::ErrorCode::PathNotFound,
+                    format!("no .um or .note document at {}", file.display()),
+                )),
+            }
         }
         Some(Command::History {
             file,
