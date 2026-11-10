@@ -447,6 +447,7 @@ impl FileLock {
             match sidecar.write_atomic(&path) {
                 Ok(()) => {
                     return Ok(FileLock {
+                        #[cfg(unix)]
                         identity: file_identity(&path),
                         path,
                         op_id: sidecar.op_id,
