@@ -62,6 +62,66 @@ fn write_artifact(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// Unpack one entry of a `.um` container (zip crate — no external tools).
+fn read_entry(file: &str, name: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(fs::File::open(file).unwrap()).unwrap();
+    let mut entry = archive.by_name(name).unwrap();
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+    out
+}
+
+/// Read one entry from in-memory container bytes.
+fn read_entry_bytes(bytes: &[u8], name: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    let mut entry = archive.by_name(name).unwrap();
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+    out
+}
+
+/// List entry names of a `.um` container.
+#[allow(dead_code)]
+fn entry_names(file: &str) -> Vec<String> {
+    let mut archive = zip::ZipArchive::new(fs::File::open(file).unwrap()).unwrap();
+    (0..archive.len())
+        .map(|i| {
+            archive
+                .by_index_raw(i)
+                .unwrap()
+                .name()
+                .unwrap()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// Rewrite one entry of a `.um` container in place (zip crate).
+fn patch_entry(file: &str, name: &str, new_bytes: &[u8]) {
+    let mut archive = zip::ZipArchive::new(fs::File::open(file).unwrap()).unwrap();
+    let buffer = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(buffer);
+    for index in 0..archive.len() {
+        let raw = archive.by_index_raw(index).unwrap();
+        let existing = raw.name().unwrap().into_owned();
+        if existing == name {
+            let last_modified = raw.last_modified().unwrap_or_default();
+            drop(raw);
+            writer
+                .start_file(
+                    existing.as_str(),
+                    zip::write::SimpleFileOptions::default().last_modified_time(last_modified),
+                )
+                .unwrap();
+            std::io::Write::write_all(&mut writer, new_bytes).unwrap();
+        } else {
+            writer.raw_copy_file(raw).unwrap();
+        }
+    }
+    let buffer = writer.finish().unwrap();
+    fs::write(file, buffer.into_inner()).unwrap();
+}
+
 fn stderr_json(output: &ProcessOutput) -> Value {
     assert!(output.stdout.is_empty(), "stdout stays empty on error");
     serde_json::from_slice(&output.stderr).expect("stderr is one JSON error object")
@@ -165,38 +225,14 @@ impl Fixture {
     }
 
     fn patch_manifest_unknown_field(&self, file: &str) {
-        let work = tempfile::TempDir::new().unwrap();
-        let status = std::process::Command::new("unzip")
-            .args([
-                "-q",
-                "-o",
-                file,
-                "-d",
-                work.path().to_string_lossy().as_ref(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let manifest_path = work.path().join("manifest.json");
-        let mut manifest: Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = read_entry(file, "manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&manifest).unwrap();
         manifest["owner_unknown"] = json!({"keep": "me"});
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        let out = self.dir.path().join("out.um");
-        let _ = fs::remove_file(&out);
-        let status = std::process::Command::new("zip")
-            .args(["-q", "-r", "-X"])
-            .arg(out.to_string_lossy().as_ref())
-            .args(["manifest.json", "notes", "assets"])
-            .current_dir(work.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        fs::copy(&out, file).unwrap();
+        patch_entry(
+            file,
+            "manifest.json",
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+        );
     }
 }
 
@@ -243,6 +279,7 @@ fn commit_fixes_ids_per_document_order_and_keeps_first_valid_duplicate() {
     let artifact = fixture.artifact();
     let file = fixture.container();
     fixture.patch_manifest_unknown_field(&file);
+    let fixture_bytes_before = fs::read(&file).unwrap();
     let output = insum()
         .args(["migrate-ids", &file, "--schema", &artifact])
         .output()
@@ -256,20 +293,7 @@ fn commit_fixes_ids_per_document_order_and_keeps_first_valid_duplicate() {
     assert_eq!(value["dry_run"], false);
 
     // unpack and verify
-    let work = tempfile::TempDir::new().unwrap();
-    let status = std::process::Command::new("unzip")
-        .args([
-            "-q",
-            "-o",
-            &file,
-            "-d",
-            work.path().to_string_lossy().as_ref(),
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(work.path().join("manifest.json")).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
     // criterion 26: marker + schema metadata per note
     for note in manifest["notes"].as_array().unwrap() {
         assert_eq!(note["features"]["block_ids"], 1);
@@ -289,13 +313,10 @@ fn commit_fixes_ids_per_document_order_and_keeps_first_valid_duplicate() {
     // unknown manifest fields survive
     assert_eq!(manifest["owner_unknown"]["keep"], "me");
 
-    let note1: Value = serde_json::from_slice(
-        &fs::read(
-            work.path()
-                .join(format!("notes/{}.json", insum_test_utils::ulid_seq(1))),
-        )
-        .unwrap(),
-    )
+    let note1: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", insum_test_utils::ulid_seq(1)),
+    ))
     .unwrap();
     let ids = collect_ids(&note1);
     // criterion 25: unique within the note
@@ -332,15 +353,27 @@ fn commit_fixes_ids_per_document_order_and_keeps_first_valid_duplicate() {
         "the second duplicate is remapped"
     );
 
-    // the untouched note payload is byte-identical (raw copy) — its ids were
-    // kept as they were; the marker rides in the manifest
-    let note2_new = fs::read(
-        work.path()
-            .join(format!("notes/{}.json", insum_test_utils::ulid_seq(2))),
-    )
-    .unwrap();
+    // the untouched note payload is byte-identical (raw copy); the marker
+    // rides in the manifest; assets survive byte-identically
+    let note2_new = read_entry(
+        &file,
+        &format!("notes/{}.json", insum_test_utils::ulid_seq(2)),
+    );
     let note2_doc: Value = serde_json::from_slice(&note2_new).unwrap();
     assert_eq!(collect_ids(&note2_doc), vec!["secondone0"]);
+    assert_eq!(
+        read_entry(&file, "assets/pic.png"),
+        read_entry_bytes(&fixture_bytes_before, "assets/pic.png"),
+        "asset entry is raw-copied byte-identically"
+    );
+    assert_eq!(
+        note2_new,
+        read_entry_bytes(
+            &fixture_bytes_before,
+            &format!("notes/{}.json", insum_test_utils::ulid_seq(2)),
+        ),
+        "untouched payload entry is raw-copied byte-identically"
+    );
 }
 
 #[test]
@@ -412,20 +445,7 @@ fn selection_by_note_id_migrates_only_that_note() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["notes"].as_array().unwrap().len(), 1);
 
-    let work = tempfile::TempDir::new().unwrap();
-    let status = std::process::Command::new("unzip")
-        .args([
-            "-q",
-            "-o",
-            &file,
-            "-d",
-            work.path().to_string_lossy().as_ref(),
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(work.path().join("manifest.json")).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
     let markers: Vec<bool> = manifest["notes"]
         .as_array()
         .unwrap()
@@ -483,29 +503,13 @@ fn unmarked_note_with_complete_ids_still_gets_the_marker() {
         "the manifest was rewritten"
     );
 
-    let work = tempfile::TempDir::new().unwrap();
-    let status = std::process::Command::new("unzip")
-        .args([
-            "-q",
-            "-o",
-            &file,
-            "-d",
-            work.path().to_string_lossy().as_ref(),
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(work.path().join("manifest.json")).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
     assert_eq!(manifest["notes"][0]["features"]["block_ids"], 1);
     // payloads unchanged: ids are the same as before
-    let payload: Value = serde_json::from_slice(
-        &fs::read(
-            work.path()
-                .join(format!("notes/{}.json", insum_test_utils::ulid_seq(1))),
-        )
-        .unwrap(),
-    )
+    let payload: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", insum_test_utils::ulid_seq(1)),
+    ))
     .unwrap();
     assert_eq!(collect_ids(&payload), vec!["alreadyok0", "anotherok1"]);
 }

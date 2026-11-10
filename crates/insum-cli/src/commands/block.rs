@@ -1,7 +1,8 @@
 //! `insum block get` — full subtree of one block.
 //!
-//! Stage A addresses blocks by `--pointer`; `--id` arrives with the migration
-//! stage and is rejected here.
+//! Stage A addresses blocks by `--pointer`; `--id` works on notes that
+//! carry the `features.block_ids` marker (migration stage C) — before it
+//! the IDs are not guaranteed (§4.6) and the flag is refused.
 
 use std::path::Path;
 
