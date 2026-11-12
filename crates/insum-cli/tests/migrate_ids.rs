@@ -1581,6 +1581,62 @@ fn validation_does_not_stage_into_the_shared_temp_dir() {
     assert!(leftovers.is_empty(), "no temp leftovers: {leftovers:?}");
 }
 
+/// D-6: a target whose NAME cannot carry the name-based staged suffix
+/// (the component would exceed the file-name cap: +30 bytes) must not fail
+/// the commit with ENAMETOOLONG while the dry-run was green — the staging
+/// falls back to the name-independent hidden prefix in the same directory,
+/// and both dry-run and commit stay green.
+#[cfg(unix)]
+#[test]
+fn long_target_name_stages_under_the_name_independent_prefix() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    // 230-byte base name: the target itself fits the component cap, the
+    // name-based tmp component (230 + 30) does not
+    let long = format!("{}.um", "n".repeat(227));
+    assert_eq!(
+        long.len(),
+        230,
+        "the target name is long enough to overflow the staged component"
+    );
+    let path = fixture.dir.path().join(&long);
+    let notes = [FixtureNote::title_page(
+        &insum_test_utils::ulid_seq(1),
+        "Alpha",
+        "first",
+        &[insum_test_utils::paragraph(&[insum_test_utils::text(
+            "body",
+        )])],
+    )];
+    insum_test_utils::write_um(&path, &notes).unwrap();
+    let file = path.to_string_lossy().into_owned();
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--dry-run", "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dry-run is green for a long target name: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the commit must not fail on the staged name length: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["written"], true);
+    // the migration actually happened on the long-named file
+    let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
+    assert_eq!(manifest["notes"][0]["features"]["block_ids"], 1);
+}
+
 /// m-13: `block get --id` verdicts are pinned by code, not just exit codes:
 /// a note the partial migration did not mark answers with the
 /// not-guaranteed warning even though its block carries a physical

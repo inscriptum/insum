@@ -636,9 +636,12 @@ fn pre_replace_verification(path: &Path, expected_rev: &str, what: &str) -> Resu
 /// artifacts are hidden and live beside the original). The name carries a
 /// random suffix and the file is created with `create_new` — a planted
 /// symlink or a pre-existing file is never followed or reused (M-4/M-5);
-/// on unix it is created 0600. The file is unlinked on drop — on every
-/// error path and on panic unwinding (m-2) — unless it became the target
-/// through a successful rename.
+/// on unix it is created 0600. A target whose name cannot carry the
+/// name-based suffix (file-name component caps) is staged under the
+/// name-independent hidden prefix `.insum-migrate-tmp-<hex>` in the same
+/// directory (D-6) — the same guarantees, none of the length. The file is
+/// unlinked on drop — on every error path and on panic unwinding (m-2) —
+/// unless it became the target through a successful rename.
 struct StagedFile {
     path: PathBuf,
     armed: bool,
@@ -651,10 +654,28 @@ impl StagedFile {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "insum".to_owned());
+        // D-6: the name-based component (".", the target name,
+        // ".migrate-tmp-" and 16 hex digits) is 30 bytes longer than the
+        // target's own name, and file-name components are length-capped — a
+        // long target failed the create with ENAMETOOLONG while the dry-run
+        // was green. Such a name (and any create failure that is not a
+        // collision) falls back to the name-independent hidden prefix in the
+        // SAME directory, with the same guarantees: create_new, 0600, never
+        // following a planted name.
+        const COMPONENT_CAP: usize = 255;
+        const FALLBACK_PREFIX: &str = ".insum-migrate-tmp";
+        let named_prefix = format!(".{name}.migrate-tmp");
+        // 17 = "-" + 16 hex digits of the random suffix
+        let mut prefix = if named_prefix.len() + 17 > COMPONENT_CAP {
+            FALLBACK_PREFIX.to_owned()
+        } else {
+            named_prefix
+        };
+        let mut using_fallback = prefix == FALLBACK_PREFIX;
         use rand::Rng;
         for _ in 0..64 {
             let suffix: u64 = rand::rng().random();
-            let candidate = parent.join(format!(".{name}.migrate-tmp-{suffix:016x}"));
+            let candidate = parent.join(format!("{prefix}-{suffix:016x}"));
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -676,6 +697,14 @@ impl StagedFile {
                 // another random suffix, never follow what is there
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
+                    if !using_fallback {
+                        // the name-based component can exceed a file-name
+                        // limit even when the target itself fits (D-6) —
+                        // retry once with the name-independent prefix
+                        using_fallback = true;
+                        prefix = FALLBACK_PREFIX.to_owned();
+                        continue;
+                    }
                     return Err(UmError::new(
                         ErrorCode::IoError,
                         format!(
