@@ -218,16 +218,24 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   non-dry-run responses carry `written: true|false`; every response
   carries `complete`. A rerun on a migrated note is a no-op
   (`written: false`).
-- **Response budget.** The report respects `UM_MAX_OUTPUT_BYTES`: note
-  plans are appended whole while they fit; an oversized report is
-  explicitly incomplete (`complete: false`, `truncated: true`,
-  `notes_total`/`notes_returned`, an `OUTPUT_BUDGET` warning naming
-  `--note` filters as the way to the remainder). The write itself always
-  covers every selected note — only the report can be partial. The first
-  note plan above the whole budget is emitted whole (the same documented
-  exception `tree` applies to a single oversized block). There is no
-  cursor pagination: the commit is one transaction, so a second page could
-  not reproduce mappings from an already-migrated file.
+- **Response budget.** The report respects `UM_MAX_OUTPUT_BYTES`,
+  budgeted over its final shape: a committed report reserves the
+  post-write `new_note_rev` of every note, so the emitted bytes never
+  exceed the budget. Note plans are appended whole while they fit; an
+  oversized report is explicitly incomplete (`complete: false`,
+  `truncated: true`, `notes_total`/`notes_returned`, an `OUTPUT_BUDGET`
+  warning). The write itself always covers every selected note — only
+  the report can be partial. The first note plan above the whole budget
+  is emitted whole (the same documented exception `tree` applies to a
+  single oversized block). There is no cursor pagination: the commit is
+  one transaction. The way to the remainder depends on the mode: in a
+  dry-run (and on a no-op rerun, `written: false`) the file is untouched,
+  so `--note <id>` filters re-derive the missing plans from it; after a
+  commit the file is migrated — a repeated `--note` rerun answers an
+  empty no-op — so the warning points to the stamped ids, readable with
+  `insum tree <file> --note <id>` (or `insum read`), and to the
+  pre-commit copy (git) that still holds the old ids at the same
+  pointers.
 - **Rollback and one-shot semantics.** The migration is one-shot; there is
   no `--unmark` flag and no built-in undo. Rollback is the user's git
   (restore the file from history). Removing the marker afterwards means

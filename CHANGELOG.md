@@ -27,18 +27,25 @@ Format — Keep a Changelog; versioning — SemVer.
   `BLOCK_IDS_NOT_GUARANTEED` warning (§6.5 — no silent answers), an
   absent ID stays `BLOCK_NOT_FOUND`, and the marker gate remains
   mandatory for the write API (stage D).
-- `migrate-ids` responses respect `UM_MAX_OUTPUT_BYTES` (§5.5): note
-  plans are appended whole while they fit the budget; an oversized
-  report is explicitly incomplete — `complete: false`, `truncated:
-  true`, `notes_total`/`notes_returned` and an `OUTPUT_BUDGET` warning
-  naming `--note <id>` filters as the way to the remainder (§6.5 —
-  silent truncation is forbidden). Every response carries `complete`.
-  A cursor pagination would not fit this command: the commit is one
-  transaction, so a second page could not reproduce mappings from an
-  already-migrated file. The operation itself always covers every
-  selected note — only the report can be partial; the first note plan
-  above the whole budget is emitted whole (the same documented
-  exception `tree` applies to a single oversized block).
+- `migrate-ids` responses respect `UM_MAX_OUTPUT_BYTES` (§5.5), budgeted
+  over the final response shape — a committed report reserves the
+  post-write `new_note_rev` of every note, so the emitted bytes never
+  exceed the budget (§6.5 — silent truncation is forbidden). Note plans
+  are appended whole while they fit the budget; an oversized report is
+  explicitly incomplete — `complete: false`, `truncated: true`,
+  `notes_total`/`notes_returned` and an `OUTPUT_BUDGET` warning whose
+  way to the remainder is mode-aware: a dry-run (and a no-op rerun,
+  `written: false`) names `--note <id>` filters — the file is untouched
+  and re-derivable; a committed report points to the stamped ids
+  (`insum tree <file> --note <id>`, `insum read`) and to the pre-commit
+  copy (git) that holds the old ids at the same pointers — a repeated
+  `--note` rerun after a commit answers an empty no-op. Every response
+  carries `complete`. A cursor pagination would not fit this command:
+  the commit is one transaction, so a second page could not reproduce
+  mappings from an already-migrated file. The operation itself always
+  covers every selected note — only the report can be partial; the
+  first note plan above the whole budget is emitted whole (the same
+  documented exception `tree` applies to a single oversized block).
 - Non-dry-run `migrate-ids` responses distinguish wrote from no-op with
   the top-level `written: true|false` flag.
 - `migrate-ids` response revisions are unambiguous: `notes[].note_rev`

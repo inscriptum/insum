@@ -799,6 +799,20 @@ fn report_respects_the_output_budget_and_marks_incompleteness() {
         warnings.iter().any(|w| w["code"] == "OUTPUT_BUDGET"),
         "the truncation is explained: {warnings:?}"
     );
+    // D-2: the dry-run file is untouched, so the warning names the --note
+    // route to the remainder (the committed warning names the stamped ids
+    // instead — asserted below)
+    let dry_warning = warnings
+        .iter()
+        .find(|w| w["code"] == "OUTPUT_BUDGET")
+        .unwrap();
+    assert!(
+        dry_warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("--note <id> filters"),
+        "the dry-run warning names the --note route: {dry_warning}"
+    );
     assert_eq!(
         before,
         fs::read(&file).unwrap(),
@@ -835,6 +849,24 @@ fn report_respects_the_output_budget_and_marks_incompleteness() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["complete"], false);
     assert_eq!(value["truncated"], true);
+    // D-2: the committed warning cannot send the consumer to --note
+    // filters — after the write they answer an empty no-op. It points to
+    // the stamped ids and the pre-commit copy instead, while the dry-run
+    // warning above keeps the --note route.
+    let warnings = value["warnings"].as_array().unwrap();
+    let budget_warning = warnings
+        .iter()
+        .find(|w| w["code"] == "OUTPUT_BUDGET")
+        .expect("the truncation is explained");
+    let message = budget_warning["message"].as_str().unwrap();
+    assert!(
+        message.contains("insum tree") && message.contains("pre-commit copy"),
+        "the committed warning names the readable ids and the pre-commit copy: {message}"
+    );
+    assert!(
+        !message.contains("--note <id> filters"),
+        "the committed warning does not dead-end into --note filters: {message}"
+    );
     let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
     let marked: Vec<bool> = manifest["notes"]
         .as_array()

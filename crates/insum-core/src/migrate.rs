@@ -499,13 +499,27 @@ struct Report {
 /// the budget holds for the bytes that are finally emitted (§6.5).
 const COMMIT_NOTE_RESERVE: usize = 96;
 
-/// The OUTPUT_BUDGET warning message. One source for the real response and
-/// for the envelope skeleton the budget measures over — the two cannot
-/// drift apart (D-1).
-fn truncation_warning_message(returned: usize, total: usize) -> String {
-    format!(
-        "the change report holds {returned} of {total} note plans to fit the output budget; the operation itself covers every selected note — pass --note <id> filters to inspect the remainder"
-    )
+/// The OUTPUT_BUDGET warning message, split by the response mode (D-2).
+/// One source for the real response and for the envelope skeleton the
+/// budget measures over — the two cannot drift apart (D-1).
+///
+/// A dry-run report (and the no-op rerun, `written: false`) describes a
+/// file that was not modified: the remainder is re-derivable from the same
+/// file with `--note <id>` filters. A COMMITTED report cannot be — the
+/// file is already migrated, a repeated `--note` rerun answers an empty
+/// no-op (`changes: []`, `written: false`) — so the warning points to
+/// where the stamped ids are readable and to the pre-commit copy that
+/// holds the old ids.
+fn truncation_warning_message(returned: usize, total: usize, committed: bool) -> String {
+    if committed {
+        format!(
+            "the change report holds {returned} of {total} note plans to fit the output budget; the write itself covered every selected note — the stamped ids are readable with `insum tree <file> --note <id>` (or `insum read`), and the old-to-new mapping per pointer is recoverable from the pre-commit copy (git)"
+        )
+    } else {
+        format!(
+            "the change report holds {returned} of {total} note plans to fit the output budget; the operation itself covers every selected note — pass --note <id> filters to inspect the remainder"
+        )
+    }
 }
 
 /// The envelope overhead of the FINAL response, measured over a skeleton
@@ -529,7 +543,9 @@ fn envelope_overhead(path: &Path) -> usize {
         "would_write": true,
         "warnings": [{
             "code": "OUTPUT_BUDGET",
-            "message": truncation_warning_message(0, 0),
+            // the skeleton measures the LONGEST variant (the committed one,
+            // D-2) — the budget must hold for whichever mode is emitted
+            "message": truncation_warning_message(0, 0, true),
         }],
     });
     // +16 covers the digit-width growth of the real counts against the
@@ -578,9 +594,11 @@ fn budgeted_report(
 }
 
 /// Declare the incompleteness on a response that carries a partial report:
-/// `truncated: true`, the counts, and a warning with the reason and the way
-/// to the remainder (§6.5). `complete` is already set at construction.
-fn apply_report_truncation(response: &mut Value, report: &Report) {
+/// `truncated: true`, the counts, and a warning with the reason and — mode
+/// aware (D-2) — the way to the remainder (§6.5). `complete` is already
+/// set at construction; `committed` marks a response whose file was
+/// actually written.
+fn apply_report_truncation(response: &mut Value, report: &Report, committed: bool) {
     response["truncated"] = json!(true);
     response["notes_total"] = json!(report.notes_total);
     response["notes_returned"] = json!(report.notes.len());
@@ -591,7 +609,7 @@ fn apply_report_truncation(response: &mut Value, report: &Report) {
         .unwrap_or_default();
     warnings.push(json!({
         "code": "OUTPUT_BUDGET",
-        "message": truncation_warning_message(report.notes.len(), report.notes_total),
+        "message": truncation_warning_message(report.notes.len(), report.notes_total, committed),
     }));
     response["warnings"] = Value::Array(warnings);
 }
@@ -921,7 +939,9 @@ pub fn migrate_um(
             "would_write": would_write,
         });
         if report.truncated {
-            apply_report_truncation(&mut response, &report);
+            // the file was not touched: the remainder is reachable with
+            // --note filters (D-2)
+            apply_report_truncation(&mut response, &report, false);
         }
         return Ok(response);
     }
@@ -937,7 +957,9 @@ pub fn migrate_um(
             "file_rev": file_rev_before,
         });
         if report.truncated {
-            apply_report_truncation(&mut response, &report);
+            // written:false — the file was not touched: the remainder is
+            // reachable with --note filters (D-2)
+            apply_report_truncation(&mut response, &report, false);
         }
         return Ok(response);
     }
@@ -1177,7 +1199,10 @@ fn commit_um(
         "file_rev": new_file_rev,
     });
     if report.truncated {
-        apply_report_truncation(&mut response, report);
+        // written:true — the file is migrated: a repeated --note filter
+        // would answer an empty no-op, so the warning points to the stamped
+        // ids and the pre-commit copy instead (D-2)
+        apply_report_truncation(&mut response, report, true);
     }
     Ok(response)
 }
