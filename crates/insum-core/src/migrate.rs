@@ -748,12 +748,19 @@ pub fn migrate_um(
     let mut container = UmContainer::open(path, limits)?;
     let file_rev_before = container.file_rev()?;
 
-    // selection: note ids (--note repeats) or every note needing migration
+    // selection: note ids (--note repeats) or every note needing migration.
+    // A note is selected once even when named repeatedly or through both
+    // its id and its title (m-7): duplicate selections would be planned
+    // twice with independently generated ids and collide in the rewrite.
     let selected: Vec<crate::model::NoteDescriptor> = match filters {
         Some(filters) => {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut out = Vec::new();
             for filter in filters {
-                out.push(container.find_note(filter)?.clone());
+                let descriptor = container.find_note(filter)?;
+                if seen.insert(descriptor.id.clone()) {
+                    out.push(descriptor.clone());
+                }
             }
             out
         }

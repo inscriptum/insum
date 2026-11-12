@@ -105,6 +105,9 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Fixed
 
+- `migrate-ids` no longer fails with `INTERNAL` on a repeated `--note <id>`
+  filter: a note named several times is selected and planned once, so the
+  independently generated preview ids can no longer collide in the rewrite.
 - Annotated reading neutralizes the `<!--` sequence coming from document
   text — document content can no longer forge CLI anchors or markers.
 - The oversized-block marker is no longer lost when content follows the

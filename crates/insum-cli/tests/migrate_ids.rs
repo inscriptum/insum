@@ -470,6 +470,64 @@ fn selection_by_note_id_migrates_only_that_note() {
     let _ = before;
 }
 
+/// m-7: repeating a filter selects the note ONCE (`migrate-ids --note`
+/// takes note ids). Duplicate selections used to be planned twice with
+/// independently generated ids and collided in the rewrite (INTERNAL).
+#[test]
+fn duplicate_note_filters_select_the_note_once() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let id = insum_test_utils::ulid_seq(1);
+
+    // dry-run: one plan for the doubly-named note
+    let output = insum()
+        .args([
+            "migrate-ids",
+            &file,
+            "--dry-run",
+            "--schema",
+            &artifact,
+            "--note",
+            &id,
+            "--note",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "duplicate filters select the note once: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["notes"].as_array().unwrap().len(), 1, "one plan");
+
+    // the commit path (where the duplicates used to collide): succeeds and
+    // reports the note once
+    let output = insum()
+        .args([
+            "migrate-ids",
+            &file,
+            "--schema",
+            &artifact,
+            "--note",
+            &id,
+            "--note",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["written"], true);
+    assert_eq!(value["notes"].as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn unmarked_note_with_complete_ids_still_gets_the_marker() {
     let fixture = Fixture::new();
