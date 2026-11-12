@@ -849,12 +849,6 @@ pub fn migrate_um(
     // §9.3: a symlink or non-regular source is refused before any work —
     // dry-run and commit refuse alike (plan == commit)
     ensure_writable_source(path)?;
-    // plan == commit (R3COR-1): the write lock sidecar is named after the
-    // target (§9.2 — a cross-tool contract with the plugin, so there is no
-    // fallback name). A target whose name leaves no room for the sidecar
-    // component can never take the lock; refusing in the plan phase makes
-    // the dry-run answer exactly what the commit would produce
-    check_sidecar_name_fits(path)?;
     let resolved = resolve_for_write(path, schema, limits)?;
     let meta = SchemaMeta {
         id: resolved.artifact.schema_id.clone(),
@@ -930,6 +924,19 @@ pub fn migrate_um(
         .iter()
         .zip(selected.iter())
         .any(|(plan, descriptor)| plan.change_count() > 0 || !descriptor.block_ids_enabled());
+    // plan == commit (R3COR-1, gated by R4SEC-1): the write lock sidecar is
+    // named after the target (§9.2 — a cross-tool contract with the plugin,
+    // so there is no fallback name), so a run that would take the lock
+    // refuses here with the same error the lock phase produces. A no-op run
+    // (would_write:false) exits before acquire_write_lock and never touches
+    // the sidecar — it keeps the pre-R3COR-1 green answer for long names.
+    // The gate sits after the plan: shape/plan errors of the plan phase
+    // keep their deterministic order, identical in dry-run and commit.
+    // acquire_write_lock re-runs the check, so the write paths keep the
+    // refusal even without this call.
+    if would_write {
+        check_sidecar_name_fits(path)?;
+    }
     // the report is budgeted over the FINAL response shape (D-1): a commit
     // adds the post-write `new_note_rev` to every reported note after this
     // pass, so each note reserves that growth
@@ -1265,11 +1272,6 @@ pub fn migrate_note_file(
     // §9.3: a symlink or non-regular source is refused before any work —
     // dry-run and commit refuse alike (plan == commit)
     ensure_writable_source(path)?;
-    // plan == commit (R3COR-1): the same sidecar-name room check as the
-    // .um path — migrate_note_file also takes the write lock through
-    // acquire_write_lock, so the .note dry-run must refuse when the sidecar
-    // component cannot fit, exactly as the commit would
-    check_sidecar_name_fits(path)?;
     let resolved = resolve_for_write(path, schema, limits)?;
     let addressable = addressable_types(&resolved.artifact);
     let rules = IdRules::from_artifact(&resolved.artifact)?;
@@ -1326,6 +1328,23 @@ pub fn migrate_note_file(
         limits,
     )?;
 
+    // a marker-less envelope is written even when its ids are complete: the
+    // marker records the verification itself (§4.6)
+    let would_write = plan.change_count() > 0 || !marker_set;
+    // plan == commit (R3COR-1, gated by R4SEC-1): the same sidecar-name room
+    // check as the .um path — migrate_note_file also takes the write lock
+    // through acquire_write_lock, so a run that would take the lock refuses
+    // here with the same error the lock phase produces. A no-op run
+    // (would_write:false) exits before acquire_write_lock and never touches
+    // the sidecar — it keeps the pre-R3COR-1 green answer for long names.
+    // The gate sits after the plan: shape/plan errors of the plan phase
+    // keep their deterministic order, identical in dry-run and commit.
+    // acquire_write_lock re-runs the check, so the write path keeps the
+    // refusal even without this call.
+    if would_write {
+        check_sidecar_name_fits(path)?;
+    }
+
     if dry_run {
         return Ok(json!({
             "api_version": 1,
@@ -1333,11 +1352,11 @@ pub fn migrate_note_file(
             "path": path.display().to_string(),
             "notes": [plan.to_json()],
             "complete": true,
-            "would_write": plan.change_count() > 0 || !marker_set,
+            "would_write": would_write,
         }));
     }
 
-    if plan.change_count() == 0 && marker_set {
+    if !would_write {
         return Ok(json!({
             "api_version": 1,
             "dry_run": false,

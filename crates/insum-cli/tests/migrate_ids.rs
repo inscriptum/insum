@@ -1912,6 +1912,258 @@ fn long_named_note_file_refuses_in_the_plan_phase() {
     );
 }
 
+/// R4SEC-1: the plan-phase sidecar-name check (R3COR-1) refuses only a run
+/// that would actually take the write lock. A FULLY migrated container has
+/// no work: the dry-run answers would_write:false and the commit answers
+/// written:false, both before acquire_write_lock — the long target name
+/// must not turn these no-op runs into IO_ERROR (the pre-R3COR-1 behavior
+/// is restored for the no-op class).
+#[cfg(unix)]
+#[test]
+fn fully_migrated_long_named_um_container_no_op_stays_green() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    // migrate fully under a short name (under the long name this run would
+    // refuse — there IS work here)
+    let first = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let migrated: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(migrated["written"], true);
+
+    // 250-byte name: the sidecar components (250 + 12, 250 + 13) do not fit
+    // the component cap — but the rerun has no work, so no sidecar is needed
+    let long = format!("{}.um", "n".repeat(247));
+    assert_eq!(long.len(), 250);
+    let long_path = fixture.dir.path().join(&long);
+    fs::rename(&file, &long_path).unwrap();
+    let long_file = long_path.to_string_lossy().into_owned();
+    let before = fs::read(&long_file).unwrap();
+
+    let output = insum()
+        .args([
+            "migrate-ids",
+            &long_file,
+            "--schema",
+            &artifact,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the dry-run no-op stays green on a long name: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dry: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(dry["would_write"], false);
+    assert_eq!(dry["dry_run"], true);
+
+    let output = insum()
+        .args(["migrate-ids", &long_file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the commit no-op stays green on a long name: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(commit["written"], false);
+    assert_eq!(
+        before,
+        fs::read(&long_file).unwrap(),
+        "the no-op commit leaves the file alone"
+    );
+    let leftovers: Vec<_> = fs::read_dir(fixture.dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.contains("insum-lock")
+                || name.contains("insum-lease")
+                || name.contains("migrate-tmp")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no sidecar or tmp leftovers: {leftovers:?}"
+    );
+}
+
+/// R4SEC-1 on the `.note` path: the same no-op gating — a fully migrated
+/// envelope (marker set, ids complete) renamed to a sidecar-unfriendly long
+/// name reruns green in both modes (would_write:false / written:false).
+#[cfg(unix)]
+#[test]
+fn fully_migrated_long_named_note_file_no_op_stays_green() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    // migrate a legacy note under a short name
+    let short_path = fixture.dir.path().join("m.note");
+    let doc = json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "noteTitle", "content": [{"type": "text", "text": "Alpha"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "body"}]}
+        ]
+    });
+    fs::write(&short_path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let short_file = short_path.to_string_lossy().into_owned();
+    let first = insum()
+        .args(["migrate-ids", &short_file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let migrated: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(migrated["written"], true);
+
+    let long = format!("{}.note", "n".repeat(245));
+    assert_eq!(long.len(), 250);
+    let long_path = fixture.dir.path().join(&long);
+    fs::rename(&short_path, &long_path).unwrap();
+    let long_file = long_path.to_string_lossy().into_owned();
+    let before = fs::read(&long_file).unwrap();
+
+    let output = insum()
+        .args([
+            "migrate-ids",
+            &long_file,
+            "--schema",
+            &artifact,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the dry-run no-op stays green on a long name: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dry: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(dry["would_write"], false);
+    assert_eq!(dry["dry_run"], true);
+
+    let output = insum()
+        .args(["migrate-ids", &long_file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the commit no-op stays green on a long name: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(commit["written"], false);
+    assert_eq!(
+        before,
+        fs::read(&long_file).unwrap(),
+        "the no-op commit leaves the file alone"
+    );
+}
+
+/// R4SEC-1 ordering pin: the sidecar gate sits AFTER the plan, so a target
+/// with two problems (a long name AND a broken shape) refuses with the
+/// plan-phase shape error — not the sidecar IO_ERROR that 85ba0e4 answered
+/// first. The whole plan phase is mode-independent, so the order is one and
+/// the same in dry-run and commit (plan == commit).
+#[cfg(unix)]
+#[test]
+fn long_named_target_with_a_broken_shape_refuses_the_shape_first() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let long_um = format!("{}.um", "n".repeat(247));
+    assert_eq!(long_um.len(), 250);
+    let um_path = fixture.dir.path().join(&long_um);
+    let notes = [FixtureNote::title_page(
+        &insum_test_utils::ulid_seq(1),
+        "Alpha",
+        "first",
+        &[insum_test_utils::paragraph(&[insum_test_utils::text(
+            "body",
+        )])],
+    )];
+    insum_test_utils::write_um(&um_path, &notes).unwrap();
+    // corrupt the descriptor's features to a string (the D-4 shape fault)
+    let um_file = um_path.to_string_lossy().into_owned();
+    let manifest = read_entry(&um_file, "manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    manifest["notes"][0]["features"] = json!("corrupt");
+    patch_entry(
+        &um_file,
+        "manifest.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+
+    // a long-named envelope with a non-object features field (the same
+    // two-problem combination on the .note path)
+    let long_note = format!("{}.note", "n".repeat(245));
+    assert_eq!(long_note.len(), 250);
+    let note_path = fixture.dir.path().join(&long_note);
+    let envelope = json!({
+        "format": "inscriptum-note",
+        "version": 1,
+        "features": 5,
+        "document": {
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "Alpha"}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": "body"}]}
+            ]
+        }
+    });
+    fs::write(&note_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    for (file, code, fragment) in [
+        (um_file, "MANIFEST_INVALID", "non-object features field"),
+        (
+            note_path.to_string_lossy().into_owned(),
+            "NOTE_DOC_INVALID",
+            "not an object",
+        ),
+    ] {
+        let mut errors: Vec<Value> = Vec::new();
+        for extra in [vec!["--dry-run"], vec![]] {
+            let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+            args.extend(extra.iter());
+            let output = insum().args(&args).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(4),
+                "{code} exits 4 ({extra:?}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let err = stderr_json(&output);
+            assert_eq!(err["error"]["code"], code, "{extra:?}");
+            let message = err["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(fragment),
+                "the shape refusal wins ({extra:?}): {message}"
+            );
+            assert!(
+                !message.contains("too long for the lock sidecar"),
+                "the sidecar gate does not preempt the plan-phase shape refusal ({extra:?})"
+            );
+            errors.push(err);
+        }
+        assert_eq!(
+            errors[0], errors[1],
+            "plan == commit: the two-problem order is identical in dry-run and commit"
+        );
+    }
+}
+
 /// m-13: `block get --id` verdicts are pinned by code, not just exit codes:
 /// a note the partial migration did not mark answers with the
 /// not-guaranteed warning even though its block carries a physical
