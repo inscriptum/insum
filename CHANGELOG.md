@@ -27,6 +27,18 @@ Format — Keep a Changelog; versioning — SemVer.
   `BLOCK_IDS_NOT_GUARANTEED` warning (§6.5 — no silent answers), an
   absent ID stays `BLOCK_NOT_FOUND`, and the marker gate remains
   mandatory for the write API (stage D).
+- `migrate-ids` responses respect `UM_MAX_OUTPUT_BYTES` (§5.5): note
+  plans are appended whole while they fit the budget; an oversized
+  report is explicitly incomplete — `complete: false`, `truncated:
+  true`, `notes_total`/`notes_returned` and an `OUTPUT_BUDGET` warning
+  naming `--note <id>` filters as the way to the remainder (§6.5 —
+  silent truncation is forbidden). Every response carries `complete`.
+  A cursor pagination would not fit this command: the commit is one
+  transaction, so a second page could not reproduce mappings from an
+  already-migrated file. The operation itself always covers every
+  selected note — only the report can be partial; the first note plan
+  above the whole budget is emitted whole (the same documented
+  exception `tree` applies to a single oversized block).
 - Search attribution invariant pinned: repeated stress runs over a
   multi-note corpus (heavy text sharing, `--note` filter, `.um`+`.note`
   mix) verify every match resolves `block get` by its own `note_id` and

@@ -479,6 +479,70 @@ fn revision_mismatch(expected: &str, actual: &str, what: &str) -> UmError {
     .with_details(json!({ "expected": expected, "actual": actual }))
 }
 
+/// The change report is budgeted like every other command's output (§5.5):
+/// note plans are appended whole while they fit `UM_MAX_OUTPUT_BYTES`, and
+/// an incomplete report says so explicitly (§6.5 — silent truncation is
+/// forbidden). A tree-style cursor does not fit this command: the commit is
+/// one transaction, so a second page could not reproduce the remaining
+/// mappings from an already-migrated file — the remainder is reached with
+/// `--note <id>` filters instead. The operation itself always covers every
+/// selected note; only the report can be partial.
+struct Report {
+    notes: Vec<Value>,
+    notes_total: usize,
+    truncated: bool,
+}
+
+/// Build the report over all plans; the first note plan is emitted whole
+/// even above the budget (documented exception, same rule as `tree`'s
+/// oversized block) — a response must at least name what it did.
+fn budgeted_report(plans: &[MigrateNotePlan], limits: &Limits) -> Report {
+    let budget = limits.output_bytes(None);
+    let mut used: usize = 256; // envelope overhead estimate
+    let mut notes = Vec::new();
+    for plan in plans {
+        let note_json = plan.to_json();
+        let size = serde_json::to_string(&note_json).map_or(256, |s| s.len() + 1);
+        if !notes.is_empty() && used + size > budget {
+            return Report {
+                notes,
+                notes_total: plans.len(),
+                truncated: true,
+            };
+        }
+        used += size + 1;
+        notes.push(note_json);
+    }
+    Report {
+        notes,
+        notes_total: plans.len(),
+        truncated: false,
+    }
+}
+
+/// Declare the incompleteness on a response that carries a partial report:
+/// `truncated: true`, the counts, and a warning with the reason and the way
+/// to the remainder (§6.5). `complete` is already set at construction.
+fn apply_report_truncation(response: &mut Value, report: &Report) {
+    response["truncated"] = json!(true);
+    response["notes_total"] = json!(report.notes_total);
+    response["notes_returned"] = json!(report.notes.len());
+    let mut warnings = response
+        .get("warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    warnings.push(json!({
+        "code": "OUTPUT_BUDGET",
+        "message": format!(
+            "the change report holds {} of {} note plans to fit the output budget; the operation itself covers every selected note — pass --note <id> filters to inspect the remainder",
+            report.notes.len(),
+            report.notes_total
+        ),
+    }));
+    response["warnings"] = Value::Array(warnings);
+}
+
 /// §9.3 MUST: the write path refuses a symlink source and any non-regular
 /// source — the link is never followed to its target and never silently
 /// replaced by a regular file. Runs before any other work, so dry-run and
@@ -725,7 +789,7 @@ pub fn migrate_um(
         )?;
         plans.push(plan);
     }
-    let notes_json: Vec<Value> = plans.iter().map(|p| p.to_json()).collect();
+    let report = budgeted_report(&plans, limits);
     // a note without the marker is written even when its ids are complete:
     // the marker records the verification itself (§4.6)
     let would_write = plans
@@ -734,23 +798,33 @@ pub fn migrate_um(
         .any(|(plan, descriptor)| plan.change_count() > 0 || !descriptor.block_ids_enabled());
 
     if dry_run {
-        return Ok(json!({
+        let mut response = json!({
             "api_version": 1,
             "dry_run": true,
             "path": path.display().to_string(),
-            "notes": notes_json,
+            "notes": report.notes,
+            "complete": !report.truncated,
             "would_write": would_write,
-        }));
+        });
+        if report.truncated {
+            apply_report_truncation(&mut response, &report);
+        }
+        return Ok(response);
     }
 
     if !would_write {
-        return Ok(json!({
+        let mut response = json!({
             "api_version": 1,
             "dry_run": false,
             "path": path.display().to_string(),
-            "notes": notes_json,
+            "notes": report.notes,
+            "complete": !report.truncated,
             "file_rev": file_rev_before,
-        }));
+        });
+        if report.truncated {
+            apply_report_truncation(&mut response, &report);
+        }
+        return Ok(response);
     }
 
     // transactional commit: lock → recheck → rewrite → validate → release
@@ -762,6 +836,7 @@ pub fn migrate_um(
         &mut container,
         &selected,
         &plans,
+        &report,
         &meta,
         &attrs_key,
         &addressable,
@@ -869,13 +944,16 @@ fn validation_refusal(note: &str, code: &str, message: String) -> UmError {
 }
 
 /// Lock-held phase of the `.um` commit: revision recheck, rewrite,
-/// validation of the result (§12), atomic replace.
+/// validation of the result (§12), atomic replace. The report (already
+/// budgeted against the plan) shapes the response — the write itself
+/// covers every selected note even when the report is partial.
 #[allow(clippy::too_many_arguments)]
 fn commit_um(
     path: &Path,
     container: &mut UmContainer,
     selected: &[crate::model::NoteDescriptor],
     plans: &[MigrateNotePlan],
+    report: &Report,
     meta: &SchemaMeta,
     attrs_key: &str,
     addressable: &BTreeSet<String>,
@@ -938,13 +1016,18 @@ fn commit_um(
     let new_file_rev = crate::container::file_sha256(staged.path())?;
     staged.commit_to(path, mode)?;
 
-    Ok(json!({
+    let mut response = json!({
         "api_version": 1,
         "dry_run": false,
         "path": path.display().to_string(),
-        "notes": plans.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
+        "notes": report.notes,
+        "complete": !report.truncated,
         "file_rev": new_file_rev,
-    }))
+    });
+    if report.truncated {
+        apply_report_truncation(&mut response, report);
+    }
+    Ok(response)
 }
 
 /// Pre-commit validation (§12: the result passes validation before commit):
@@ -1031,6 +1114,7 @@ pub fn migrate_note_file(
             "dry_run": true,
             "path": path.display().to_string(),
             "notes": [plan.to_json()],
+            "complete": true,
             "would_write": plan.change_count() > 0 || !marker_set,
         }));
     }
@@ -1041,6 +1125,7 @@ pub fn migrate_note_file(
             "dry_run": false,
             "path": path.display().to_string(),
             "notes": [plan.to_json()],
+            "complete": true,
             "file_rev": note_file.file_rev.clone(),
         }));
     }
@@ -1182,6 +1267,7 @@ fn commit_note_file(
         "dry_run": false,
         "path": path.display().to_string(),
         "notes": [plan.to_json()],
+        "complete": true,
         "file_rev": note_rev_for_file_bytes(&new_bytes),
     }))
 }
@@ -1545,6 +1631,7 @@ mod tests {
             &mut container,
             std::slice::from_ref(&descriptor),
             std::slice::from_ref(&plan),
+            &budgeted_report(std::slice::from_ref(&plan), &limits),
             &meta,
             &attrs_key,
             &addressable,

@@ -646,6 +646,104 @@ fn artifact_is_resolved_from_the_target_vault_not_the_cwd() {
     );
 }
 
+/// M-9: the change report respects UM_MAX_OUTPUT_BYTES — an oversized
+/// report is explicitly incomplete (`complete: false`, `truncated: true`,
+/// counts and an OUTPUT_BUDGET warning; §6.5 forbids silent truncation),
+/// while the operation itself still covers every selected note. The
+/// remainder is reachable with `--note` filters (a cursor cannot work:
+/// the commit is one transaction).
+#[test]
+fn report_respects_the_output_budget_and_marks_incompleteness() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let before = fs::read(&file).unwrap();
+
+    // a budget below the first note plan: the first note is emitted whole
+    // (documented oversized-first-note exception), the rest is truncated
+    // with the counts and the warning
+    let output = insum()
+        .args(["migrate-ids", &file, "--dry-run", "--schema", &artifact])
+        .env("UM_MAX_OUTPUT_BYTES", "100")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["complete"], false);
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["notes_total"], 2);
+    assert_eq!(value["notes_returned"], 1);
+    assert_eq!(value["notes"].as_array().unwrap().len(), 1);
+    let warnings = value["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w["code"] == "OUTPUT_BUDGET"),
+        "the truncation is explained: {warnings:?}"
+    );
+    assert_eq!(
+        before,
+        fs::read(&file).unwrap(),
+        "the truncated dry-run still does not touch the file"
+    );
+
+    // the remainder is reachable with --note filters
+    let output = insum()
+        .args([
+            "migrate-ids",
+            &file,
+            "--dry-run",
+            "--note",
+            &insum_test_utils::ulid_seq(2),
+            "--schema",
+            &artifact,
+        ])
+        .env("UM_MAX_OUTPUT_BYTES", "100")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["notes"].as_array().unwrap().len(), 1);
+
+    // the commit under the same tiny budget still migrates EVERY selected
+    // note — only the report is partial
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .env("UM_MAX_OUTPUT_BYTES", "100")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["complete"], false);
+    assert_eq!(value["truncated"], true);
+    let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
+    let marked: Vec<bool> = manifest["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["features"]["block_ids"] == 1)
+        .collect();
+    assert_eq!(
+        marked,
+        vec![true, true],
+        "the write covers every selected note despite the partial report"
+    );
+
+    // default budget: the full report is complete and carries no truncation
+    // markers
+    let fixture2 = Fixture::new();
+    let file2 = fixture2.container();
+    let output = insum()
+        .args(["migrate-ids", &file2, "--dry-run", "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["complete"], true);
+    assert!(value.get("truncated").is_none());
+    assert!(value.get("warnings").is_none());
+    assert_eq!(value["notes"].as_array().unwrap().len(), 2);
+}
+
 #[test]
 fn tampered_artifact_refuses_to_write() {
     let fixture = Fixture::new();
