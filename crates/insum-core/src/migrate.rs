@@ -179,14 +179,7 @@ impl MigrateNotePlan {
 
 /// Addressable node types come from the artifact (`addressable: true`) —
 /// never from a hardcoded Rust list (§4.7).
-fn addressable_types(artifact: &crate::schema::SchemaArtifact) -> BTreeSet<String> {
-    artifact
-        .nodes
-        .iter()
-        .filter(|(_, spec)| spec.addressable)
-        .map(|(name, _)| name.clone())
-        .collect()
-}
+use crate::schema::addressable_types;
 
 /// Set the planned `attrs.id` values on a document. The pointers are the
 /// same the plan was built with; unknown fields stay untouched (§12). A
@@ -553,6 +546,19 @@ pub fn migrate_um(
             &generator,
             &attrs_key,
         )?;
+        // plan == commit: the dry-run must show the same refusal the commit
+        // would produce, so the planned document is validated here with the
+        // same shared check the pre-commit validation runs (B-1)
+        let mut planned_doc = parsed.note.doc.clone();
+        apply_ids(&mut planned_doc, &plan.changes, &attrs_key)?;
+        validate_migrated_doc(
+            &descriptor.id,
+            &planned_doc,
+            &plan,
+            &addressable,
+            &attrs_key,
+            limits,
+        )?;
         plans.push(plan);
     }
     let notes_json: Vec<Value> = plans.iter().map(|p| p.to_json()).collect();
@@ -594,6 +600,7 @@ pub fn migrate_um(
         &plans,
         &meta,
         &attrs_key,
+        &addressable,
         limits,
     );
     match outcome {
@@ -608,8 +615,95 @@ pub fn migrate_um(
     }
 }
 
+/// The post-migration document must satisfy the contract the marker vouches
+/// for (§10.1): every planned id present at its pointer, ids unique per
+/// note, grammar-valid, and required for artifact-addressable types only
+/// (§4.7 — the id-required universe is the same one `plan_note` schedules
+/// against). Dry-run runs this on the planned copy of the document; commit
+/// runs it on the rewritten container — one shared implementation keeps
+/// `dry-run == commit`.
+fn validate_migrated_doc(
+    note: &str,
+    doc: &Value,
+    plan: &MigrateNotePlan,
+    addressable: &BTreeSet<String>,
+    attrs_key: &str,
+    limits: &Limits,
+) -> Result<(), UmError> {
+    for change in &plan.changes {
+        let actual = pointer::resolve(doc, &change.pointer)
+            .ok()
+            .and_then(|node| {
+                node.get("attrs")
+                    .and_then(|attrs| attrs.get(attrs_key))
+                    .and_then(Value::as_str)
+            });
+        if actual != Some(change.new_id.as_str()) {
+            return Err(UmError::internal(format!(
+                "note {note:?} does not carry the planned id at {}",
+                change.pointer
+            )));
+        }
+    }
+    // ids unique within the note
+    let mut ids: Vec<String> = Vec::new();
+    fn collect(node: &Value, attrs_key: &str, ids: &mut Vec<String>) {
+        if let Some(id) = node
+            .get("attrs")
+            .and_then(|attrs| attrs.get(attrs_key))
+            .and_then(Value::as_str)
+        {
+            ids.push(id.to_owned());
+        }
+        if let Some(children) = node.get("content").and_then(Value::as_array) {
+            for child in children {
+                collect(child, attrs_key, ids);
+            }
+        }
+    }
+    collect(doc, attrs_key, &mut ids);
+    let unique: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+    if ids.len() != unique.len() {
+        return Err(validation_refusal(
+            note,
+            "BLOCK_ID_DUPLICATE",
+            format!("note {note:?} has duplicate ids"),
+        ));
+    }
+    // structural validation with the artifact-addressable id universe
+    let validation =
+        crate::validate_note_doc_with_schema(doc, true, limits, None, Some(addressable))?;
+    if !validation.valid() {
+        let first = validation.errors.first();
+        return Err(validation_refusal(
+            note,
+            first.map(|d| d.code).unwrap_or("NOTE_DOC_INVALID"),
+            format!(
+                "note {note:?} would not satisfy the block-id contract: {}",
+                first.map(|d| d.message.clone()).unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Classify a validation refusal with an existing registry code (§11): the
+/// marker must not lie, and a data problem is exit 4 — never INTERNAL.
+fn validation_refusal(note: &str, code: &str, message: String) -> UmError {
+    let code = match code {
+        "BLOCK_ID_MISSING" => ErrorCode::BlockIdMissing,
+        "BLOCK_ID_DUPLICATE" => ErrorCode::BlockIdDuplicate,
+        "BLOCK_ID_INVALID" => ErrorCode::BlockIdInvalid,
+        _ => ErrorCode::NoteDocInvalid,
+    };
+    UmError::new(code, message).with_hint(format!(
+        "Fix the data before migrating note {note:?}; `insum validate` shows the full diagnostic list. The file was not modified."
+    ))
+}
+
 /// Lock-held phase of the `.um` commit: revision recheck, rewrite,
 /// validation of the result (§12), atomic replace.
+#[allow(clippy::too_many_arguments)]
 fn commit_um(
     path: &Path,
     container: &mut UmContainer,
@@ -617,6 +711,7 @@ fn commit_um(
     plans: &[MigrateNotePlan],
     meta: &SchemaMeta,
     attrs_key: &str,
+    addressable: &BTreeSet<String>,
     limits: &Limits,
 ) -> Result<Value, UmError> {
     let file_rev_before = container.file_rev()?;
@@ -655,7 +750,7 @@ fn commit_um(
         attrs_key,
         limits,
     )?;
-    validate_result_um(&new_bytes, selected, plans, attrs_key, limits)?;
+    validate_result_um(&new_bytes, selected, plans, attrs_key, addressable, limits)?;
     atomic_replace(path, &new_bytes)?;
 
     Ok(json!({
@@ -668,14 +763,14 @@ fn commit_um(
 }
 
 /// Pre-commit validation (§12: the result passes validation before commit):
-/// the rewritten container opens, every planned id is present at its
-/// pointer, ids stay unique per note, and the documents pass the
-/// structural validator.
+/// every selected note of the rewritten container — a note that only
+/// receives the marker included — passes the shared migration validation.
 fn validate_result_um(
     new_bytes: &[u8],
     selected: &[crate::model::NoteDescriptor],
     plans: &[MigrateNotePlan],
     attrs_key: &str,
+    addressable: &BTreeSet<String>,
     limits: &Limits,
 ) -> Result<(), UmError> {
     let tmp =
@@ -689,64 +784,15 @@ fn validate_result_um(
     let result = (|| {
         let mut container = UmContainer::open(&tmp, limits)?;
         for (descriptor, plan) in selected.iter().zip(plans.iter()) {
-            if plan.changes.is_empty() {
-                continue;
-            }
             let parsed = container.read_note_with_rev(descriptor, limits)?;
-            // every planned change is real in the result
-            for change in &plan.changes {
-                let actual = pointer::resolve(&parsed.note.doc, &change.pointer)
-                    .ok()
-                    .and_then(|node| {
-                        node.get("attrs")
-                            .and_then(|attrs| attrs.get(attrs_key))
-                            .and_then(Value::as_str)
-                    });
-                if actual != Some(change.new_id.as_str()) {
-                    return Err(UmError::internal(format!(
-                        "the rewritten note {:?} does not carry the planned id at {}",
-                        descriptor.id, change.pointer
-                    )));
-                }
-            }
-            // ids unique within the note
-            let mut ids: Vec<String> = Vec::new();
-            fn collect(node: &Value, attrs_key: &str, ids: &mut Vec<String>) {
-                if let Some(id) = node
-                    .get("attrs")
-                    .and_then(|attrs| attrs.get(attrs_key))
-                    .and_then(Value::as_str)
-                {
-                    ids.push(id.to_owned());
-                }
-                if let Some(children) = node.get("content").and_then(Value::as_array) {
-                    for child in children {
-                        collect(child, attrs_key, ids);
-                    }
-                }
-            }
-            collect(&parsed.note.doc, attrs_key, &mut ids);
-            let unique: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
-            if ids.len() != unique.len() {
-                return Err(UmError::internal(format!(
-                    "the rewritten note {:?} has duplicate ids",
-                    descriptor.id
-                )));
-            }
-            // structural validation of the rewritten document
-            let validation =
-                crate::validate_note_doc_with_schema(&parsed.note.doc, true, limits, None)?;
-            if !validation.valid() {
-                return Err(UmError::internal(format!(
-                    "the rewritten note {:?} fails structural validation: {}",
-                    descriptor.id,
-                    validation
-                        .errors
-                        .first()
-                        .map(|e| e.message.clone())
-                        .unwrap_or_default()
-                )));
-            }
+            validate_migrated_doc(
+                &descriptor.id,
+                &parsed.note.doc,
+                plan,
+                addressable,
+                attrs_key,
+                limits,
+            )?;
         }
         Ok(())
     })();
@@ -788,6 +834,18 @@ pub fn migrate_note_file(
         &generator,
         &attrs_key,
     )?;
+    // plan == commit: the same shared validation the commit runs, on the
+    // planned copy of the document (B-1)
+    let mut planned_doc = note_file.note.doc.clone();
+    apply_ids(&mut planned_doc, &plan.changes, &attrs_key)?;
+    validate_migrated_doc(
+        "<note>",
+        &planned_doc,
+        &plan,
+        &addressable,
+        &attrs_key,
+        limits,
+    )?;
 
     if dry_run {
         return Ok(json!({
@@ -817,6 +875,7 @@ pub fn migrate_note_file(
         &resolved,
         already_envelope,
         &attrs_key,
+        &addressable,
         limits,
     );
     match outcome {
@@ -833,6 +892,7 @@ pub fn migrate_note_file(
 
 /// Lock-held phase of the `.note` commit: revision recheck, envelope build
 /// with unknown fields preserved (§12), validation, atomic replace.
+#[allow(clippy::too_many_arguments)]
 fn commit_note_file(
     path: &Path,
     expected_rev: &str,
@@ -840,6 +900,7 @@ fn commit_note_file(
     resolved: &crate::schema::ResolvedSchema,
     already_envelope: bool,
     attrs_key: &str,
+    addressable: &BTreeSet<String>,
     limits: &Limits,
 ) -> Result<Value, UmError> {
     let reopened = NoteFile::open(path, limits, true)?;
@@ -906,18 +967,9 @@ fn commit_note_file(
         map.insert("document".to_owned(), doc.clone());
     }
 
-    // §12: the result passes validation before commit
-    let validation = crate::validate_note_doc_with_schema(&doc, true, limits, None)?;
-    if !validation.valid() {
-        return Err(UmError::internal(format!(
-            "the migrated document fails structural validation: {}",
-            validation
-                .errors
-                .first()
-                .map(|e| e.message.clone())
-                .unwrap_or_default()
-        )));
-    }
+    // §12: the result passes validation before commit — the shared
+    // migration validation (dry-run runs exactly the same check)
+    validate_migrated_doc("<note>", &doc, plan, addressable, attrs_key, limits)?;
 
     let new_bytes = serde_json::to_vec(&envelope)
         .map_err(|err| UmError::internal(format!("envelope does not serialize: {err}")))?;

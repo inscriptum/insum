@@ -47,22 +47,31 @@ pub fn validate_note_doc(
     block_ids_enabled: bool,
     limits: &Limits,
 ) -> Result<NoteValidation, UmError> {
-    validate_note_doc_with_schema(doc, block_ids_enabled, limits, None)
+    validate_note_doc_with_schema(doc, block_ids_enabled, limits, None, None)
 }
 
 /// The structural walk plus, when `schema` is `Some`, the
 /// ProseMirror-parity check of the whole document (§6.6 "schema" level).
 /// The parity result supersedes the structural unknown-type warnings.
+///
+/// `addressable` is the artifact's addressable type set (§4.7): when given,
+/// a missing ID is an error only for blocks of those types — structural
+/// types the artifact does not declare addressable (e.g. the observed
+/// on-disk `noteSummary`) are exempt. Grammar and uniqueness of the ids
+/// that exist are checked regardless. `None` keeps the conservative
+/// structural universe (every non-inline block requires an id) for the
+/// level where no artifact judges the document.
 pub fn validate_note_doc_with_schema(
     doc: &Value,
     block_ids_enabled: bool,
     limits: &Limits,
     schema: Option<&PmSchema>,
+    addressable: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<NoteValidation, UmError> {
     let mut result = NoteValidation::default();
     walk_structure(doc, 0, limits, &mut result)?;
     if block_ids_enabled {
-        validate_block_ids(doc, limits, &mut result);
+        validate_block_ids(doc, limits, addressable, &mut result);
     }
     if let Some(schema) = schema {
         let parity = schema.check_document(doc);
@@ -182,20 +191,34 @@ fn walk_structure(
     Ok(())
 }
 
-/// ID checks for documents marked `features.block_ids`: every
-/// addressable block has an ID, IDs match `^[a-z0-9]{8,12}$` and are unique.
-fn validate_block_ids(doc: &Value, limits: &Limits, result: &mut NoteValidation) {
+/// ID checks for documents marked `features.block_ids`: ids match
+/// `^[a-z0-9]{8,12}$` and are unique; a missing ID is an error for
+/// `addressable` types only (see [`validate_note_doc_with_schema`]).
+fn validate_block_ids(
+    doc: &Value,
+    limits: &Limits,
+    addressable: Option<&std::collections::BTreeSet<String>>,
+    result: &mut NoteValidation,
+) {
     let blocks = crate::traverse(doc, None, limits.max_depth);
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for block in &blocks.blocks {
         match &block.id {
-            None => result.errors.push(Diag {
-                code: "BLOCK_ID_MISSING",
-                message: format!(
-                    "block at {} has no id though block_ids is enabled",
-                    block.pointer
-                ),
-            }),
+            None => {
+                // §4.7 artifact-driven: without the addressable set the
+                // structural level cannot judge per-type addressability and
+                // keeps the conservative every-non-inline-block rule.
+                let required = addressable.is_none_or(|set| set.contains(&block.node_type));
+                if required {
+                    result.errors.push(Diag {
+                        code: "BLOCK_ID_MISSING",
+                        message: format!(
+                            "block at {} has no id though block_ids is enabled",
+                            block.pointer
+                        ),
+                    });
+                }
+            }
             Some(id) => {
                 if !is_valid_id(id) {
                     result.errors.push(Diag {
@@ -319,7 +342,8 @@ mod tests {
             "type": "noteDoc",
             "content": [{"type": "exoticWidget", "content": [{"type": "text", "text": "?"}]}]
         });
-        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        let result =
+            validate_note_doc_with_schema(&doc, false, &limits, Some(&schema), None).unwrap();
         assert!(!result.valid());
         assert!(result.errors.iter().any(|e| e.code == "UNKNOWN_NODE_TYPE"));
         // the same document without an artifact stays a warning
@@ -339,7 +363,8 @@ mod tests {
                  "content": [{"type": "text", "text": "hi", "marks": [{"type": "bold"}]}]}
             ]
         });
-        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        let result =
+            validate_note_doc_with_schema(&doc, false, &limits, Some(&schema), None).unwrap();
         assert!(result.valid(), "warnings do not flip validity");
         let codes: Vec<&str> = result.warnings.iter().map(|w| w.code).collect();
         assert!(codes.contains(&"SCHEMA_ATTR_UNKNOWN"), "{codes:?}");
@@ -360,7 +385,8 @@ mod tests {
             ]
         });
         let result =
-            validate_note_doc_with_schema(&unknown_mark, false, &limits, Some(&schema)).unwrap();
+            validate_note_doc_with_schema(&unknown_mark, false, &limits, Some(&schema), None)
+                .unwrap();
         assert!(
             !result.valid(),
             "unknown mark types fail like prosemirror fromJSON"
@@ -379,7 +405,8 @@ mod tests {
             ]
         });
         let result =
-            validate_note_doc_with_schema(&restricted, false, &limits, Some(&schema)).unwrap();
+            validate_note_doc_with_schema(&restricted, false, &limits, Some(&schema), None)
+                .unwrap();
         assert!(result.valid());
     }
 
@@ -394,7 +421,8 @@ mod tests {
             "type": "noteDoc",
             "content": [{"type": "noteSummary", "content": [{"type": "text", "text": "old"}]}]
         });
-        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        let result =
+            validate_note_doc_with_schema(&doc, false, &limits, Some(&schema), None).unwrap();
         assert!(result.valid());
         let codes: Vec<&str> = result.warnings.iter().map(|w| w.code).collect();
         assert!(codes.contains(&"SCHEMA_NODE_LEGACY"), "{codes:?}");
@@ -409,7 +437,8 @@ mod tests {
             "type": "paragraph",
             "content": [{"type": "text", "text": "x"}]
         });
-        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        let result =
+            validate_note_doc_with_schema(&doc, false, &limits, Some(&schema), None).unwrap();
         let codes: Vec<&str> = result.warnings.iter().map(|w| w.code).collect();
         assert!(codes.contains(&"SCHEMA_ROOT_MISMATCH"), "{codes:?}");
     }
@@ -426,8 +455,62 @@ mod tests {
                  "content": [{"type": "text", "text": "ok", "marks": [{"type": "bold"}]}]}
             ]
         });
-        let result = validate_note_doc_with_schema(&doc, false, &limits, Some(&schema)).unwrap();
+        let result =
+            validate_note_doc_with_schema(&doc, false, &limits, Some(&schema), None).unwrap();
         assert!(result.valid());
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    /// B-1: the id-required universe follows the artifact (§4.7). A
+    /// structural type the artifact does not declare addressable
+    /// (`noteSummary` on real title pages) is exempt from BLOCK_ID_MISSING,
+    /// while an addressable type without an id still fails. Grammar and
+    /// uniqueness of the ids that exist are checked regardless of type.
+    #[test]
+    fn block_id_missing_follows_the_artifact_addressable_set() {
+        let limits = Limits::defaults();
+        let addressable: std::collections::BTreeSet<String> =
+            ["paragraph"].iter().map(|s| s.to_string()).collect();
+
+        // an undeclared noteSummary without an id is exempt
+        let summary_only = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteSummary", "content": [{"type": "text", "text": "old"}]}
+            ]
+        });
+        let result =
+            validate_note_doc_with_schema(&summary_only, true, &limits, None, Some(&addressable))
+                .unwrap();
+        assert!(result.valid(), "{:?}", result.errors);
+
+        // an addressable paragraph without an id is still required
+        let paragraph_only = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "p"}]}
+            ]
+        });
+        let result =
+            validate_note_doc_with_schema(&paragraph_only, true, &limits, None, Some(&addressable))
+                .unwrap();
+        let codes: Vec<&str> = result.errors.iter().map(|e| e.code).collect();
+        assert!(codes.contains(&"BLOCK_ID_MISSING"), "{codes:?}");
+
+        // grammar of an existing id is checked regardless of the type
+        let bad_grammar = json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteSummary", "attrs": {"id": "BAD!!"}, "content": [{"type": "text", "text": "x"}]}
+            ]
+        });
+        let result =
+            validate_note_doc_with_schema(&bad_grammar, true, &limits, None, Some(&addressable))
+                .unwrap();
+        let codes: Vec<&str> = result.errors.iter().map(|e| e.code).collect();
+        assert!(
+            codes.contains(&"BLOCK_ID_INVALID"),
+            "grammar as before: {codes:?}"
+        );
     }
 }

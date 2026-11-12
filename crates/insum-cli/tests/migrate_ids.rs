@@ -42,6 +42,12 @@ fn artifact_with_id_rules() -> Value {
             "paragraph": {"content": "inline*", "groups": ["block"],
                           "attrs": {"id": {"default": null}}, "marks": [],
                           "addressable": true, "inline_content": true, "searchable": true},
+            "bulletList": {"content": "listItem+", "groups": ["block"],
+                           "attrs": {"id": {"default": null}}, "marks": [],
+                           "addressable": true, "inline_content": false, "searchable": false},
+            "listItem": {"content": "paragraph block*", "groups": [],
+                         "attrs": {"id": {"default": null}}, "marks": [],
+                         "addressable": true, "inline_content": false, "searchable": false},
             "text": {"content": null, "groups": ["inline"], "attrs": {},
                      "marks": [], "addressable": false, "inline_content": true,
                      "searchable": false}
@@ -937,4 +943,151 @@ fn note_filter_is_rejected_for_note_files() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
+}
+
+/// B-1 / M-10: real title pages carry `noteSummary` — a structural type the
+/// artifact does not declare addressable — and nested lists. The plan
+/// (artifact-addressable universe) and the pre-commit validator must agree:
+/// dry-run and commit both succeed, the nested blocks get ids, the
+/// undeclared noteSummary stays untouched (no id, no refusal).
+#[test]
+fn nested_blocks_and_undeclared_note_summary_migrate() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let path = fixture.dir.path().join("nested.um");
+    let notes = [FixtureNote::title_page(
+        &insum_test_utils::ulid_seq(1),
+        "Alpha",
+        "A short summary",
+        &[
+            insum_test_utils::bullet_list(&["one", "two"]),
+            insum_test_utils::paragraph(&[insum_test_utils::text("after the list")]),
+        ],
+    )];
+    insum_test_utils::write_um(&path, &notes).unwrap();
+    let file = path.to_string_lossy().into_owned();
+
+    // dry-run: green; nested blocks planned, noteSummary untouched
+    let output = insum()
+        .args(["migrate-ids", &file, "--dry-run", "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dry-run must not refuse what the commit can fix: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let changes = value["notes"][0]["changes"].as_array().unwrap();
+    let pointers: Vec<&str> = changes
+        .iter()
+        .filter_map(|c| c["pointer"].as_str())
+        .collect();
+    assert!(
+        pointers.contains(&"/content/2/content/0/content/0"),
+        "the nested list-item paragraph is planned: {pointers:?}"
+    );
+    assert!(
+        !pointers.contains(&"/content/1"),
+        "noteSummary (undeclared in the artifact) is not planned: {pointers:?}"
+    );
+    assert_eq!(value["would_write"], true);
+
+    // commit: green — the validator now judges by the same artifact universe
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "commit must not fail with INTERNAL on noteSummary: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let note: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", insum_test_utils::ulid_seq(1)),
+    ))
+    .unwrap();
+    let summary = &note["content"][1];
+    assert_eq!(summary["type"], "noteSummary");
+    assert!(
+        summary["attrs"].get("id").is_none(),
+        "the undeclared noteSummary keeps no id: {summary}"
+    );
+    let nested = &note["content"][2]["content"][0]["content"][0];
+    assert_eq!(nested["type"], "paragraph");
+    assert!(
+        nested["attrs"]["id"].is_string(),
+        "the nested paragraph carries an id: {nested}"
+    );
+}
+
+/// m-12: the dry-run plan and the commit mapping agree on shape —
+/// `pointer`, `old_id` and `type` per change for the same file state.
+/// `new_id` is a preview and may differ (§7.2).
+#[test]
+fn dry_run_plan_shape_matches_the_commit_mapping() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+
+    let dry = insum()
+        .args(["migrate-ids", &file, "--dry-run", "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_value: Value = serde_json::from_slice(&dry.stdout).unwrap();
+
+    let shape = |value: &Value| -> Vec<(String, Option<String>, String)> {
+        value["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|note| note["changes"].as_array().unwrap().iter())
+            .map(|change| {
+                (
+                    change["pointer"].as_str().unwrap().to_owned(),
+                    change["old_id"].as_str().map(str::to_owned),
+                    change["type"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let dry_shape = shape(&dry_value);
+    assert!(!dry_shape.is_empty(), "the fixture plans real changes");
+
+    let commit = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let commit_value: Value = serde_json::from_slice(&commit.stdout).unwrap();
+    assert_eq!(
+        dry_shape,
+        shape(&commit_value),
+        "dry-run plan shape == commit mapping shape"
+    );
+    // new_id is generated at commit time: identical previews would be
+    // suspicious for the two independent runs
+    let dry_ids: Vec<&str> = dry_value["notes"][0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["new_id"].as_str())
+        .collect();
+    let commit_ids: Vec<&str> = commit_value["notes"][0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["new_id"].as_str())
+        .collect();
+    assert_eq!(dry_ids.len(), commit_ids.len());
 }
