@@ -119,6 +119,34 @@ fn node_text(node: &Value) -> String {
     out
 }
 
+/// M-12: bind the per-note marker inside the hit text (`note-<i> ...`) to
+/// the attributed note id. The stress corpus puts a unique `note-<i>`
+/// marker in every shared body block, so a cross-note substitution of two
+/// textually identical hits (the invariant above cannot see it: both notes
+/// resolve the same id/type/text) shows up as a marker belonging to a
+/// different note than the one the hit claims. Hits without the marker
+/// (headings, `.note` windows) are skipped; the corpus shape makes the
+/// binding deterministic.
+fn assert_marker_binding(matches: &[Value]) {
+    for hit in matches {
+        let text = hit["text"].as_str().unwrap_or("");
+        let Some(rest) = text.strip_prefix("note-") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let index: u32 = digits.parse().expect("marker index parses");
+        assert_eq!(
+            hit["note_id"],
+            Value::String(fixtures::ulid_seq(index + 1)),
+            "hit attributed across notes: its text carries the note-{index} \
+             marker but it claims another note: {hit}"
+        );
+    }
+}
+
 #[test]
 fn search_attribution_survives_repeated_runs_and_text_sharing() {
     let dir = TempDir::new().unwrap();
@@ -128,11 +156,34 @@ fn search_attribution_survives_repeated_runs_and_text_sharing() {
     let shared = run_json(&["search", "-F", "shared-body-text", &file]);
     assert_eq!(shared["complete"], true);
     assert_invariant(&file, shared["matches"].as_array().unwrap());
+    // each hit's text marker must belong to the note the hit claims
+    assert_marker_binding(shared["matches"].as_array().unwrap());
 
-    // the heading text all notes share — the exact shape of the report
+    // the heading text all notes share — the exact shape of the report.
+    // All eight hits carry IDENTICAL text, so the invariant above (id/
+    // type/text equality) cannot detect a cross-note swap: pin the
+    // attributed note_id set to the whole corpus — one hit per note.
     let heading = run_json(&["search", "-F", "Метаданные схемы", &file]);
-    assert_eq!(heading["matches"].as_array().unwrap().len(), 8);
-    assert_invariant(&file, heading["matches"].as_array().unwrap());
+    let heading_matches = heading["matches"].as_array().unwrap();
+    assert_eq!(heading_matches.len(), 8);
+    assert_invariant(&file, heading_matches);
+    let mut hit_ids: Vec<String> = heading_matches
+        .iter()
+        .map(|m| {
+            m["note_id"]
+                .as_str()
+                .expect(".um hits carry note_id")
+                .to_owned()
+        })
+        .collect();
+    hit_ids.sort();
+    hit_ids.dedup();
+    let mut corpus_ids: Vec<String> = (1..=8).map(fixtures::ulid_seq).collect();
+    corpus_ids.sort();
+    assert_eq!(
+        hit_ids, corpus_ids,
+        "the identical-text heading hits must cover every note exactly once"
+    );
 
     // unique marker: exactly one note must be attributed
     for note_index in 0..8 {
@@ -173,6 +224,7 @@ fn search_attribution_with_note_filter_resolves_on_selected_note() {
         assert_eq!(hit["note_id"], Value::String(note_id.clone()));
     }
     assert_invariant(&file, matches);
+    assert_marker_binding(matches);
 }
 
 #[test]
