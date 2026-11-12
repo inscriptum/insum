@@ -341,11 +341,11 @@ pub fn file_sha256(path: &Path) -> Result<String, UmError> {
 /// Read a file with a hard byte cap (limits are enforced on the
 /// actual bytes, races with growing files included).
 fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
-    let file = File::open(path).map_err(|err| path_error(path, err))?;
-    // a directory opens like a file on some platforms (macOS) and fails on
-    // others — classify it deterministically before any read (m-14)
-    if file
-        .metadata()
+    // a directory is classified BEFORE any open, like open_non_empty does
+    // for `.um` (m-14): a directory opens like a file on some platforms
+    // (macOS) and fails on others (Windows: PermissionDenied) — the
+    // deterministic data-class verdict must not depend on open(2) behavior
+    if std::fs::metadata(path)
         .map_err(|err| path_error(path, err))?
         .is_dir()
     {
@@ -355,6 +355,7 @@ fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
         )
         .with_hint("Pass a .um container or a .note document, not a directory."));
     }
+    let file = File::open(path).map_err(|err| path_error(path, err))?;
     let mut buffer = Vec::new();
     let mut taken = file.take(limits.max_entry_bytes as u64 + 1);
     taken
