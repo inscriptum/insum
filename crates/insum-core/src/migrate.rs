@@ -464,40 +464,186 @@ fn revision_mismatch(expected: &str, actual: &str, what: &str) -> UmError {
     .with_details(json!({ "expected": expected, "actual": actual }))
 }
 
-/// Hidden temp file next to the target (§12: temp artifacts are hidden and
-/// live beside the original).
-fn temp_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|n| format!(".{}.migrate-tmp", n.to_string_lossy()))
-        .unwrap_or_else(|| ".insum-migrate-tmp".to_owned());
-    path.parent().unwrap_or(Path::new(".")).join(name)
-}
-
-/// Write bytes to the temp file and atomically replace the target.
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), UmError> {
-    let tmp = temp_path(path);
-    {
-        let mut file = std::fs::File::create(&tmp).map_err(|err| {
+/// §9.3 MUST: the write path refuses a symlink source and any non-regular
+/// source — the link is never followed to its target and never silently
+/// replaced by a regular file. Runs before any other work, so dry-run and
+/// commit refuse alike (plan == commit).
+fn ensure_writable_source(path: &Path) -> Result<(), UmError> {
+    let meta = std::fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            crate::container::torn_error(
+                "absent",
+                path,
+                "the file is absent (possibly being rewritten)".to_owned(),
+            )
+        } else {
             UmError::new(
                 ErrorCode::IoError,
-                format!("cannot create temp file {}: {err}", tmp.display()),
+                format!("cannot stat {}: {err}", path.display()),
+            )
+        }
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(UmError::new(
+            ErrorCode::IoError,
+            format!(
+                "{} is a symlink; the write path refuses to follow or replace it",
+                path.display()
+            ),
+        )
+        .with_hint(
+            "Run migrate-ids on the regular file the link points to — replacing the link would move the note path onto a regular file.",
+        ));
+    }
+    if !meta.is_file() {
+        return Err(UmError::new(
+            ErrorCode::IoError,
+            format!(
+                "{} is not a regular file; the write path refuses it",
+                path.display()
+            ),
+        )
+        .with_hint("migrate-ids writes regular .um/.note files only."));
+    }
+    Ok(())
+}
+
+/// §9.3 MUST: immediately before the rename — re-verify that the source is
+/// still a regular file (never a symlink) and that its revision is
+/// unchanged, and take the permissions the replacement must keep (§9.3:
+/// preserve the permissions of the source).
+fn pre_replace_verification(path: &Path, expected_rev: &str, what: &str) -> Result<u32, UmError> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|err| UmError::new(ErrorCode::IoError, format!("cannot stat {path:?}: {err}")))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(UmError::new(
+            ErrorCode::IoError,
+            format!(
+                "{} stopped being a regular file before the replace; the write refuses",
+                path.display()
+            ),
+        )
+        .with_hint("Remove the symlink or fix the directory layout, then re-run migrate-ids."));
+    }
+    let rev = crate::container::file_sha256(path)?;
+    if rev != expected_rev {
+        return Err(revision_mismatch(expected_rev, &rev, what));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(meta.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(0)
+    }
+}
+
+/// A hidden, exclusively created temp file next to the target (§12: temp
+/// artifacts are hidden and live beside the original). The name carries a
+/// random suffix and the file is created with `create_new` — a planted
+/// symlink or a pre-existing file is never followed or reused (M-4/M-5);
+/// on unix it is created 0600. The file is unlinked on drop — on every
+/// error path and on panic unwinding (m-2) — unless it became the target
+/// through a successful rename.
+struct StagedFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedFile {
+    fn create(target: &Path) -> Result<(Self, std::fs::File), UmError> {
+        let parent = target.parent().unwrap_or(Path::new("."));
+        let name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "insum".to_owned());
+        use rand::Rng;
+        for _ in 0..64 {
+            let suffix: u64 = rand::rng().random();
+            let candidate = parent.join(format!(".{name}.migrate-tmp-{suffix:016x}"));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600); // private until the rename (§12)
+            }
+            match options.open(&candidate) {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path: candidate,
+                            armed: true,
+                        },
+                        file,
+                    ));
+                }
+                // the name exists (or a planted symlink collides): pick
+                // another random suffix, never follow what is there
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(UmError::new(
+                        ErrorCode::IoError,
+                        format!(
+                            "cannot create the temp file next to {}: {err}",
+                            target.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(UmError::new(
+            ErrorCode::IoError,
+            "cannot create a unique temp file next to the target".to_owned(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Preserve the source permissions (§9.3, unix mode), atomically rename
+    /// the staged file over the target, then fsync the parent directory
+    /// (best-effort, where the OS supports it — §9.3).
+    fn commit_to(mut self, target: &Path, mode: u32) -> Result<(), UmError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|err| {
+                    UmError::new(
+                        ErrorCode::IoError,
+                        format!("cannot preserve the file permissions: {err}"),
+                    )
+                })?;
+        }
+        std::fs::rename(&self.path, target).map_err(|err| {
+            UmError::new(
+                ErrorCode::IoError,
+                format!("cannot replace the file atomically: {err}"),
             )
         })?;
-        file.write_all(bytes).map_err(|err| {
-            UmError::new(ErrorCode::IoError, format!("cannot write temp file: {err}"))
-        })?;
-        file.sync_all().map_err(|err| {
-            UmError::new(ErrorCode::IoError, format!("cannot sync temp file: {err}"))
-        })?;
+        self.armed = false;
+        #[cfg(unix)]
+        {
+            if let Some(parent) = target.parent()
+                && let Ok(dir) = std::fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        UmError::new(
-            ErrorCode::IoError,
-            format!("cannot replace the file atomically: {err}"),
-        )
-    })
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Response of `migrate-ids` on a `.um` container (§7.2).
@@ -508,6 +654,9 @@ pub fn migrate_um(
     dry_run: bool,
     limits: &Limits,
 ) -> Result<Value, UmError> {
+    // §9.3: a symlink or non-regular source is refused before any work —
+    // dry-run and commit refuse alike (plan == commit)
+    ensure_writable_source(path)?;
     let resolved = resolve_for_write(schema, limits)?;
     let meta = SchemaMeta {
         id: resolved.artifact.schema_id.clone(),
@@ -741,67 +890,71 @@ fn commit_um(
         }
     }
 
-    let new_bytes = rewrite_um(&mut reopened, selected, plans, meta, attrs_key, limits)?;
-    validate_result_um(&new_bytes, selected, plans, attrs_key, addressable, limits)?;
+    // the result is streamed into a hidden, exclusively created temp file
+    // next to the target (§12): one write pass, no second staging copy in a
+    // shared temp directory (M-4/M-5/m-17)
+    let (staged, file) = StagedFile::create(path)?;
+    rewrite_um(
+        &mut reopened,
+        selected,
+        plans,
+        meta,
+        attrs_key,
+        limits,
+        file,
+    )?;
+    // §12: the result passes validation BEFORE the rename — over the very
+    // bytes that are staged next to the target
+    validate_result_um(
+        staged.path(),
+        selected,
+        plans,
+        attrs_key,
+        addressable,
+        limits,
+    )?;
 
-    // §9.3 MUST: re-check the file revision immediately before the replace —
-    // the fresh hash sees the path the way any other process would (never
-    // through a handle a rename would have left on the old inode)
-    let file_rev_final = crate::container::file_sha256(path)?;
-    if file_rev_final != file_rev_before {
-        return Err(revision_mismatch(
-            &file_rev_before,
-            &file_rev_final,
-            "the file",
-        ));
-    }
-    atomic_replace(path, &new_bytes)?;
+    // §9.3 MUST: re-check the source immediately before the replace (still
+    // a regular file, still the rechecked revision) and take its permissions
+    let mode = pre_replace_verification(path, &file_rev_before, "the file")?;
+    let new_file_rev = crate::container::file_sha256(staged.path())?;
+    staged.commit_to(path, mode)?;
 
     Ok(json!({
         "api_version": 1,
         "dry_run": false,
         "path": path.display().to_string(),
         "notes": plans.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
-        "file_rev": note_rev_for_file_bytes(&new_bytes),
+        "file_rev": new_file_rev,
     }))
 }
 
 /// Pre-commit validation (§12: the result passes validation before commit):
 /// every selected note of the rewritten container — a note that only
 /// receives the marker included — passes the shared migration validation.
+/// Runs over the staged file next to the target: exactly the bytes that the
+/// rename would commit.
 fn validate_result_um(
-    new_bytes: &[u8],
+    staged_path: &Path,
     selected: &[crate::model::NoteDescriptor],
     plans: &[MigrateNotePlan],
     attrs_key: &str,
     addressable: &BTreeSet<String>,
     limits: &Limits,
 ) -> Result<(), UmError> {
-    let tmp =
-        std::env::temp_dir().join(format!("insum-migrate-validate-{}.um", std::process::id()));
-    std::fs::write(&tmp, new_bytes).map_err(|err| {
-        UmError::new(
-            ErrorCode::IoError,
-            format!("cannot stage the result: {err}"),
-        )
-    })?;
-    let result = (|| {
-        let mut container = UmContainer::open(&tmp, limits)?;
-        for (descriptor, plan) in selected.iter().zip(plans.iter()) {
-            let parsed = container.read_note_with_rev(descriptor, limits)?;
-            validate_migrated_doc(
-                &descriptor.id,
-                &parsed.note.doc,
-                plan,
-                addressable,
-                attrs_key,
-                limits,
-            )?;
-        }
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+    let mut container = UmContainer::open(staged_path, limits)?;
+    for (descriptor, plan) in selected.iter().zip(plans.iter()) {
+        let parsed = container.read_note_with_rev(descriptor, limits)?;
+        validate_migrated_doc(
+            &descriptor.id,
+            &parsed.note.doc,
+            plan,
+            addressable,
+            attrs_key,
+            limits,
+        )?;
+    }
+    Ok(())
 }
 
 /// Legacy `.note` → envelope with IDs (§4.6 envelope shape). An envelope
@@ -812,6 +965,9 @@ pub fn migrate_note_file(
     dry_run: bool,
     limits: &Limits,
 ) -> Result<Value, UmError> {
+    // §9.3: a symlink or non-regular source is refused before any work —
+    // dry-run and commit refuse alike (plan == commit)
+    ensure_writable_source(path)?;
     let resolved = resolve_for_write(schema, limits)?;
     let addressable = addressable_types(&resolved.artifact);
     let rules = IdRules::from_artifact(&resolved.artifact)?;
@@ -975,14 +1131,30 @@ fn commit_note_file(
 
     let new_bytes = serde_json::to_vec(&envelope)
         .map_err(|err| UmError::internal(format!("envelope does not serialize: {err}")))?;
-    // §9.3 MUST: re-check the revision immediately before the replace —
-    // for a `.note` the file hash IS the revision; the streamed hash sees
-    // the path as any other process would (no held handle)
-    let rev_now = crate::container::file_sha256(path)?;
-    if rev_now != expected_rev {
-        return Err(revision_mismatch(expected_rev, &rev_now, "the .note file"));
-    }
-    atomic_replace(path, &new_bytes)?;
+
+    // the result is staged in a hidden, exclusively created temp file next
+    // to the target and fsynced there (§12/§9.3, M-4); the Drop guard
+    // unlinks it on every error path (m-2)
+    let (staged, mut file) = StagedFile::create(path)?;
+    file.write_all(&new_bytes).map_err(|err| {
+        UmError::new(
+            ErrorCode::IoError,
+            format!("cannot write the staged file: {err}"),
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        UmError::new(
+            ErrorCode::IoError,
+            format!("cannot sync the staged file: {err}"),
+        )
+    })?;
+    drop(file);
+
+    // §9.3 MUST: re-check the source immediately before the replace (still
+    // a regular file; for a `.note` the file hash IS the revision) and take
+    // its permissions
+    let mode = pre_replace_verification(path, expected_rev, "the .note file")?;
+    staged.commit_to(path, mode)?;
 
     Ok(json!({
         "api_version": 1,
@@ -1005,6 +1177,8 @@ struct SchemaMeta {
 /// The archive is the one held open since the recheck — raw entries are
 /// copied from the in-lock generation, never from a fresh open of the path
 /// (M-1: a non-cooperative writer cannot mix generations into the commit).
+/// The result is streamed into the staged file next to the target (m-17: no
+/// whole-container buffer, no extra staging copy) and fsynced there (§9.3).
 #[allow(clippy::too_many_arguments)]
 fn rewrite_um(
     container: &mut UmContainer,
@@ -1013,7 +1187,8 @@ fn rewrite_um(
     meta: &SchemaMeta,
     attrs_key: &str,
     limits: &Limits,
-) -> Result<Vec<u8>, UmError> {
+    into: std::fs::File,
+) -> Result<(), UmError> {
     // payloads to replace, by archive entry name
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
     for (descriptor, plan) in selected.iter().zip(plans.iter()) {
@@ -1036,8 +1211,7 @@ fn rewrite_um(
 
     // rebuild: walk the source archive in order through the held handle
     let archive = container.zip_archive();
-    let buffer = std::io::Cursor::new(Vec::new());
-    let mut writer = zip::ZipWriter::new(buffer);
+    let mut writer = zip::ZipWriter::new(into);
     for index in 0..archive.len() {
         let (name, last_modified) = {
             let raw = archive.by_index_raw(index).map_err(|err| {
@@ -1080,10 +1254,17 @@ fn rewrite_um(
                 .map_err(|err| UmError::internal(format!("cannot copy entry {name:?}: {err}")))?;
         }
     }
-    let buffer = writer
+    let file = writer
         .finish()
         .map_err(|err| UmError::internal(format!("cannot finish the new container: {err}")))?;
-    Ok(buffer.into_inner())
+    // §9.3: fsync the temp file before it can become the target; any error
+    // here leaves the staged file to the Drop guard for cleanup (m-2)
+    file.sync_all().map_err(|err| {
+        UmError::new(
+            ErrorCode::IoError,
+            format!("cannot sync the staged file: {err}"),
+        )
+    })
 }
 
 /// Set `features.block_ids = 1` and schema metadata on the selected

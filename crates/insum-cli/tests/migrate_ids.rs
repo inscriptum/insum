@@ -1091,3 +1091,157 @@ fn dry_run_plan_shape_matches_the_commit_mapping() {
         .collect();
     assert_eq!(dry_ids.len(), commit_ids.len());
 }
+
+// ---------------------------------------------------------------------------
+// Write-path hardening (m-6): permissions, symlinks, staged temp files
+// ---------------------------------------------------------------------------
+
+/// M-2 (§9.3): the replacement keeps the permissions of the source — a
+/// 0600 note must not become world-readable after a migration.
+#[cfg(unix)]
+#[test]
+fn commit_preserves_source_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the mode of the source survives the replace");
+}
+
+/// M-3 (§9.3): a symlink source is refused — the link is never followed to
+/// its target and never silently replaced by a regular file. Dry-run
+/// refuses the same way (plan == commit).
+#[test]
+fn symlink_source_is_refused() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let target = fixture.container();
+    let target_bytes = fs::read(&target).unwrap();
+    let link = fixture.dir.path().join("alias.um");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(not(unix))]
+    fs::copy(&target, &link).unwrap(); // windows: no symlinks in tests
+    let link_str = link.to_string_lossy().into_owned();
+
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &link_str, "--schema", &artifact];
+        args.extend(extra.iter());
+        let output = insum().args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "IO_ERROR exits 1: {args:?}");
+        assert_eq!(stderr_json(&output)["error"]["code"], "IO_ERROR");
+        // the link is untouched and the target was not migrated through it
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink survives a refused write"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            target_bytes,
+            "the target is untouched"
+        );
+    }
+}
+
+/// M-4/M-5/m-2: the staged temp file lives next to the target, is created
+/// exclusively with a random name and is gone after the run — a planted
+/// stale tmp (the historically predictable name) is never followed and
+/// never reused, and a victim file it points at is not overwritten.
+#[cfg(unix)]
+#[test]
+fn staged_temp_file_is_exclusive_and_cleaned_up() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let dir = fixture.dir.path();
+
+    // plant the historically predictable name as a symlink to a victim
+    let victim = dir.join("victim.txt");
+    fs::write(&victim, b"do not touch").unwrap();
+    let planted = dir.join(".migrate.um.migrate-tmp");
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // the planted victim is untouched; the planted name was never followed
+    assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+    assert!(
+        fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted file itself is untouched"
+    );
+    // the note path was not hijacked into a symlink
+    assert!(
+        fs::symlink_metadata(&file).unwrap().is_file(),
+        "the target stays a regular file"
+    );
+    // no staged temp file survived the run (own tmp unlinked)
+    let leftovers: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.contains("migrate-tmp") && name != ".migrate.um.migrate-tmp"
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "no temp leftovers: {leftovers:?}");
+}
+
+/// M-4: the pre-commit validation stages over the very bytes that will be
+/// renamed, next to the target — no predictable validation file may appear
+/// in the shared temp directory (the historic insum-migrate-validate-<pid>
+/// staging must not exist).
+#[cfg(unix)]
+#[test]
+fn validation_does_not_stage_into_the_shared_temp_dir() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+
+    let temp = std::env::temp_dir();
+    let historic = temp.join(format!("insum-migrate-validate-{}.um", std::process::id()));
+    let _ = fs::remove_file(&historic);
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        !historic.exists(),
+        "the historic shared-temp staging path must stay unused"
+    );
+    // the staged file that DID exist next to the target was 0600 and is gone
+    let leftovers: Vec<_> = fs::read_dir(fixture.dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().contains("migrate-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "no temp leftovers: {leftovers:?}");
+}
