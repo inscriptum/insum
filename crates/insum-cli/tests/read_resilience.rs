@@ -202,6 +202,53 @@ fn absent_directory_stays_path_not_found() {
     assert_eq!(stderr_code(&output), "PATH_NOT_FOUND");
 }
 
+/// m-14: a directory where a container/note is expected answers a
+/// deterministic data-class error on EVERY platform — never the transient
+/// READ_TORN truncated verdict (a directory is not a write window; the
+/// "restore from backup" hint would mislead) and never a platform-dependent
+/// IO_ERROR. `ls` is exempt: a directory is its legitimate traversal input.
+#[test]
+fn directory_at_a_container_path_answers_a_deterministic_data_error() {
+    let fixture = Fixture::new("dirfile");
+    let as_um = fixture.dir.join("not-a-container.um");
+    fs::create_dir(&as_um).unwrap();
+    let as_note = fixture.dir.join("not-a-note.note");
+    fs::create_dir(&as_note).unwrap();
+
+    // the .um readers: tree / read / block get
+    let um = as_um.to_string_lossy().into_owned();
+    for args in [
+        vec!["tree", um.as_str()],
+        vec!["read", um.as_str(), "--note", "Alpha"],
+        vec![
+            "block",
+            "get",
+            um.as_str(),
+            "--note",
+            "Alpha",
+            "--pointer",
+            "/content/0",
+        ],
+    ] {
+        let output = insum().args(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "invalid data exits 4: {args:?}"
+        );
+        assert!(output.stdout.is_empty(), "stdout stays empty: {args:?}");
+        assert_eq!(stderr_code(&output), "NOT_A_ZIP", "args: {args:?}");
+    }
+    // the .note reader
+    let output = insum()
+        .arg("read")
+        .arg(as_note.to_string_lossy().into_owned())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(stderr_code(&output), "NOTE_JSON_INVALID");
+}
+
 /// history reads git, not the live container bytes: a torn working file
 /// serves its (empty, non-git) history like any untracked file — no
 /// container-integrity error, and never NOTE_NOT_FOUND. The absent path

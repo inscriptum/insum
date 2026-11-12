@@ -595,7 +595,6 @@ fn live_editor_lease_blocks_the_write() {
 
     let output = insum()
         .args(["migrate-ids", &file, "--schema", &artifact])
-        .env("INSUM_LOCK_STALE_AFTER_MS", "60000")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(7), "WRITE_LOCKED exits 7");
@@ -730,7 +729,7 @@ fn block_get_by_id_is_gated_on_the_marker() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["block"]["id"], "secondone0");
     assert_eq!(value["block"]["node"]["type"], "noteTitle");
-    // unknown id: BLOCK_NOT_FOUND (exit 3)
+    // unknown id: BLOCK_NOT_FOUND (exit 3), not just a bare exit code
     let output = insum()
         .args([
             "block",
@@ -744,6 +743,7 @@ fn block_get_by_id_is_gated_on_the_marker() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stderr_json(&output)["error"]["code"], "BLOCK_NOT_FOUND");
     // --pointer and --id together: USAGE
     let output = insum()
         .args([
@@ -800,9 +800,11 @@ fn regression_attrs_null_refuses_the_migration() {
 }
 
 #[test]
-fn regression_envelope_unknown_fields_survive_and_broken_shapes_refuse() {
+fn regression_envelope_unknown_fields_survive_and_unmarked_envelope_is_selected() {
     // M-04/M-06: an envelope keeps its unknown fields and is selected by
-    // marker state, not envelope presence
+    // marker state, not envelope presence (both scenarios are positive —
+    // refusal cases live in regression_attrs_null_refuses_the_migration
+    // and regression_broken_features_descriptor_refuses_the_marker)
     let fixture = Fixture::new();
     let artifact = fixture.artifact();
     let path = fixture.dir.path().join("envelope.note");
@@ -1244,4 +1246,87 @@ fn validation_does_not_stage_into_the_shared_temp_dir() {
         .filter(|entry| entry.file_name().to_string_lossy().contains("migrate-tmp"))
         .collect();
     assert!(leftovers.is_empty(), "no temp leftovers: {leftovers:?}");
+}
+
+/// m-13: `block get --id` verdicts are pinned by code, not just exit codes:
+/// the marker gate holds for a note the partial migration did not mark
+/// (even though its block carries a physical attrs.id), and an id of
+/// another note never resolves cross-note.
+#[test]
+fn block_get_by_id_partial_migration_gate_and_cross_note_ids() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+
+    // partial migration: only the first note is marked
+    let partial = insum()
+        .args([
+            "migrate-ids",
+            &file,
+            "--note",
+            &insum_test_utils::ulid_seq(1),
+            "--schema",
+            &artifact,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        partial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+
+    // the unmarked second note keeps the gate even though its noteTitle
+    // physically carries attrs.id secondone0 (§4.6: ids are not guaranteed
+    // without the marker)
+    let output = insum()
+        .args([
+            "block",
+            "get",
+            &file,
+            "--note",
+            &insum_test_utils::ulid_seq(2),
+            "--id",
+            "secondone0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the gate stays for an unmarked note"
+    );
+    assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
+
+    // full migration marks both notes
+    let full = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    // an id of another note does not address this one (BLOCK_NOT_FOUND,
+    // exit 3 — never a silent first match across notes)
+    let output = insum()
+        .args([
+            "block",
+            "get",
+            &file,
+            "--note",
+            &insum_test_utils::ulid_seq(1),
+            "--id",
+            "secondone0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        stderr_json(&output)["error"]["code"],
+        "BLOCK_NOT_FOUND",
+        "a foreign note's id does not resolve"
+    );
 }

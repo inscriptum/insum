@@ -342,6 +342,19 @@ pub fn file_sha256(path: &Path) -> Result<String, UmError> {
 /// actual bytes, races with growing files included).
 fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
     let file = File::open(path).map_err(|err| path_error(path, err))?;
+    // a directory opens like a file on some platforms (macOS) and fails on
+    // others — classify it deterministically before any read (m-14)
+    if file
+        .metadata()
+        .map_err(|err| path_error(path, err))?
+        .is_dir()
+    {
+        return Err(UmError::new(
+            ErrorCode::NoteJsonInvalid,
+            format!("{} is a directory, not a note document", path.display()),
+        )
+        .with_hint("Pass a .um container or a .note document, not a directory."));
+    }
     let mut buffer = Vec::new();
     let mut taken = file.take(limits.max_entry_bytes as u64 + 1);
     taken
@@ -589,11 +602,20 @@ fn classify_zip_open_error(path: &Path, err: zip::result::ZipError) -> UmError {
     }
 }
 
-/// Open a file and fail with READ_TORN when it is absent or empty.
+/// Open a file and fail with READ_TORN when it is absent or empty. A
+/// directory at a `.um` path is NOT_A_ZIP on every platform — a directory
+/// opens like a file on some (macOS) and fails on others (m-14): the
+/// verdict must not depend on open(2) behavior.
 fn open_non_empty(path: &Path) -> Result<(File, u64), UmError> {
-    let bytes = std::fs::metadata(path)
-        .map_err(|err| path_error(path, err))?
-        .len();
+    let metadata = std::fs::metadata(path).map_err(|err| path_error(path, err))?;
+    if metadata.is_dir() {
+        return Err(UmError::new(
+            ErrorCode::NotAZip,
+            format!("{} is a directory, not a ZIP container", path.display()),
+        )
+        .with_hint("Check the file type or restore a valid UM container."));
+    }
+    let bytes = metadata.len();
     if bytes == 0 {
         return Err(torn_error(
             "empty",
