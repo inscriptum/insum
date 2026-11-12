@@ -484,21 +484,78 @@ fn revision_mismatch(expected: &str, actual: &str, what: &str) -> UmError {
 /// an incomplete report says so explicitly (§6.5 — silent truncation is
 /// forbidden). A tree-style cursor does not fit this command: the commit is
 /// one transaction, so a second page could not reproduce the remaining
-/// mappings from an already-migrated file — the remainder is reached with
-/// `--note <id>` filters instead. The operation itself always covers every
-/// selected note; only the report can be partial.
+/// mappings from an already-migrated file. The operation itself always
+/// covers every selected note; only the report can be partial.
 struct Report {
     notes: Vec<Value>,
     notes_total: usize,
     truncated: bool,
 }
 
+/// Post-write growth of a committed note plan (D-1): commit_um adds the
+/// additive `new_note_rev` field — `"new_note_rev":"sha256:"` + 64 hex +
+/// quotes, colon and comma ≈ 89 bytes — to every reported note AFTER the
+/// plans are budgeted. Each note of a commit report reserves this much, so
+/// the budget holds for the bytes that are finally emitted (§6.5).
+const COMMIT_NOTE_RESERVE: usize = 96;
+
+/// The OUTPUT_BUDGET warning message. One source for the real response and
+/// for the envelope skeleton the budget measures over — the two cannot
+/// drift apart (D-1).
+fn truncation_warning_message(returned: usize, total: usize) -> String {
+    format!(
+        "the change report holds {returned} of {total} note plans to fit the output budget; the operation itself covers every selected note — pass --note <id> filters to inspect the remainder"
+    )
+}
+
+/// The envelope overhead of the FINAL response, measured over a skeleton
+/// that carries every field any branch can emit (with empty `notes`): the
+/// fixed fields, the real path, the truncation block (the worst case — it
+/// disappears when the report fits) and the post-write fields of a commit
+/// (`written`, `file_rev`, D-1). Only the integer widths of the counts can
+/// differ from the real response — a few bytes, covered by the margin.
+fn envelope_overhead(path: &Path) -> usize {
+    let skeleton = json!({
+        "api_version": 1,
+        "dry_run": false,
+        "path": path.display().to_string(),
+        "notes": [],
+        "complete": false,
+        "truncated": true,
+        "notes_total": 0,
+        "notes_returned": 0,
+        "written": true,
+        "file_rev": format!("sha256:{}", "0".repeat(64)),
+        "would_write": true,
+        "warnings": [{
+            "code": "OUTPUT_BUDGET",
+            "message": truncation_warning_message(0, 0),
+        }],
+    });
+    // +16 covers the digit-width growth of the real counts against the
+    // skeleton's zeros
+    serde_json::to_string(&skeleton).map_or(1024, |s| s.len() + 16)
+}
+
 /// Build the report over all plans; the first note plan is emitted whole
 /// even above the budget (documented exception, same rule as `tree`'s
-/// oversized block) — a response must at least name what it did.
-fn budgeted_report(plans: &[MigrateNotePlan], limits: &Limits) -> Report {
+/// oversized block) — a response must at least name what it did. `commit`
+/// reserves the per-note post-write growth (D-1): the commit adds
+/// `new_note_rev` after this pass, and the budget must hold for the final
+/// bytes.
+fn budgeted_report(
+    plans: &[MigrateNotePlan],
+    limits: &Limits,
+    path: &Path,
+    commit: bool,
+) -> Report {
     let budget = limits.output_bytes(None);
-    let mut used: usize = 256; // envelope overhead estimate
+    let mut used = envelope_overhead(path)
+        + if commit {
+            plans.len().saturating_mul(COMMIT_NOTE_RESERVE)
+        } else {
+            0
+        };
     let mut notes = Vec::new();
     for plan in plans {
         let note_json = plan.to_json();
@@ -534,11 +591,7 @@ fn apply_report_truncation(response: &mut Value, report: &Report) {
         .unwrap_or_default();
     warnings.push(json!({
         "code": "OUTPUT_BUDGET",
-        "message": format!(
-            "the change report holds {} of {} note plans to fit the output budget; the operation itself covers every selected note — pass --note <id> filters to inspect the remainder",
-            report.notes.len(),
-            report.notes_total
-        ),
+        "message": truncation_warning_message(report.notes.len(), report.notes_total),
     }));
     response["warnings"] = Value::Array(warnings);
 }
@@ -847,13 +900,16 @@ pub fn migrate_um(
         )?;
         plans.push(plan);
     }
-    let report = budgeted_report(&plans, limits);
     // a note without the marker is written even when its ids are complete:
     // the marker records the verification itself (§4.6)
     let would_write = plans
         .iter()
         .zip(selected.iter())
         .any(|(plan, descriptor)| plan.change_count() > 0 || !descriptor.block_ids_enabled());
+    // the report is budgeted over the FINAL response shape (D-1): a commit
+    // adds the post-write `new_note_rev` to every reported note after this
+    // pass, so each note reserves that growth
+    let report = budgeted_report(&plans, limits, path, !dry_run && would_write);
 
     if dry_run {
         let mut response = json!({
@@ -1764,7 +1820,7 @@ mod tests {
             &mut container,
             std::slice::from_ref(&descriptor),
             std::slice::from_ref(&plan),
-            &budgeted_report(std::slice::from_ref(&plan), &limits),
+            &budgeted_report(std::slice::from_ref(&plan), &limits, &path, true),
             &meta,
             &attrs_key,
             &addressable,
@@ -1918,7 +1974,7 @@ mod tests {
             &mut container,
             &selected,
             &plans,
-            &budgeted_report(&plans, &limits),
+            &budgeted_report(&plans, &limits, &path, true),
             &meta,
             &attrs_key,
             &addressable,
@@ -1970,6 +2026,118 @@ mod tests {
             3,
             "noteTitle + two paragraphs of the second doc"
         );
+    }
+
+    /// D-1: the commit response is budgeted over its FINAL shape. The
+    /// post-write `new_note_rev` (≈ 89 bytes per note) is added to every
+    /// reported note after the plans are budgeted — each note reserves that
+    /// growth, so a committed report never exceeds UM_MAX_OUTPUT_BYTES
+    /// without the explicit `truncated`/`complete` markers (§6.5 — no
+    /// silent overflow). The write itself still covers every note.
+    #[test]
+    fn committed_report_stays_within_the_output_budget_after_the_post_write_growth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("big.um");
+        // 40 notes with real changes: their bare plans fit a small budget,
+        // so the pre-fix budgeting marked the report complete — and the
+        // final bytes with `new_note_rev` overflowed it
+        let notes: Vec<insum_test_utils::FixtureNote> = (1..=40)
+            .map(|i| {
+                insum_test_utils::FixtureNote::title_page(
+                    &insum_test_utils::ulid_seq(i),
+                    &format!("Note {i}"),
+                    "summary",
+                    &[insum_test_utils::paragraph(&[insum_test_utils::text(
+                        &format!("body {i}"),
+                    )])],
+                )
+            })
+            .collect();
+        insum_test_utils::write_um(&path, &notes).unwrap();
+
+        let artifact = &*TEST_ARTIFACT;
+        let addressable = crate::schema::addressable_types(artifact);
+        let rules = IdRules::from_artifact(artifact).unwrap();
+        let attrs_key = rules.attrs_key.clone();
+        let generator = IdGenerator::new(rules);
+        let mut limits = Limits::defaults();
+        limits.max_output_bytes = 8192;
+
+        let mut container = UmContainer::open(&path, &limits).unwrap();
+        let selected: Vec<crate::model::NoteDescriptor> =
+            container.notes_in_order().into_iter().cloned().collect();
+        let mut plans = Vec::new();
+        for descriptor in &selected {
+            let parsed = container.read_note_with_rev(descriptor, &limits).unwrap();
+            plans.push(
+                plan_note(
+                    &parsed.note.doc,
+                    Some(descriptor.id.clone()),
+                    descriptor.title.as_deref(),
+                    parsed.note_rev,
+                    &addressable,
+                    &generator,
+                    &attrs_key,
+                )
+                .unwrap(),
+            );
+        }
+
+        let meta = SchemaMeta {
+            id: artifact.schema_id.clone(),
+            schema_version: artifact.schema_version,
+            schema_hash: artifact.schema_hash.clone(),
+        };
+        let lock =
+            crate::lock::acquire_write_lock(&path, "migrate-ids", &LockConfig::defaults()).unwrap();
+        let response = commit_um(
+            &path,
+            &mut container,
+            &selected,
+            &plans,
+            &budgeted_report(&plans, &limits, &path, true),
+            &meta,
+            &attrs_key,
+            &addressable,
+            &limits,
+        );
+        let _ = lock.release();
+        let response = response.unwrap_or_else(|err| panic!("the commit writes: {err}"));
+
+        // the emitted bytes stay inside the budget, and the incompleteness
+        // is explicit (§6.5) — no silent overflow, no silent partial report
+        let bytes = serde_json::to_string(&response).unwrap();
+        assert!(
+            bytes.len() <= limits.max_output_bytes,
+            "the committed response ({} bytes) fits the budget of {}",
+            bytes.len(),
+            limits.max_output_bytes
+        );
+        assert_eq!(response["complete"], false);
+        assert_eq!(response["truncated"], true);
+        assert_eq!(response["written"], true);
+        assert_eq!(response["notes_total"], plans.len());
+        assert!(
+            (response["notes_returned"].as_u64().unwrap() as usize) < plans.len(),
+            "the report is partial but the write covered every note"
+        );
+        // every emitted note still carries its own post-write revision
+        for note in response["notes"].as_array().unwrap() {
+            assert!(
+                note["new_note_rev"].as_str().is_some(),
+                "the reported notes keep their new_note_rev: {note}"
+            );
+        }
+        // the operation itself covers every selected note: all 40
+        // descriptors are stamped in the committed file
+        let after = UmContainer::open(&path, &limits).unwrap();
+        for descriptor in after.notes_in_order() {
+            assert!(
+                descriptor.block_ids_enabled(),
+                "descriptor {} carries the marker",
+                descriptor.id
+            );
+        }
     }
 
     /// Every `attrs.id` of a document, in document order (test helper).
