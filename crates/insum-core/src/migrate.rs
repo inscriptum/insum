@@ -592,8 +592,21 @@ fn ensure_writable_source(path: &Path) -> Result<(), UmError> {
 /// unchanged, and take the permissions the replacement must keep (§9.3:
 /// preserve the permissions of the source).
 fn pre_replace_verification(path: &Path, expected_rev: &str, what: &str) -> Result<u32, UmError> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|err| UmError::new(ErrorCode::IoError, format!("cannot stat {path:?}: {err}")))?;
+    let meta = std::fs::symlink_metadata(path).map_err(|err| {
+        // the same disappearing-source window must classify the same way no
+        // matter which check of this phase hits it first (D-7): an absent
+        // source is the torn-write class — exactly what ensure_writable_source
+        // and the readers report — never a plain IO_ERROR
+        if err.kind() == std::io::ErrorKind::NotFound {
+            crate::container::torn_error(
+                "absent",
+                path,
+                "the file is absent (possibly being rewritten)".to_owned(),
+            )
+        } else {
+            UmError::new(ErrorCode::IoError, format!("cannot stat {path:?}: {err}"))
+        }
+    })?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Err(UmError::new(
             ErrorCode::IoError,
@@ -1697,5 +1710,27 @@ mod tests {
             sidecars.is_empty(),
             "the lock sidecar is released on refusal: {sidecars:?}"
         );
+    }
+
+    /// D-7: a source that vanishes inside the pre-replace window classifies
+    /// as the torn-write class (READ_TORN, cause `absent`) no matter which
+    /// check of pre_replace_verification hits it first — the same verdict
+    /// ensure_writable_source and the readers produce, never a plain
+    /// IO_ERROR that would hide the retry hint.
+    #[test]
+    fn absent_source_in_the_pre_replace_window_reports_read_torn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let absent = dir.path().join("vanished.um");
+        let err = pre_replace_verification(&absent, "sha256:0", "the file").unwrap_err();
+        assert_eq!(err.code, ErrorCode::ReadTorn, "code: {err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("cause"))
+                .and_then(|c| c.as_str()),
+            Some("absent"),
+            "cause: {err:?}"
+        );
+        assert!(err.hint.is_some(), "READ_TORN carries a hint");
     }
 }
