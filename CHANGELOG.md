@@ -63,9 +63,12 @@ Format — Keep a Changelog; versioning — SemVer.
   answers `NOTE_JSON_INVALID` — a JSON document has no signature to detect
   truncation. `history` is intentionally exempt: it reads git, not the
   live container bytes, and keeps its reviewed absent-path contract.
-  `search`/`validate` fold the new code into their existing per-file
-  `skipped`/`files[]` entries; error entries in those reports now carry
-  `details` too.
+  `search`/`validate` split the new code by how the file was reached: a
+  container named explicitly on the command line and found absent fails
+  the whole command with `READ_TORN` (exit 4 — a named input is never
+  silently dropped), while torn files discovered by walking a directory
+  fold into the existing per-file `skipped`/`files[]` entries and lower
+  `complete`; error entries in those reports now carry `details` too.
 - Differential TS×Rust corpus (§4.8): a TypeScript harness builds a real
   prosemirror-model Schema from the artifact and records its verdicts for
   122 documents (valid compositions, targeted mutations, unknown types,
@@ -108,6 +111,10 @@ Format — Keep a Changelog; versioning — SemVer.
 - `migrate-ids` no longer fails with `INTERNAL` on a repeated `--note <id>`
   filter: a note named several times is selected and planned once, so the
   independently generated preview ids can no longer collide in the rewrite.
+- Every note entry of a `migrate-ids` response carries `note_title`
+  (from the manifest descriptor, falling back to the document title) —
+  matching the other per-note responses; consumers match hits to notes
+  without a second `ls`.
 - Annotated reading neutralizes the `<!--` sequence coming from document
   text — document content can no longer forge CLI anchors or markers.
 - The oversized-block marker is no longer lost when content follows the
