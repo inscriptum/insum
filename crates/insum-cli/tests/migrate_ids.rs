@@ -520,6 +520,68 @@ fn unmarked_note_with_complete_ids_still_gets_the_marker() {
     assert_eq!(collect_ids(&payload), vec!["alreadyok0", "anotherok1"]);
 }
 
+/// m-3: the non-dry-run response distinguishes wrote vs no-op with the
+/// top-level `written` flag. m-8: `notes[].note_rev` stays the pre-write
+/// revision (the stage-D CAS base), while the additive `new_note_rev`
+/// carries the post-write revision computed from the final bytes — the
+/// no-op rerun's pre-write revision equals the previous commit's
+/// `new_note_rev`.
+#[test]
+fn commit_response_marks_written_and_carries_the_post_write_revision() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(commit["written"], true, "the first run writes");
+    for note in commit["notes"].as_array().unwrap() {
+        let pre = note["note_rev"].as_str().unwrap();
+        let post = note["new_note_rev"].as_str().unwrap();
+        assert_ne!(
+            pre, post,
+            "the descriptor changed, so the revision changed: {note}"
+        );
+    }
+    assert!(commit["file_rev"].as_str().is_some());
+
+    // the rerun is a no-op: written:false, and each pre-write revision of
+    // the no-op equals the post-write revision the commit reported
+    let output = insum()
+        .args(["migrate-ids", &file, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let noop: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(noop["written"], false, "the rerun writes nothing");
+    assert!(noop["notes"][0].get("new_note_rev").is_none());
+    for note in noop["notes"].as_array().unwrap() {
+        let id = note["note_id"].as_str().unwrap();
+        let committed = commit["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["note_id"] == Value::String(id.to_owned()))
+            .expect("the same notes are reported");
+        assert_eq!(
+            note["note_rev"], committed["new_note_rev"],
+            "the commit's post-write revision is the current pre-write one"
+        );
+    }
+}
+
 #[test]
 fn unknown_note_id_is_note_not_found() {
     let fixture = Fixture::new();

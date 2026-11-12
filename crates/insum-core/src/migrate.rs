@@ -819,6 +819,7 @@ pub fn migrate_um(
             "path": path.display().to_string(),
             "notes": report.notes,
             "complete": !report.truncated,
+            "written": false,
             "file_rev": file_rev_before,
         });
         if report.truncated {
@@ -1000,8 +1001,12 @@ fn commit_um(
         file,
     )?;
     // §12: the result passes validation BEFORE the rename — over the very
-    // bytes that are staged next to the target
-    validate_result_um(
+    // bytes that are staged next to the target. The pass doubles as the
+    // source of the post-write note revisions: the staged bytes are the
+    // final bytes, so each parsed note_rev is what the file will carry
+    // after the rename (m-8 — reported additively, `note_rev` stays the
+    // pre-write revision the stage-D CAS must be built on).
+    let post_revs = validate_result_um(
         staged.path(),
         selected,
         plans,
@@ -1016,12 +1021,23 @@ fn commit_um(
     let new_file_rev = crate::container::file_sha256(staged.path())?;
     staged.commit_to(path, mode)?;
 
+    let mut notes = report.notes.clone();
+    for note in notes.iter_mut() {
+        let id = note
+            .get("note_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(rev) = id.as_deref().and_then(|id| post_revs.get(id)) {
+            note["new_note_rev"] = json!(rev);
+        }
+    }
     let mut response = json!({
         "api_version": 1,
         "dry_run": false,
         "path": path.display().to_string(),
-        "notes": report.notes,
+        "notes": notes,
         "complete": !report.truncated,
+        "written": true,
         "file_rev": new_file_rev,
     });
     if report.truncated {
@@ -1034,7 +1050,9 @@ fn commit_um(
 /// every selected note of the rewritten container — a note that only
 /// receives the marker included — passes the shared migration validation.
 /// Runs over the staged file next to the target: exactly the bytes that the
-/// rename would commit.
+/// rename would commit. Returns each note's revision over those final bytes
+/// (the post-write `new_note_rev` of the response, m-8) — no extra pass.
+#[allow(clippy::too_many_arguments)]
 fn validate_result_um(
     staged_path: &Path,
     selected: &[crate::model::NoteDescriptor],
@@ -1042,10 +1060,15 @@ fn validate_result_um(
     attrs_key: &str,
     addressable: &BTreeSet<String>,
     limits: &Limits,
-) -> Result<(), UmError> {
+) -> Result<HashMap<String, String>, UmError> {
     let mut container = UmContainer::open(staged_path, limits)?;
+    let mut post_revs: HashMap<String, String> = HashMap::new();
     for (descriptor, plan) in selected.iter().zip(plans.iter()) {
-        let parsed = container.read_note_with_rev(descriptor, limits)?;
+        // the STAGED descriptor carries the stamped features — the revision
+        // must be computed over the descriptor the file will actually hold,
+        // not over the pre-write one (m-8)
+        let staged_descriptor = container.find_note(&descriptor.id)?.clone();
+        let parsed = container.read_note_with_rev(&staged_descriptor, limits)?;
         validate_migrated_doc(
             &descriptor.id,
             &parsed.note.doc,
@@ -1054,8 +1077,9 @@ fn validate_result_um(
             attrs_key,
             limits,
         )?;
+        post_revs.insert(descriptor.id.clone(), parsed.note_rev);
     }
-    Ok(())
+    Ok(post_revs)
 }
 
 /// Legacy `.note` → envelope with IDs (§4.6 envelope shape). An envelope
@@ -1126,6 +1150,7 @@ pub fn migrate_note_file(
             "path": path.display().to_string(),
             "notes": [plan.to_json()],
             "complete": true,
+            "written": false,
             "file_rev": note_file.file_rev.clone(),
         }));
     }
@@ -1262,13 +1287,19 @@ fn commit_note_file(
     let mode = pre_replace_verification(path, expected_rev, "the .note file")?;
     staged.commit_to(path, mode)?;
 
+    // for a .note the whole file IS the note: the post-write note revision
+    // is the hash of the final bytes (the same value as `file_rev`, m-8)
+    let new_note_rev = note_rev_for_file_bytes(&new_bytes);
+    let mut note_json = plan.to_json();
+    note_json["new_note_rev"] = json!(new_note_rev);
     Ok(json!({
         "api_version": 1,
         "dry_run": false,
         "path": path.display().to_string(),
-        "notes": [plan.to_json()],
+        "notes": [note_json],
         "complete": true,
-        "file_rev": note_rev_for_file_bytes(&new_bytes),
+        "written": true,
+        "file_rev": new_note_rev,
     }))
 }
 

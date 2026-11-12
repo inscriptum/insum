@@ -39,6 +39,14 @@ Format — Keep a Changelog; versioning — SemVer.
   selected note — only the report can be partial; the first note plan
   above the whole budget is emitted whole (the same documented
   exception `tree` applies to a single oversized block).
+- Non-dry-run `migrate-ids` responses distinguish wrote from no-op with
+  the top-level `written: true|false` flag.
+- `migrate-ids` response revisions are unambiguous: `notes[].note_rev`
+  is the PRE-write revision — the base a stage-D write must build its
+  CAS on (§5.4); the additive `notes[].new_note_rev` (computed from the
+  final bytes, staged descriptor included) and the top-level `file_rev`
+  are post-write. The no-op rerun of a commit reports the committed
+  `new_note_rev` values as its pre-write `note_rev`s.
 - Search attribution invariant pinned: repeated stress runs over a
   multi-note corpus (heavy text sharing, `--note` filter, `.um`+`.note`
   mix) verify every match resolves `block get` by its own `note_id` and
