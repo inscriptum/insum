@@ -210,7 +210,14 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   manifest fields survive), validates the result over the staged bytes and
   replaces the file atomically (permissions preserved, symlink sources
   refused). A source symlink or non-regular file is refused before any
-  work, in dry-run and commit alike.
+  work, in dry-run and commit alike. The result is staged in a hidden,
+  exclusively created temp file next to the target (`.name.migrate-tmp-<16
+  hex>`, or `.insum-migrate-tmp-<16 hex>` when the target's name is too
+  long to carry the suffix; 0600 on unix, never reused or followed) and
+  unlinked on every error path — after a killed process such orphans may
+  remain next to the target, and deleting them by hand is safe: a later
+  migration always creates a fresh temp file and never reuses an existing
+  one.
 - **Response shape.** `notes[]` per selected note with the
   `{pointer, old_id, new_id, type}` change mapping; `note_rev` is the
   PRE-write revision (the CAS base for the stage-D write API) while the
