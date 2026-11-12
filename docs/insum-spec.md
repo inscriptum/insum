@@ -210,7 +210,13 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   manifest fields survive), validates the result over the staged bytes and
   replaces the file atomically (permissions preserved, symlink sources
   refused). A source symlink or non-regular file is refused before any
-  work, in dry-run and commit alike. The result is staged in a hidden,
+  work, in dry-run and commit alike. The lock and lease sidecars are named
+  after the target (§9.2 — the plugin counts on the same names, so there
+  is no fallback name): a target whose name leaves no room for the sidecar
+  component (the target name plus the dot and the suffix would exceed the
+  file-name cap) can never take the lock and is refused before any work
+  with `IO_ERROR` and a rename hint, in dry-run and commit alike. The
+  result is staged in a hidden,
   exclusively created temp file next to the target (`.name.migrate-tmp-<16
   hex>`, or `.insum-migrate-tmp-<16 hex>` when the target's name is too
   long to carry the suffix; 0600 on unix, never reused or followed) and

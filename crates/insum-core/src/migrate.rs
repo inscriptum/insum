@@ -17,7 +17,7 @@ use zip::write::SimpleFileOptions;
 use crate::container::{NoteFile, UmContainer, note_rev_for_file_bytes};
 use crate::error::{ErrorCode, UmError};
 use crate::limits::Limits;
-use crate::lock::{LockConfig, acquire_write_lock};
+use crate::lock::{LockConfig, acquire_write_lock, check_sidecar_name_fits};
 use crate::model::note_title;
 use crate::pointer;
 use crate::schema::SchemaSource;
@@ -849,6 +849,12 @@ pub fn migrate_um(
     // §9.3: a symlink or non-regular source is refused before any work —
     // dry-run and commit refuse alike (plan == commit)
     ensure_writable_source(path)?;
+    // plan == commit (R3COR-1): the write lock sidecar is named after the
+    // target (§9.2 — a cross-tool contract with the plugin, so there is no
+    // fallback name). A target whose name leaves no room for the sidecar
+    // component can never take the lock; refusing in the plan phase makes
+    // the dry-run answer exactly what the commit would produce
+    check_sidecar_name_fits(path)?;
     let resolved = resolve_for_write(path, schema, limits)?;
     let meta = SchemaMeta {
         id: resolved.artifact.schema_id.clone(),
@@ -1259,6 +1265,11 @@ pub fn migrate_note_file(
     // §9.3: a symlink or non-regular source is refused before any work —
     // dry-run and commit refuse alike (plan == commit)
     ensure_writable_source(path)?;
+    // plan == commit (R3COR-1): the same sidecar-name room check as the
+    // .um path — migrate_note_file also takes the write lock through
+    // acquire_write_lock, so the .note dry-run must refuse when the sidecar
+    // component cannot fit, exactly as the commit would
+    check_sidecar_name_fits(path)?;
     let resolved = resolve_for_write(path, schema, limits)?;
     let addressable = addressable_types(&resolved.artifact);
     let rules = IdRules::from_artifact(&resolved.artifact)?;

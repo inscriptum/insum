@@ -115,6 +115,13 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Fixed
 
+- `migrate-ids` refuses a target whose file name leaves no room for the
+  lock/lease sidecar component (the sidecars are named after the target,
+  §9.2 — a fallback name would break the lock protocol the plugin follows):
+  a 243–255-byte target name used to leave the dry-run green while the
+  commit failed `IO_ERROR` (`ENAMETOOLONG`). Both refuse alike before any
+  work now, with a rename-the-file hint; the bytes are never touched. A
+  242-byte or shorter name keeps the D-6 staging behavior green.
 - `migrate-ids` no longer fails with `INTERNAL` on a repeated `--note <id>`
   filter: a note named several times is selected and planned once, so the
   independently generated preview ids can no longer collide in the rewrite.

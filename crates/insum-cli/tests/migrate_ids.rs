@@ -1766,6 +1766,152 @@ fn long_target_name_stages_under_the_name_independent_prefix() {
     assert_eq!(manifest["notes"][0]["features"]["block_ids"], 1);
 }
 
+/// R3COR-1: the lock/lease sidecars are named after the target (§9.2, a
+/// cross-tool contract with the plugin — no fallback name exists). The D-6
+/// staging fallback covers the staged temp name but not the sidecar
+/// component (the target name plus the dot and the 11/12-byte suffix): a
+/// target whose name leaves no room for it can never take the write lock,
+/// and the commit used to fail ENAMETOOLONG (IO_ERROR) while the dry-run
+/// was green — the very plan != commit symptom D-6 removed for staging.
+/// plan == commit: the plan phase refuses with the same code, message and
+/// hint, and the bytes are never touched.
+#[cfg(unix)]
+#[test]
+fn target_without_sidecar_name_room_refuses_in_the_plan_phase() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    // 250-byte base name: the target itself fits the component cap, the
+    // sidecar components (250 + 12, 250 + 13) do not
+    let long = format!("{}.um", "n".repeat(247));
+    assert_eq!(
+        long.len(),
+        250,
+        "the target name leaves no room for the sidecar component"
+    );
+    let path = fixture.dir.path().join(&long);
+    let notes = [FixtureNote::title_page(
+        &insum_test_utils::ulid_seq(1),
+        "Alpha",
+        "first",
+        &[insum_test_utils::paragraph(&[insum_test_utils::text(
+            "body",
+        )])],
+    )];
+    insum_test_utils::write_um(&path, &notes).unwrap();
+    let file = path.to_string_lossy().into_owned();
+    let before = fs::read(&file).unwrap();
+
+    let mut errors: Vec<Value> = Vec::new();
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+        args.extend(extra.iter());
+        let output = insum().args(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "IO_ERROR exits 1 ({extra:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let err = stderr_json(&output);
+        assert_eq!(err["error"]["code"], "IO_ERROR", "{extra:?}");
+        let message = err["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("too long for the lock sidecar"),
+            "the refusal names the sidecar ({extra:?}): {message}"
+        );
+        let hint = err["error"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("rename the file"),
+            "the hint says what to do ({extra:?}): {hint}"
+        );
+        errors.push(err);
+    }
+    assert_eq!(
+        errors[0], errors[1],
+        "plan == commit: the dry-run answers the very error object the commit produces"
+    );
+
+    assert_eq!(
+        before,
+        fs::read(&file).unwrap(),
+        "refused runs leave the file alone"
+    );
+    let leftovers: Vec<_> = fs::read_dir(fixture.dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.contains("insum-lock")
+                || name.contains("insum-lease")
+                || name.contains("migrate-tmp")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no sidecar or tmp leftovers: {leftovers:?}"
+    );
+}
+
+/// R3COR-1 on the `.note` path: migrate_note_file takes the write lock
+/// through acquire_write_lock too, so a long-named `.note` must refuse in
+/// the plan phase with the same code and hint as its commit — bytes never
+/// touched (the D-6 staging fallback already kept the 230-byte case green).
+#[cfg(unix)]
+#[test]
+fn long_named_note_file_refuses_in_the_plan_phase() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let long = format!("{}.note", "n".repeat(245));
+    assert_eq!(
+        long.len(),
+        250,
+        "the target name leaves no room for the sidecar component"
+    );
+    let path = fixture.dir.path().join(&long);
+    let doc = json!({
+        "type": "noteDoc",
+        "content": [
+            {"type": "noteTitle", "content": [{"type": "text", "text": "Alpha"}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "body"}]}
+        ]
+    });
+    fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let file = path.to_string_lossy().into_owned();
+    let before = fs::read(&file).unwrap();
+
+    let mut errors: Vec<Value> = Vec::new();
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+        args.extend(extra.iter());
+        let output = insum().args(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "IO_ERROR exits 1 ({extra:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let err = stderr_json(&output);
+        assert_eq!(err["error"]["code"], "IO_ERROR", "{extra:?}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("too long for the lock sidecar"),
+            "{extra:?}"
+        );
+        errors.push(err);
+    }
+    assert_eq!(
+        errors[0], errors[1],
+        "plan == commit: the dry-run answers the very error object the commit produces"
+    );
+    assert_eq!(
+        before,
+        fs::read(&file).unwrap(),
+        "refused runs leave the file alone"
+    );
+}
+
 /// m-13: `block get --id` verdicts are pinned by code, not just exit codes:
 /// a note the partial migration did not mark answers with the
 /// not-guaranteed warning even though its block carries a physical
