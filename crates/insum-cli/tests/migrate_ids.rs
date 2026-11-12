@@ -770,12 +770,14 @@ fn legacy_note_converts_to_envelope_and_stays_readable() {
 }
 
 #[test]
-fn block_get_by_id_is_gated_on_the_marker() {
+fn block_get_by_id_resolves_on_presence_and_warns_without_the_marker() {
     let fixture = Fixture::new();
     let artifact = fixture.artifact();
     let file = fixture.container();
 
-    // before migration: --id refuses (ids not guaranteed)
+    // before migration: a physically present id resolves (§4.6 п.4 — read
+    // by ID works on presence), but the answer warns the ids are not
+    // guaranteed without the marker
     let output = insum()
         .args([
             "block",
@@ -788,9 +790,23 @@ fn block_get_by_id_is_gated_on_the_marker() {
         ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2), "pre-migration --id is USAGE");
+    assert!(
+        output.status.success(),
+        "pre-migration --id resolves on presence: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["block"]["id"], "secondone0");
+    assert_eq!(value["block"]["node"]["type"], "noteTitle");
+    let warnings = value["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "BLOCK_IDS_NOT_GUARANTEED"),
+        "unmarked note warns the ids are not guaranteed: {warnings:?}"
+    );
 
-    // after migration: the same --id resolves
+    // after migration: the same --id resolves without that warning
     let migrate = insum()
         .args(["migrate-ids", &file, "--schema", &artifact])
         .output()
@@ -819,8 +835,16 @@ fn block_get_by_id_is_gated_on_the_marker() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["block"]["id"], "secondone0");
-    assert_eq!(value["block"]["node"]["type"], "noteTitle");
-    // unknown id: BLOCK_NOT_FOUND (exit 3), not just a bare exit code
+    let warnings = value["warnings"].as_array().unwrap();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w["code"] == "BLOCK_IDS_NOT_GUARANTEED"),
+        "a marked note does not warn: {warnings:?}"
+    );
+
+    // unknown id: BLOCK_NOT_FOUND (exit 3), not just a bare exit code —
+    // marker or not, absence stays absence
     let output = insum()
         .args([
             "block",
@@ -1340,11 +1364,12 @@ fn validation_does_not_stage_into_the_shared_temp_dir() {
 }
 
 /// m-13: `block get --id` verdicts are pinned by code, not just exit codes:
-/// the marker gate holds for a note the partial migration did not mark
-/// (even though its block carries a physical attrs.id), and an id of
+/// a note the partial migration did not mark answers with the
+/// not-guaranteed warning even though its block carries a physical
+/// attrs.id (read-by-id works on presence, §4.6 п.4), and an id of
 /// another note never resolves cross-note.
 #[test]
-fn block_get_by_id_partial_migration_gate_and_cross_note_ids() {
+fn block_get_by_id_on_unmarked_note_warns_and_never_resolves_cross_note() {
     let fixture = Fixture::new();
     let artifact = fixture.artifact();
     let file = fixture.container();
@@ -1367,9 +1392,8 @@ fn block_get_by_id_partial_migration_gate_and_cross_note_ids() {
         String::from_utf8_lossy(&partial.stderr)
     );
 
-    // the unmarked second note keeps the gate even though its noteTitle
-    // physically carries attrs.id secondone0 (§4.6: ids are not guaranteed
-    // without the marker)
+    // the unmarked second note resolves its physical id, with the warning
+    // (§4.6: ids are not guaranteed without the marker)
     let output = insum()
         .args([
             "block",
@@ -1382,12 +1406,20 @@ fn block_get_by_id_partial_migration_gate_and_cross_note_ids() {
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "the gate stays for an unmarked note"
+    assert!(
+        output.status.success(),
+        "read by id works on presence for an unmarked note: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["block"]["id"], "secondone0");
+    let warnings = value["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "BLOCK_IDS_NOT_GUARANTEED"),
+        "the unmarked note warns: {warnings:?}"
+    );
 
     // full migration marks both notes
     let full = insum()

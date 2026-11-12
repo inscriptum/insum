@@ -21,8 +21,12 @@ Format — Keep a Changelog; versioning — SemVer.
   descriptor's `schema` field (the editor profile) is untouched. Legacy
   `.note` converts to the envelope shape of §4.6. A note whose IDs are
   already complete still gets the marker — the marker records the
-  verification. `block get --id` now works on marker-bearing notes
-  (§6.3 gate lifted from unconditional refusal to marker-gated).
+  verification. `block get --id` works whenever the ID is present in the
+  note (§4.6 п.4, owner decision 2026-10-30 — read-by-ID on presence):
+  without the `features.block_ids` marker the response carries a
+  `BLOCK_IDS_NOT_GUARANTEED` warning (§6.5 — no silent answers), an
+  absent ID stays `BLOCK_NOT_FOUND`, and the marker gate remains
+  mandatory for the write API (stage D).
 - Search attribution invariant pinned: repeated stress runs over a
   multi-note corpus (heavy text sharing, `--note` filter, `.um`+`.note`
   mix) verify every match resolves `block get` by its own `note_id` and

@@ -186,7 +186,8 @@ enum BlockAction {
         /// JSON Pointer of the block (stage A addressing).
         #[arg(long)]
         pointer: Option<String>,
-        /// Block ID — available after the migration stage.
+        /// Block ID — resolves when the ID is present in the note; without
+        /// the features.block_ids marker the answer carries a warning
         #[arg(long)]
         id: Option<String>,
         /// Return the original node JSON with `attrs.id` kept.

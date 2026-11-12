@@ -1,8 +1,10 @@
 //! `insum block get` — full subtree of one block.
 //!
-//! Stage A addresses blocks by `--pointer`; `--id` works on notes that
-//! carry the `features.block_ids` marker (migration stage C) — before it
-//! the IDs are not guaranteed (§4.6) and the flag is refused.
+//! Stage A addresses blocks by `--pointer`; `--id` works whenever the ID is
+//! present in the note (§4.6 п.4, owner decision 2026-10-30: reading by ID
+//! works on presence). Without the `features.block_ids` marker the IDs are
+//! not guaranteed, so the answer carries an explicit warning; the marker
+//! stays mandatory for the write API (stage D).
 
 use std::path::Path;
 
@@ -57,13 +59,11 @@ pub fn run(
     // The block must exist as a traversable structural node.
     let all_blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
     let entry: &BlockEntry = if let Some(id) = id {
-        // --id addressing is gated on the marker: before migration the IDs
-        // are not guaranteed (§4.6), after it the manifest vouches for them
-        if !view.block_ids_enabled {
-            return Err(UmError::usage(
-                "--id requires the note to carry the features.block_ids marker (run `insum migrate-ids` first)",
-            ));
-        }
+        // --id addresses by presence (§4.6 п.4): a physically present ID
+        // resolves even without the marker, but the answer says the IDs are
+        // not guaranteed (§6.5 warning convention — never a silent answer);
+        // an absent ID is BLOCK_NOT_FOUND either way. The marker gate stays
+        // for the write API (stage D).
         all_blocks
             .iter()
             .find(|block| block.id.as_deref() == Some(id))
@@ -118,7 +118,18 @@ pub fn run(
                 .map(str::to_owned)
         });
 
-    let warnings = collect_unknown_types(&node, limits);
+    let mut warnings = collect_unknown_types(&node, limits);
+    // §4.6 п.4: before the marker the note's IDs are not guaranteed — the
+    // successful read says so instead of implying a vouched-for address
+    if id.is_some() && !view.block_ids_enabled {
+        warnings.insert(
+            0,
+            json!({
+                "code": "BLOCK_IDS_NOT_GUARANTEED",
+                "message": "IDs not guaranteed: the note carries no features.block_ids marker (run `insum migrate-ids` to verify the IDs and stamp the marker)",
+            }),
+        );
+    }
     Ok(json!({
         "api_version": 1,
         "path": rendered,

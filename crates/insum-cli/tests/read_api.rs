@@ -543,8 +543,8 @@ fn limits_and_error_codes_are_enforced() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
 
-    // --id before migration → USAGE exit 2 (the marker gate; the note must
-    // exist — resolution happens before the gate)
+    // --id on an unmarked note addresses by presence (§4.6 п.4): the
+    // fixture carries no such id, so the miss is BLOCK_NOT_FOUND (exit 3)
     let output = insum()
         .args([
             "block",
@@ -557,8 +557,8 @@ fn limits_and_error_codes_are_enforced() {
         ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stderr_json(&output)["error"]["code"], "BLOCK_NOT_FOUND");
 
     // validate --schema with a missing artifact → SCHEMA_UNAVAILABLE exit 6
     let output = insum()
