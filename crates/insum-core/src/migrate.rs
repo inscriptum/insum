@@ -1070,15 +1070,13 @@ fn commit_um(
     let new_file_rev = crate::container::file_sha256(staged.path())?;
     staged.commit_to(path, mode)?;
 
+    // `new_note_rev` lands by POSITION, not by note-id lookup (D-3): the
+    // report holds the plans in order (budgeted_report iterates `plans`),
+    // and post_revs is aligned with `plans`/`selected` — duplicate note ids
+    // in the manifest must not report one note's revision for another
     let mut notes = report.notes.clone();
-    for note in notes.iter_mut() {
-        let id = note
-            .get("note_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(rev) = id.as_deref().and_then(|id| post_revs.get(id)) {
-            note["new_note_rev"] = json!(rev);
-        }
+    for (index, note) in notes.iter_mut().enumerate() {
+        note["new_note_rev"] = json!(post_revs[index]);
     }
     let mut response = json!({
         "api_version": 1,
@@ -1100,7 +1098,12 @@ fn commit_um(
 /// receives the marker included — passes the shared migration validation.
 /// Runs over the staged file next to the target: exactly the bytes that the
 /// rename would commit. Returns each note's revision over those final bytes
-/// (the post-write `new_note_rev` of the response, m-8) — no extra pass.
+/// in the order of `selected`/`plans` (the post-write `new_note_rev` of the
+/// response, m-8) — no extra pass. The staged descriptor is resolved by
+/// payload PATH, never by note id (D-3): a manifest may carry duplicate
+/// note ids, and the first-id match would validate one note's plan against
+/// another note's document (a false INTERNAL) or report one note's
+/// revision for both.
 #[allow(clippy::too_many_arguments)]
 fn validate_result_um(
     staged_path: &Path,
@@ -1109,14 +1112,14 @@ fn validate_result_um(
     attrs_key: &str,
     addressable: &BTreeSet<String>,
     limits: &Limits,
-) -> Result<HashMap<String, String>, UmError> {
+) -> Result<Vec<String>, UmError> {
     let mut container = UmContainer::open(staged_path, limits)?;
-    let mut post_revs: HashMap<String, String> = HashMap::new();
+    let mut post_revs = Vec::with_capacity(selected.len());
     for (descriptor, plan) in selected.iter().zip(plans.iter()) {
         // the STAGED descriptor carries the stamped features — the revision
         // must be computed over the descriptor the file will actually hold,
-        // not over the pre-write one (m-8)
-        let staged_descriptor = container.find_note(&descriptor.id)?.clone();
+        // not over the pre-write one (m-8); the path is the unique key (D-3)
+        let staged_descriptor = container.find_note_by_path(&descriptor.path)?.clone();
         let parsed = container.read_note_with_rev(&staged_descriptor, limits)?;
         validate_migrated_doc(
             &descriptor.id,
@@ -1126,7 +1129,7 @@ fn validate_result_um(
             attrs_key,
             limits,
         )?;
-        post_revs.insert(descriptor.id.clone(), parsed.note_rev);
+        post_revs.push(parsed.note_rev);
     }
     Ok(post_revs)
 }
@@ -1455,7 +1458,10 @@ fn rewrite_um(
 }
 
 /// Set `features.block_ids = 1` and schema metadata on the selected
-/// descriptors; unknown manifest fields are preserved as values (§12).
+/// descriptors; unknown manifest fields are preserved as values (§12). The
+/// selected entries are matched by payload PATH — the unique archive key —
+/// so a manifest with duplicate note ids cannot receive the marker on an
+/// entry that was not selected and verified (D-3).
 fn stamp_manifest(
     mut manifest: Value,
     selected: &[crate::model::NoteDescriptor],
@@ -1465,16 +1471,21 @@ fn stamp_manifest(
         .get_mut("notes")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| UmError::new(ErrorCode::ManifestInvalid, "manifest has no notes array"))?;
-    let selected_ids: BTreeSet<&str> = selected.iter().map(|d| d.id.as_str()).collect();
+    let selected_paths: BTreeSet<&str> = selected.iter().map(|d| d.path.as_str()).collect();
     for entry in notes.iter_mut() {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !selected_paths.contains(path.as_str()) {
+            continue;
+        }
         let id = entry
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        if !selected_ids.contains(id.as_str()) {
-            continue;
-        }
         let object = entry.as_object_mut().ok_or_else(|| {
             UmError::new(
                 ErrorCode::ManifestInvalid,
@@ -1761,5 +1772,182 @@ mod tests {
             "cause: {err:?}"
         );
         assert!(err.hint.is_some(), "READ_TORN carries a hint");
+    }
+
+    /// D-3: a manifest may carry duplicate note ids (the read contract is
+    /// not changed — `find_note` still answers the first). The commit must
+    /// resolve each staged note by its payload PATH — the unique ZIP-entry
+    /// key — so every plan is validated against its OWN document (no false
+    /// INTERNAL) and every reported `new_note_rev` belongs to its own note,
+    /// even when the ids collide.
+    #[test]
+    fn duplicate_note_ids_validate_and_report_by_payload_path() {
+        use std::io::Write as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dup-ids.um");
+        let id = insum_test_utils::ulid_seq(1);
+        // two manifest entries share ONE note id; the payload paths differ
+        let manifest = serde_json::json!({
+            "format": "um",
+            "version": 1,
+            "type": "notepad",
+            "notes": [
+                {"id": id, "path": format!("notes/{id}.json"), "order": 0,
+                 "title": "Alpha", "schema": "title", "schemaVersion": 2},
+                {"id": id, "path": format!("notes/{id}-b.json"), "order": 1,
+                 "title": "Beta", "schema": "title", "schemaVersion": 2},
+            ],
+        });
+        // the documents differ in shape: only the second carries /content/2
+        let doc_a = serde_json::json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "Alpha"}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": "one"}]}
+            ]
+        });
+        let doc_b = serde_json::json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "content": [{"type": "text", "text": "Beta"}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": "two"}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": "three"}]}
+            ]
+        });
+        let options =
+            zip::write::SimpleFileOptions::default().last_modified_time(zip::DateTime::default());
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file("manifest.json", options).unwrap();
+        writer.write_all(manifest.to_string().as_bytes()).unwrap();
+        writer
+            .start_file(format!("notes/{id}.json"), options)
+            .unwrap();
+        writer.write_all(doc_a.to_string().as_bytes()).unwrap();
+        writer
+            .start_file(format!("notes/{id}-b.json"), options)
+            .unwrap();
+        writer.write_all(doc_b.to_string().as_bytes()).unwrap();
+        writer.finish().unwrap();
+
+        let artifact = &*TEST_ARTIFACT;
+        let addressable = crate::schema::addressable_types(artifact);
+        let rules = IdRules::from_artifact(artifact).unwrap();
+        let attrs_key = rules.attrs_key.clone();
+        let generator = IdGenerator::new(rules);
+        let limits = Limits::defaults();
+
+        let mut container = UmContainer::open(&path, &limits).unwrap();
+        let selected: Vec<crate::model::NoteDescriptor> =
+            container.notes_in_order().into_iter().cloned().collect();
+        assert_eq!(selected.len(), 2, "both duplicate-id entries are selected");
+        let mut plans = Vec::new();
+        for descriptor in &selected {
+            let parsed = container.read_note_with_rev(descriptor, &limits).unwrap();
+            plans.push(
+                plan_note(
+                    &parsed.note.doc,
+                    Some(descriptor.id.clone()),
+                    descriptor.title.as_deref(),
+                    parsed.note_rev,
+                    &addressable,
+                    &generator,
+                    &attrs_key,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            plans[0].changes.len(),
+            plans[1].changes.len() - 1,
+            "the second document plans one more change (its extra block)"
+        );
+
+        let meta = SchemaMeta {
+            id: artifact.schema_id.clone(),
+            schema_version: artifact.schema_version,
+            schema_hash: artifact.schema_hash.clone(),
+        };
+        let lock =
+            crate::lock::acquire_write_lock(&path, "migrate-ids", &LockConfig::defaults()).unwrap();
+        let response = commit_um(
+            &path,
+            &mut container,
+            &selected,
+            &plans,
+            &budgeted_report(&plans, &limits),
+            &meta,
+            &attrs_key,
+            &addressable,
+            &limits,
+        );
+        let _ = lock.release();
+        let response = response
+            .unwrap_or_else(|err| panic!("the commit validates each note by its own path: {err}"));
+
+        let notes = response["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        // the report stays position-aligned with the plans: titles differ
+        assert_eq!(notes[0]["note_title"], "Alpha");
+        assert_eq!(notes[1]["note_title"], "Beta");
+        // distinct revisions per note — no shared `new_note_rev` for the
+        // colliding ids
+        let rev0 = notes[0]["new_note_rev"].as_str().unwrap().to_owned();
+        let rev1 = notes[1]["new_note_rev"].as_str().unwrap().to_owned();
+        assert_ne!(rev0, rev1, "each note reports its own post-write revision");
+        // the reported revisions are exactly the final bytes' per-note
+        // revisions of the STAGED (stamped) descriptors
+        let mut after = UmContainer::open(&path, &limits).unwrap();
+        let parsed_a = after
+            .read_note_with_rev(
+                &after
+                    .find_note_by_path(&format!("notes/{id}.json"))
+                    .unwrap()
+                    .clone(),
+                &limits,
+            )
+            .unwrap();
+        let parsed_b = after
+            .read_note_with_rev(
+                &after
+                    .find_note_by_path(&format!("notes/{id}-b.json"))
+                    .unwrap()
+                    .clone(),
+                &limits,
+            )
+            .unwrap();
+        assert_eq!(parsed_a.note_rev, rev0, "first entry's own revision");
+        assert_eq!(parsed_b.note_rev, rev1, "second entry's own revision");
+        // both documents were migrated in their own payloads
+        let ids_a = collect_doc_ids(&parsed_a.note.doc);
+        let ids_b = collect_doc_ids(&parsed_b.note.doc);
+        assert_eq!(ids_a.len(), 2, "noteTitle + paragraph of the first doc");
+        assert_eq!(
+            ids_b.len(),
+            3,
+            "noteTitle + two paragraphs of the second doc"
+        );
+    }
+
+    /// Every `attrs.id` of a document, in document order (test helper).
+    fn collect_doc_ids(doc: &serde_json::Value) -> Vec<String> {
+        fn walk(node: &serde_json::Value, ids: &mut Vec<String>) {
+            if let Some(id) = node
+                .get("attrs")
+                .and_then(|attrs| attrs.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                ids.push(id.to_owned());
+            }
+            if let Some(children) = node.get("content").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    walk(child, ids);
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        walk(doc, &mut ids);
+        ids
     }
 }

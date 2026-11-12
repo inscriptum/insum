@@ -122,6 +122,23 @@ impl UmContainer {
             })
     }
 
+    /// Resolve a note descriptor by its payload path — the unique archive
+    /// key. Unlike [`UmContainer::find_note`] (which matches the manifest id
+    /// and answers the first duplicate), a payload path identifies exactly
+    /// one ZIP entry, so the write path validates and reports the note it
+    /// actually staged even when a manifest carries duplicate note ids (D-3).
+    pub fn find_note_by_path(&self, payload_path: &str) -> Result<&NoteDescriptor, UmError> {
+        self.manifest
+            .notes
+            .iter()
+            .find(|note| note.path == payload_path)
+            .ok_or_else(|| {
+                UmError::internal(format!(
+                    "no manifest note carries the payload path {payload_path:?}"
+                ))
+            })
+    }
+
     /// Read and parse one note payload. The entry size is checked against
     /// the limit before decompression. No revision is computed —
     /// the light path for consumers that never output revisions.
