@@ -555,6 +555,97 @@ fn bundled_fallback_refuses_to_write() {
     assert_eq!(stderr_json(&output)["error"]["code"], "SCHEMA_UNAVAILABLE");
 }
 
+/// M-6: the artifact is resolved for the vault that CONTAINS the target file
+/// (§4.7) — a vault artifact is found with the process cwd outside the vault,
+/// and an artifact sitting in the cwd is never stamped into a vault that has
+/// none. Dry-run and commit resolve the same way (plan == commit).
+#[test]
+fn artifact_is_resolved_from_the_target_vault_not_the_cwd() {
+    let fixture = Fixture::new();
+
+    // a vault carrying the plugin runtime artifact, target file inside it
+    let vault = fixture.dir.path().join("vault");
+    fs::create_dir_all(vault.join(".obsidian/plugins/inscriptum")).unwrap();
+    fs::write(
+        vault.join(".obsidian/plugins/inscriptum/schema.json"),
+        serde_json::to_vec(&artifact_with_id_rules()).unwrap(),
+    )
+    .unwrap();
+    let notes = [FixtureNote::title_page(
+        &insum_test_utils::ulid_seq(1),
+        "Alpha",
+        "first",
+        &[insum_test_utils::paragraph(&[insum_test_utils::text(
+            "body",
+        )])],
+    )];
+    let container = vault.join("target.um");
+    write_um(&container, &notes).unwrap();
+    let file = container.to_string_lossy().into_owned();
+
+    // cwd outside the vault, no --schema: dry-run plans and the commit
+    // writes, both through the vault artifact of the target file
+    let outside = tempfile::TempDir::new().unwrap();
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &file];
+        args.extend(extra);
+        let output = insum()
+            .args(&args)
+            .current_dir(outside.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "vault artifact of the target file is used without --schema ({args:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // the marker was stamped by that commit — the vault artifact was not
+    // merely readable, it authorized the write
+    let manifest: Value = serde_json::from_slice(&read_entry(&file, "manifest.json")).unwrap();
+    assert_eq!(manifest["notes"][0]["features"]["block_ids"], 1);
+
+    // the cwd artifact must not leak into a vault that has none: the sibling
+    // vault without .obsidian refuses (bundled fallback refuses to write) in
+    // dry-run and commit alike, with the file untouched
+    let foreign = fixture.dir.path().join("foreign-vault");
+    fs::create_dir_all(&foreign).unwrap();
+    let foreign_container = foreign.join("foreign.um");
+    write_um(&foreign_container, &notes).unwrap();
+    let foreign_file = foreign_container.to_string_lossy().into_owned();
+    let before = fs::read(&foreign_file).unwrap();
+
+    let work_vault = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(work_vault.path().join(".obsidian/plugins/inscriptum")).unwrap();
+    fs::write(
+        work_vault
+            .path()
+            .join(".obsidian/plugins/inscriptum/schema.json"),
+        serde_json::to_vec(&artifact_with_id_rules()).unwrap(),
+    )
+    .unwrap();
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &foreign_file];
+        args.extend(extra);
+        let output = insum()
+            .args(&args)
+            .current_dir(work_vault.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "a cwd artifact is not applied to a vault that has none ({args:?})"
+        );
+        assert_eq!(stderr_json(&output)["error"]["code"], "SCHEMA_UNAVAILABLE");
+    }
+    assert_eq!(
+        before,
+        fs::read(&foreign_file).unwrap(),
+        "the refused migration leaves the foreign vault untouched"
+    );
+}
+
 #[test]
 fn tampered_artifact_refuses_to_write() {
     let fixture = Fixture::new();

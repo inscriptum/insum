@@ -453,14 +453,19 @@ fn marker_rejection(resolved_source: SchemaSource, hash_verified: bool) -> Resul
 }
 
 /// Resolve a schema artifact for a write (explicit → vault rule → refused
-/// bundled fallback).
+/// bundled fallback). The vault walk starts at the target file's directory —
+/// §4.7 resolves the artifact "for the vault containing the target file", so
+/// the artifact is found even when the command runs from outside the vault,
+/// and an artifact of the *calling* directory is never stamped into a foreign
+/// vault (M-6; `validate` walks from `file.parent()` the same way). Dry-run
+/// and commit resolve once here — plan == commit.
 fn resolve_for_write(
+    path: &Path,
     schema: Option<&Path>,
     limits: &Limits,
 ) -> Result<crate::schema::ResolvedSchema, UmError> {
-    let start = std::env::current_dir()
-        .map_err(|err| UmError::new(ErrorCode::IoError, format!("cannot read cwd: {err}")))?;
-    let resolved = crate::schema::resolve(schema, &start, limits)?;
+    let start = path.parent().unwrap_or_else(|| Path::new("."));
+    let resolved = crate::schema::resolve(schema, start, limits)?;
     marker_rejection(resolved.source, resolved.hash_verified)?;
     Ok(resolved)
 }
@@ -667,7 +672,7 @@ pub fn migrate_um(
     // §9.3: a symlink or non-regular source is refused before any work —
     // dry-run and commit refuse alike (plan == commit)
     ensure_writable_source(path)?;
-    let resolved = resolve_for_write(schema, limits)?;
+    let resolved = resolve_for_write(path, schema, limits)?;
     let meta = SchemaMeta {
         id: resolved.artifact.schema_id.clone(),
         schema_version: resolved.artifact.schema_version,
@@ -981,7 +986,7 @@ pub fn migrate_note_file(
     // §9.3: a symlink or non-regular source is refused before any work —
     // dry-run and commit refuse alike (plan == commit)
     ensure_writable_source(path)?;
-    let resolved = resolve_for_write(schema, limits)?;
+    let resolved = resolve_for_write(path, schema, limits)?;
     let addressable = addressable_types(&resolved.artifact);
     let rules = IdRules::from_artifact(&resolved.artifact)?;
     let attrs_key = rules.attrs_key.clone();
