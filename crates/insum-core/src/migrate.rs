@@ -741,16 +741,20 @@ fn commit_um(
         }
     }
 
-    let new_bytes = rewrite_um(
-        path,
-        &mut reopened,
-        selected,
-        plans,
-        meta,
-        attrs_key,
-        limits,
-    )?;
+    let new_bytes = rewrite_um(&mut reopened, selected, plans, meta, attrs_key, limits)?;
     validate_result_um(&new_bytes, selected, plans, attrs_key, addressable, limits)?;
+
+    // §9.3 MUST: re-check the file revision immediately before the replace —
+    // the fresh hash sees the path the way any other process would (never
+    // through a handle a rename would have left on the old inode)
+    let file_rev_final = crate::container::file_sha256(path)?;
+    if file_rev_final != file_rev_before {
+        return Err(revision_mismatch(
+            &file_rev_before,
+            &file_rev_final,
+            "the file",
+        ));
+    }
     atomic_replace(path, &new_bytes)?;
 
     Ok(json!({
@@ -903,7 +907,10 @@ fn commit_note_file(
     addressable: &BTreeSet<String>,
     limits: &Limits,
 ) -> Result<Value, UmError> {
-    let reopened = NoteFile::open(path, limits, true)?;
+    // one bounded read serves the whole phase: the revision recheck and the
+    // envelope bytes come from the same generation (m-5 — no unconditional
+    // re-read of the file, no envelope fields from another generation)
+    let (reopened, raw) = NoteFile::open_with_raw(path, limits, true)?;
     if reopened.note_rev != expected_rev {
         return Err(revision_mismatch(
             expected_rev,
@@ -919,13 +926,8 @@ fn commit_note_file(
     // top-level fields are preserved as values (§12 — anything that cannot
     // be preserved must abort the write, not be dropped silently)
     let mut envelope: Value = if already_envelope {
-        serde_json::from_slice(&std::fs::read(path).map_err(|err| {
-            UmError::new(
-                ErrorCode::IoError,
-                format!("cannot read {}: {err}", path.display()),
-            )
-        })?)
-        .map_err(|err| UmError::internal(format!("envelope does not parse: {err}")))?
+        serde_json::from_slice(&raw)
+            .map_err(|err| UmError::internal(format!("envelope does not parse: {err}")))?
     } else {
         json!({})
     };
@@ -973,6 +975,13 @@ fn commit_note_file(
 
     let new_bytes = serde_json::to_vec(&envelope)
         .map_err(|err| UmError::internal(format!("envelope does not serialize: {err}")))?;
+    // §9.3 MUST: re-check the revision immediately before the replace —
+    // for a `.note` the file hash IS the revision; the streamed hash sees
+    // the path as any other process would (no held handle)
+    let rev_now = crate::container::file_sha256(path)?;
+    if rev_now != expected_rev {
+        return Err(revision_mismatch(expected_rev, &rev_now, "the .note file"));
+    }
     atomic_replace(path, &new_bytes)?;
 
     Ok(json!({
@@ -993,9 +1002,11 @@ struct SchemaMeta {
 
 /// Rebuild the `.um` container: modified manifest + modified payloads, every
 /// other entry copied raw (byte-identical, order and timestamps preserved).
+/// The archive is the one held open since the recheck — raw entries are
+/// copied from the in-lock generation, never from a fresh open of the path
+/// (M-1: a non-cooperative writer cannot mix generations into the commit).
 #[allow(clippy::too_many_arguments)]
 fn rewrite_um(
-    path: &Path,
     container: &mut UmContainer,
     selected: &[crate::model::NoteDescriptor],
     plans: &[MigrateNotePlan],
@@ -1023,20 +1034,8 @@ fn rewrite_um(
         .map_err(|err| UmError::internal(format!("manifest does not serialize: {err}")))?;
     replacements.insert("manifest.json".to_owned(), manifest_bytes);
 
-    // rebuild: walk the source archive in order
-    let source = std::fs::File::open(path).map_err(|err| {
-        UmError::new(
-            ErrorCode::IoError,
-            format!("cannot read {}: {err}", path.display()),
-        )
-    })?;
-    let mut archive = zip::ZipArchive::new(source).map_err(|err| {
-        crate::container::torn_error(
-            "truncated",
-            path,
-            format!("ZIP container is incomplete or corrupt: {err}"),
-        )
-    })?;
+    // rebuild: walk the source archive in order through the held handle
+    let archive = container.zip_archive();
     let buffer = std::io::Cursor::new(Vec::new());
     let mut writer = zip::ZipWriter::new(buffer);
     for index in 0..archive.len() {
@@ -1145,4 +1144,167 @@ fn stamp_manifest(
         }
     }
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+    use std::fs;
+    use std::sync::LazyLock;
+
+    /// A minimal runtime artifact: noteTitle + paragraph addressable,
+    /// grammar §4.4. Self-hashed so `SchemaArtifact::parse` accepts it.
+    static TEST_ARTIFACT: LazyLock<crate::schema::SchemaArtifact> = LazyLock::new(|| {
+        let mut raw = serde_json::json!({
+            "schema_id": "inscriptum",
+            "schema_version": 1,
+            "schema_hash": "",
+            "top_node": "noteDoc",
+            "validation_capability": "partial",
+            "id_rules": {
+                "attrs_key": "id",
+                "pattern": "^[a-z0-9]{8,12}$",
+                "recommended_length": 10
+            },
+            "nodes": {
+                "noteDoc": {"content": "noteTitle block*", "groups": [], "attrs": {},
+                            "marks": [], "addressable": false, "inline_content": false,
+                            "searchable": false},
+                "noteTitle": {"content": "inline*", "groups": ["block"], "attrs": {},
+                              "marks": [], "addressable": true, "inline_content": true,
+                              "searchable": true},
+                "paragraph": {"content": "inline*", "groups": ["block"], "attrs": {},
+                              "marks": [], "addressable": true, "inline_content": true,
+                              "searchable": true},
+                "text": {"content": null, "groups": ["inline"], "attrs": {},
+                         "marks": [], "addressable": false, "inline_content": true,
+                         "searchable": false}
+            },
+            "marks": {}
+        });
+        raw["schema_hash"] = serde_json::json!(crate::schema::compute_hash(&raw));
+        crate::schema::SchemaArtifact::parse(raw).unwrap()
+    });
+
+    /// M-11: the §7.2 revision recheck inside the commit refuses with
+    /// NOTE_REVISION_MISMATCH when the file changed after the plan was
+    /// built (a non-cooperative writer); the bytes stay untouched and the
+    /// lock sidecar is released.
+    #[test]
+    fn file_changed_after_plan_refuses_with_note_revision_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("race.um");
+        let notes = [insum_test_utils::FixtureNote::title_page(
+            &insum_test_utils::ulid_seq(1),
+            "Alpha",
+            "first",
+            &[insum_test_utils::paragraph(&[insum_test_utils::text(
+                "body",
+            )])],
+        )];
+        insum_test_utils::write_um(&path, &notes).unwrap();
+
+        let artifact = &*TEST_ARTIFACT;
+        let addressable = crate::schema::addressable_types(artifact);
+        let rules = IdRules::from_artifact(artifact).unwrap();
+        let attrs_key = rules.attrs_key.clone();
+        let generator = IdGenerator::new(rules).unwrap();
+        let limits = Limits::defaults();
+
+        let mut container = UmContainer::open(&path, &limits).unwrap();
+        let descriptor = container
+            .find_note(&insum_test_utils::ulid_seq(1))
+            .unwrap()
+            .clone();
+        let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+        let plan = plan_note(
+            &parsed.note.doc,
+            Some(descriptor.id.clone()),
+            descriptor.title.as_deref(),
+            parsed.note_rev,
+            &addressable,
+            &generator,
+            &attrs_key,
+        )
+        .unwrap();
+        assert!(plan.change_count() > 0, "the fixture plans real changes");
+
+        // a non-cooperative writer rewrites the payload after the plan was
+        // built (in-place rewrite, same inode)
+        let mutated = {
+            let mut doc = parsed.note.doc.clone();
+            doc["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(insum_test_utils::paragraph(&[insum_test_utils::text(
+                    "raced in",
+                )]));
+            let bytes = serde_json::to_vec(&doc).unwrap();
+            let mut archive = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+            let buffer = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(buffer);
+            for index in 0..archive.len() {
+                let raw = archive.by_index_raw(index).unwrap();
+                let name = raw.name().unwrap().into_owned();
+                if name == descriptor.path {
+                    let last_modified = raw.last_modified().unwrap_or_default();
+                    drop(raw);
+                    writer
+                        .start_file(
+                            name.as_str(),
+                            zip::write::SimpleFileOptions::default()
+                                .last_modified_time(last_modified),
+                        )
+                        .unwrap();
+                    std::io::Write::write_all(&mut writer, &bytes).unwrap();
+                } else {
+                    writer.raw_copy_file(raw).unwrap();
+                }
+            }
+            writer.finish().unwrap().into_inner()
+        };
+        fs::write(&path, &mutated).unwrap();
+
+        // the write path holds the commit lock exactly like migrate_um does
+        let lock =
+            crate::lock::acquire_write_lock(&path, "migrate-ids", &LockConfig::defaults()).unwrap();
+        let meta = SchemaMeta {
+            id: artifact.schema_id.clone(),
+            schema_version: artifact.schema_version,
+            schema_hash: artifact.schema_hash.clone(),
+        };
+        let outcome = commit_um(
+            &path,
+            &mut container,
+            std::slice::from_ref(&descriptor),
+            std::slice::from_ref(&plan),
+            &meta,
+            &attrs_key,
+            &addressable,
+            &limits,
+        );
+        let Err(err) = outcome else {
+            panic!("the commit refuses the changed file")
+        };
+        assert_eq!(err.code, ErrorCode::NoteRevisionMismatch);
+        let _ = lock.release();
+
+        // the refused write leaves the (mutated) file alone
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            mutated,
+            "the refused commit does not touch the bytes"
+        );
+        // no lock sidecar remains on the refusal path
+        let sidecars: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("insum-lock"))
+            .collect();
+        assert!(
+            sidecars.is_empty(),
+            "the lock sidecar is released on refusal: {sidecars:?}"
+        );
+    }
 }

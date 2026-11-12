@@ -94,6 +94,14 @@ impl UmContainer {
         Ok(self.file_rev_cache.clone().expect("just cached"))
     }
 
+    /// The archive over the descriptor held since open. The write path uses
+    /// it to rebuild the container from the in-lock generation: raw entries
+    /// are copied through THIS handle — never through a fresh open of the
+    /// path, which a non-cooperative writer could have swapped (M-1/SEC-3).
+    pub(crate) fn zip_archive(&mut self) -> &mut ZipArchive<File> {
+        &mut self.archive
+    }
+
     /// Note descriptors sorted by `order`, then `id`.
     pub fn notes_in_order(&self) -> Vec<&NoteDescriptor> {
         let mut notes: Vec<&NoteDescriptor> = self.manifest.notes.iter().collect();
@@ -304,6 +312,30 @@ pub fn note_rev_for_file_bytes(file_bytes: &[u8]) -> String {
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
+}
+
+/// SHA-256 of a file's CURRENT bytes, streamed from a fresh open. Unlike
+/// [`UmContainer::file_rev`] (which reads through the handle held since
+/// open and therefore sees the generation that handle was opened on), this
+/// re-reads the path — the write path's pre-replace revision re-check
+/// (§9.3) must see the file the way any other process would.
+pub fn file_sha256(path: &Path) -> Result<String, UmError> {
+    let mut file = File::open(path).map_err(|err| path_error(path, err))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|err| {
+            UmError::new(
+                ErrorCode::IoError,
+                format!("cannot hash {}: {err}", path.display()),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format_rev(hex(&hasher.finalize())))
 }
 
 /// Read a file with a hard byte cap (limits are enforced on the
@@ -593,16 +625,40 @@ impl NoteFile {
         // Read with a hard cap instead of stat-then-read: a FIFO or a file
         // growing between stat and read cannot inflate the allocation.
         let raw = read_bounded(path, limits)?;
+        Self::from_raw(path, &raw, limits, with_revs)
+    }
+
+    /// Open like [`NoteFile::open`] and also return the bounded raw bytes
+    /// the revisions were computed from. The write path uses this to
+    /// rebuild the envelope from the same generation it re-checked — one
+    /// bounded read, no unconditional re-read of the file (m-5).
+    pub fn open_with_raw(
+        path: &Path,
+        limits: &Limits,
+        with_revs: bool,
+    ) -> Result<(Self, Vec<u8>), UmError> {
+        let raw = read_bounded(path, limits)?;
+        let note_file = Self::from_raw(path, &raw, limits, with_revs)?;
+        Ok((note_file, raw))
+    }
+
+    /// Parse the bounded bytes [`NoteFile::open`] read.
+    fn from_raw(
+        path: &Path,
+        raw: &[u8],
+        limits: &Limits,
+        with_revs: bool,
+    ) -> Result<Self, UmError> {
         let bytes = raw.len() as u64;
         //: for.note both revisions hash the whole file — one digest
         // serves both; skipped entirely on the light path
         let (file_rev, note_rev) = if with_revs {
-            let digest = format_rev(sha256_hex(&raw));
+            let digest = format_rev(sha256_hex(raw));
             (digest.clone(), digest)
         } else {
             (String::new(), String::new())
         };
-        let text = String::from_utf8(raw).map_err(|err| {
+        let text = String::from_utf8(raw.to_vec()).map_err(|err| {
             UmError::new(
                 ErrorCode::NoteJsonInvalid,
                 format!("note is not UTF-8: {err}"),
