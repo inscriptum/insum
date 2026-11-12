@@ -828,6 +828,15 @@ pub fn migrate_um(
         // same shared check the pre-commit validation runs (B-1)
         let mut planned_doc = parsed.note.doc.clone();
         apply_ids(&mut planned_doc, &plan.changes, &attrs_key)?;
+        // plan == commit (D-4): the commit stamps the marker through
+        // stamp_manifest, which refuses a non-object `features` field — the
+        // dry-run refuses here with the same code and message, before any
+        // work happens
+        if let Some(features) = &descriptor.features
+            && !features.is_object()
+        {
+            return Err(broken_features_error(&descriptor.id));
+        }
         validate_migrated_doc(
             &descriptor.id,
             &planned_doc,
@@ -991,6 +1000,30 @@ fn validation_refusal(note: &str, code: &str, message: String) -> UmError {
     UmError::new(code, message).with_hint(format!(
         "Fix the data before migrating note {note:?}; `insum validate` shows the full diagnostic list. The file was not modified."
     ))
+}
+
+/// plan == commit (D-4): the commit refuses a selected descriptor whose
+/// `features` field is not an object (stamp_manifest); the plan phase
+/// refuses with the same code and message — the dry-run must answer the
+/// refusal the commit would produce.
+fn broken_features_error(id: &str) -> UmError {
+    UmError::new(
+        ErrorCode::ManifestInvalid,
+        format!(
+            "descriptor {id:?} has a non-object features field; fix the manifest before migration"
+        ),
+    )
+}
+
+/// plan == commit (D-4): the commit rebuilds the envelope from the raw
+/// payload and refuses a non-object `features`/`schema` field there
+/// (commit_note_file); the plan phase refuses with the same code and
+/// message before any work happens.
+fn envelope_field_shape_error(field: &str) -> UmError {
+    UmError::new(
+        ErrorCode::NoteDocInvalid,
+        format!("the envelope {field} field is not an object; fix the data before migration"),
+    )
 }
 
 /// Lock-held phase of the `.um` commit: revision recheck, rewrite,
@@ -1175,6 +1208,23 @@ pub fn migrate_note_file(
     // planned copy of the document (B-1)
     let mut planned_doc = note_file.note.doc.clone();
     apply_ids(&mut planned_doc, &plan.changes, &attrs_key)?;
+    // plan == commit (D-4): the commit rebuilds the envelope from the raw
+    // payload and refuses a non-object `features`/`schema` field there —
+    // the dry-run refuses with the same code and message. A legacy payload
+    // is rebuilt from an EMPTY envelope on commit, so its stray top-level
+    // fields never refuse the commit and must not refuse the dry-run.
+    if already_envelope {
+        if let Some(features) = &note_file.features
+            && !features.is_object()
+        {
+            return Err(envelope_field_shape_error("features"));
+        }
+        if let Some(schema) = &note_file.schema
+            && !schema.is_object()
+        {
+            return Err(envelope_field_shape_error("schema"));
+        }
+    }
     validate_migrated_doc(
         "<note>",
         &planned_doc,
@@ -1284,10 +1334,8 @@ fn commit_note_file(
                 map.insert("block_ids".to_owned(), json!(1));
             }
             _ => {
-                return Err(UmError::new(
-                    ErrorCode::NoteDocInvalid,
-                    "the envelope features field is not an object; fix the data before migration",
-                ));
+                // the plan phase refuses with this same error (D-4)
+                return Err(envelope_field_shape_error("features"));
             }
         }
         // the envelope's own schema metadata is kept when present; a legacy
@@ -1300,10 +1348,8 @@ fn commit_note_file(
             })
         });
         if !schema.is_object() {
-            return Err(UmError::new(
-                ErrorCode::NoteDocInvalid,
-                "the envelope schema field is not an object; fix the data before migration",
-            ));
+            // the plan phase refuses with this same error (D-4)
+            return Err(envelope_field_shape_error("schema"));
         }
         map.insert("document".to_owned(), doc.clone());
     }
@@ -1512,13 +1558,9 @@ fn stamp_manifest(
             }
             _ => {
                 // refuse-don't-skip: a selected note must not report success
-                // without its marker (same rule as the payload attrs path)
-                return Err(UmError::new(
-                    ErrorCode::ManifestInvalid,
-                    format!(
-                        "descriptor {id:?} has a non-object features field; fix the manifest before migration"
-                    ),
-                ));
+                // without its marker (same rule as the payload attrs path);
+                // the plan phase refuses with this same error (D-4)
+                return Err(broken_features_error(&id));
             }
         }
     }

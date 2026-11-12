@@ -1217,7 +1217,9 @@ fn regression_envelope_unknown_fields_survive_and_unmarked_envelope_is_selected(
 #[test]
 fn regression_broken_features_descriptor_refuses_the_marker() {
     // N-01: a non-object features field on a selected descriptor refuses
-    // the stamp instead of silently skipping it
+    // the stamp instead of silently skipping it. D-4: the refusal is
+    // reached in the PLAN phase too — the dry-run answers the same
+    // MANIFEST_INVALID the commit produces (it used to be green).
     let fixture = Fixture::new();
     let artifact = fixture.artifact();
     let file = fixture.container();
@@ -1230,13 +1232,108 @@ fn regression_broken_features_descriptor_refuses_the_marker() {
         "manifest.json",
         &serde_json::to_vec(&manifest).unwrap(),
     );
+    let before = fs::read(&file).unwrap();
 
-    let output = insum()
-        .args(["migrate-ids", &file, "--schema", &artifact])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(4), "MANIFEST_INVALID exits 4");
-    assert_eq!(stderr_json(&output)["error"]["code"], "MANIFEST_INVALID");
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+        args.extend(extra.iter());
+        let output = insum().args(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "MANIFEST_INVALID exits 4 ({extra:?})"
+        );
+        let err = stderr_json(&output);
+        assert_eq!(err["error"]["code"], "MANIFEST_INVALID", "{extra:?}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("non-object features field"),
+            "the refusal names the broken shape: {err}"
+        );
+    }
+    assert_eq!(
+        before,
+        fs::read(&file).unwrap(),
+        "refused runs leave the file alone"
+    );
+}
+
+/// D-4: plan == commit for the `.note` envelope metadata shape — a
+/// non-object `features` or `schema` field refuses the dry-run with the
+/// same NOTE_DOC_INVALID the commit produces (the dry-run used to be
+/// green while the commit failed after the lock was taken).
+#[test]
+fn regression_broken_envelope_features_and_schema_refuse_in_plan_too() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let doc = json!({"type": "noteDoc", "content": [
+        {"type": "noteTitle", "content": [{"type": "text", "text": "T"}]}
+    ]});
+    for (field, value) in [("features", json!(5)), ("schema", json!(7))] {
+        let mut envelope = json!({
+            "format": "inscriptum-note",
+            "version": 1,
+            "document": doc,
+        });
+        envelope[field] = value;
+        let path = fixture.dir.path().join(format!("broken-{field}.note"));
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let before = fs::read(&file).unwrap();
+
+        for extra in [vec!["--dry-run"], vec![]] {
+            let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+            args.extend(extra.iter());
+            let output = insum().args(&args).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(4),
+                "NOTE_DOC_INVALID exits 4 ({field}, {extra:?})"
+            );
+            let err = stderr_json(&output);
+            assert_eq!(err["error"]["code"], "NOTE_DOC_INVALID", "{field}");
+            assert!(
+                err["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not an object"),
+                "the refusal names the broken shape: {err}"
+            );
+        }
+        assert_eq!(
+            before,
+            fs::read(&file).unwrap(),
+            "refused runs leave the file alone ({field})"
+        );
+    }
+
+    // control: a LEGACY payload with stray top-level features/schema fields
+    // is rebuilt from an empty envelope on commit — it migrates green, and
+    // the plan phase must not refuse what the commit accepts
+    let path = fixture.dir.path().join("legacy-stray-fields.note");
+    let mut legacy = doc.clone();
+    legacy["features"] = json!("stray");
+    legacy["schema"] = json!(3);
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let file = path.to_string_lossy().into_owned();
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["migrate-ids", &file, "--schema", &artifact];
+        args.extend(extra.iter());
+        let output = insum().args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "a legacy payload's stray top-level fields do not refuse ({extra:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let after: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert_eq!(after["features"]["block_ids"], 1);
+    assert!(
+        after["schema"].is_object(),
+        "the envelope schema is an object"
+    );
 }
 
 #[test]
