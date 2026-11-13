@@ -1587,6 +1587,9 @@ fn commit_preserves_source_permissions() {
 /// M-3 (§9.3): a symlink source is refused — the link is never followed to
 /// its target and never silently replaced by a regular file. Dry-run
 /// refuses the same way (plan == commit).
+// Unix-only: creating a symlink on Windows needs elevated rights, and a
+// regular-file substitute would lose the very precondition under test.
+#[cfg(unix)]
 #[test]
 fn symlink_source_is_refused() {
     let fixture = Fixture::new();
@@ -1596,8 +1599,6 @@ fn symlink_source_is_refused() {
     let link = fixture.dir.path().join("alias.um");
     #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    #[cfg(not(unix))]
-    fs::copy(&target, &link).unwrap(); // windows: no symlinks in tests
     let link_str = link.to_string_lossy().into_owned();
 
     for extra in [vec!["--dry-run"], vec![]] {
