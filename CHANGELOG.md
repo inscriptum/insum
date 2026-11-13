@@ -7,6 +7,51 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum apply <file> --ops <file|-> [--dry-run] [--if-match <prefix>]`
+  (stage D, §8): addressed write of blocks by ID with a revision CAS.
+  One package mutates one note; `base_note_rev` (from `tree` / `read` /
+  `block get` / `search`) is compared against the current `note_rev`
+  before any work (`NOTE_REVISION_MISMATCH`, exit 7). Operations:
+  `replace`, `delete`, `insert_before`, `insert_after`, `append_child`
+  (`parent_id: null` — the document root), `set_attrs`, `replace_content`;
+  `set_text` and `move` are not in v1. IDs are CLI-managed: input nodes
+  must not carry `attrs.id` — a stolen ID is `ID_CONFLICT`, any other
+  input ID is `BLOCK_ID_IMMUTABLE`; `replace` keeps the target's ID and
+  its subtree may restate its own descendant IDs; new addressable blocks
+  receive generator IDs. Sequential semantics (§8.4): IDs resolve against
+  the current working copy, `insert_after` groups on one anchor keep the
+  operation order, a deleted block fails every later operation on its ID.
+  Dry-run validates the package against the current state (`operations_validated`,
+  `would_create_count`, `would_delete_ids`, parity warnings) and never
+  touches bytes, mtime or the directory (plan == commit). Commit: the
+  same sidecar lock and dirty-lease guard as `migrate-ids`
+  (`WRITE_LOCKED`); a changed file with an unchanged target note is
+  re-applied onto the fresh generation (other notes' changes survive),
+  a changed target is `NOTE_REVISION_MISMATCH`, after
+  `UM_MAX_COMMIT_RETRIES` (default 3) — `WRITE_CONFLICT`, never a silent
+  overwrite; all-or-nothing, untouched ZIP entries keep names and
+  compressed bytes, unknown manifest/envelope fields survive, atomic
+  replace with permissions preserved and symlink sources refused. The
+  result document must satisfy the applicable schema (verified runtime or
+  explicit artifact; bundled fallback refuses with `SCHEMA_UNAVAILABLE`,
+  `SCHEMA_MISMATCH` on a failed hash) and the note must carry the
+  `features.block_ids` marker (`BLOCK_IDS_NOT_ENABLED` — run
+  `migrate-ids` first). Success response: `old/new note_rev`,
+  `old/new file_rev`, `operations_applied`, `created_ids` (every new
+  addressable block with its final `{id, pointer, type}`),
+  `deleted_ids`, parity warnings; the ID lists respect
+  `UM_MAX_OUTPUT_BYTES` with explicit truncation (`truncated`, totals,
+  `OUTPUT_BUDGET`). Validation refusals map onto the registry
+  (`CONTENT_NOT_ALLOWED`, `UNSUPPORTED_NODE_TYPE`, `INVALID_NODE`) with
+  the full diagnostic list in `error.details.diagnostics`. Package
+  envelope violations are `USAGE`; limits: `UM_MAX_APPLY_OPS`,
+  `UM_MAX_OPS_BYTES` (`LIMIT_EXCEEDED`). The shared write-path plumbing
+  (staged temp file, source-safety and pre-replace checks, raw-copy
+  container rebuild) moved from `migrate-ids` into `insum_core::commit` —
+  one commit discipline for both write commands.
+- User documentation: stage-D section in `docs/insum-spec.md` (package
+  format, ID rules, transaction semantics, response shape).
+
 - `insum migrate-ids <file> [--note <id>]... [--dry-run]` (stage C, §7.2):
   the one command allowed to stamp the `features.block_ids` marker (§4.6).
   Plans ID fixes per note (missing/duplicate/invalid per document order —

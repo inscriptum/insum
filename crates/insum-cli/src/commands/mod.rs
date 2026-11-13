@@ -1,5 +1,6 @@
 //! CLI command modules — one file per read API command.
 
+pub mod apply;
 pub mod block;
 pub mod history;
 pub mod ls;

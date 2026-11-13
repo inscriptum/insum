@@ -250,7 +250,7 @@ pub struct ParsedNote {
 /// Parse JSON with the depth limit enforced on the raw text before parsing
 /// (so hostile nesting fails as `LIMIT_EXCEEDED`, not as a parse error) and
 /// with serde_json's own recursion limit disabled afterwards.
-fn parse_json_limited(
+pub(crate) fn parse_json_limited(
     text: &str,
     max_depth: usize,
     parse_error: ErrorCode,
