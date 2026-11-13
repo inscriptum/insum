@@ -41,15 +41,9 @@ pub fn read_ops(source: &str, limits: &Limits) -> Result<Vec<u8>, UmError> {
                 )
             })?;
     }
-    if bytes.len() > limits.max_ops_bytes {
-        return Err(UmError::new(
-            ErrorCode::LimitExceeded,
-            format!(
-                "operations package exceeds UM_MAX_OPS_BYTES ({} bytes)",
-                limits.max_ops_bytes
-            ),
-        ));
-    }
+    // the canonical LIMIT_EXCEEDED construction lives in the engine — the
+    // CLI layer only reads the bytes against the same budget
+    insum_core::apply::check_ops_package_size(&bytes, limits)?;
     Ok(bytes)
 }
 

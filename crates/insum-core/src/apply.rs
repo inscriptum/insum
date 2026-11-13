@@ -70,6 +70,7 @@ enum Operation {
 }
 
 /// The parsed operations package: one note, one base revision, N operations.
+#[derive(Debug)]
 struct Package {
     note_id: Option<String>,
     base_note_rev: String,
@@ -77,32 +78,47 @@ struct Package {
     operations: Vec<Operation>,
 }
 
-/// Parse and shape-check the package (§8.1). Package-envelope violations
-/// (api_version, base_note_rev, note_id presence) are `USAGE`; malformed
-/// operation entries are `INVALID_OPERATION`; malformed node JSON inside an
-/// operation is `INVALID_NODE`. Limits bound the package size and the
-/// operation count (§5.5).
-fn parse_package(
-    bytes: &[u8],
-    limits: &Limits,
-    require_note_id: bool,
-    if_match: Option<&str>,
-) -> Result<Package, UmError> {
+/// The canonical UM_MAX_OPS_BYTES verdict for a freshly read package (§5.5).
+/// The CLI reader and the engine re-check share this one construction so the
+/// limit cannot be reported with two different texts or codes.
+pub fn check_ops_package_size(bytes: &[u8], limits: &Limits) -> Result<(), UmError> {
     if bytes.len() > limits.max_ops_bytes {
         return Err(limit_exceeded(format!(
             "operations package exceeds UM_MAX_OPS_BYTES ({} bytes)",
             limits.max_ops_bytes
         )));
     }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| invalid_operation("the operations package is not UTF-8"))?;
+    Ok(())
+}
+
+/// Parse and shape-check the package (§8.1). Package-envelope violations
+/// (non-UTF-8 bytes, api_version, base_note_rev, note_id presence) are
+/// `USAGE`; malformed operation entries are `INVALID_OPERATION`; malformed
+/// node JSON inside an operation is `INVALID_NODE`. Limits bound the package
+/// size and the operation count (§5.5).
+fn parse_package(
+    bytes: &[u8],
+    limits: &Limits,
+    require_note_id: bool,
+    if_match: Option<&str>,
+) -> Result<Package, UmError> {
+    check_ops_package_size(bytes, limits)?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| usage("the operations package is not UTF-8"))?;
     let value =
         crate::container::parse_json_limited(text, limits.max_depth, ErrorCode::InvalidOperation)
             .map_err(|err| {
-            usage(format!(
-                "the operations package does not parse: {}",
-                err.message
-            ))
+            // WHY: parse_json_limited owns the depth verdict — a depth over
+            // UM_MAX_DEPTH must stay LIMIT_EXCEEDED (exit 5), only a genuine
+            // parse failure is package-envelope USAGE
+            if err.code == ErrorCode::LimitExceeded {
+                err
+            } else {
+                usage(format!(
+                    "the operations package does not parse: {}",
+                    err.message
+                ))
+            }
         })?;
     let object = value
         .as_object()
@@ -478,8 +494,9 @@ impl<'a> Engine<'a> {
     }
 
     fn apply(&mut self, doc: &mut Value, ops: &[Operation]) -> Result<(), UmError> {
-        for op in ops {
-            self.apply_one(doc, op)?;
+        for (index, op) in ops.iter().enumerate() {
+            self.apply_one(doc, op)
+                .map_err(|err| annotate_failed_operation(err, index))?;
         }
         Ok(())
     }
@@ -686,6 +703,17 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// Point a failed operation back at its position in the package: the message
+/// names the index and details carry it, so the agent can locate the failing
+/// entry without counting JSON members by hand.
+fn annotate_failed_operation(mut err: UmError, index: usize) -> UmError {
+    err.message = format!("operation {index}: {}", err.message);
+    let mut details = err.details.take().unwrap_or_else(|| json!({}));
+    details["operation_index"] = json!(index);
+    err.details = Some(details);
+    err
+}
+
 /// One addressable block created by the package: ID, pointer in the final
 /// document, node type (§8.5).
 #[derive(Debug, Clone)]
@@ -697,6 +725,7 @@ struct CreatedBlock {
 
 /// The result of applying a package to one document generation: the final
 /// document, the created/deleted ID bookkeeping and the validation verdict.
+#[derive(Debug)]
 struct Generation {
     doc: Value,
     operations_applied: usize,
@@ -726,6 +755,7 @@ fn build_generation(
     let mut engine = Engine::new(attrs_key, addressable);
     engine.apply(&mut doc, &package.operations)?;
     let operations_applied = package.operations.len();
+    refuse_title_family_loss(doc_source, &doc)?;
 
     // deleted = IDs present before the package and gone after it
     // (delete ops, replaced subtrees, dropped replace_content content)
@@ -832,6 +862,36 @@ fn assign_missing_ids(
         }
     }
     Ok(())
+}
+
+/// The source document was title-family (first root child `noteTitle`) and
+/// the result is not: the artifact's `noteTitle block*` root rule rejects
+/// such a document, but pmschema only WARNS on it
+/// (`root_outside_artifact_scope` → SCHEMA_FAMILY_UNCOVERED), so without
+/// this gate a delete/replace of the title (or an insert_before ahead of
+/// it) would commit a document the artifact refuses. Sources that are not
+/// title-family keep the legacy plain-page verdict (warning only).
+/// The type of the first root child, or None when the content is empty.
+fn first_root_child_type(doc: &Value) -> Option<&str> {
+    doc.get("content")
+        .and_then(Value::as_array)
+        .and_then(|children| children.first())
+        .and_then(|child| child.get("type"))
+        .and_then(Value::as_str)
+}
+
+fn refuse_title_family_loss(doc_source: &Value, doc: &Value) -> Result<(), UmError> {
+    if first_root_child_type(doc_source) != Some("noteTitle")
+        || first_root_child_type(doc) == Some("noteTitle")
+    {
+        return Ok(());
+    }
+    Err(validation_refusal(&[Diag {
+        code: "CONTENT_MISMATCH",
+        message:
+            "the package removes the leading noteTitle: the noteDoc content rule of this artifact requires the title block first"
+                .to_owned(),
+    }]))
 }
 
 /// Map a parity-validation refusal onto the operation-level registry codes
@@ -1053,11 +1113,14 @@ fn commit_um_locked(
             // the package base is stale and the CAS must fail
             attempts += 1;
             if attempts > limits.max_commit_retries {
+                // WHY: `attempts` counts observed changes; the last one never
+                // produced a re-apply, so the report must not overstate by one
+                let re_applications = attempts.saturating_sub(1);
                 return Err(UmError::new(
                     ErrorCode::WriteConflict,
                     format!(
                         "the file kept changing under the commit ({} re-applications, UM_MAX_COMMIT_RETRIES={})",
-                        attempts, limits.max_commit_retries
+                        re_applications, limits.max_commit_retries
                     ),
                 )
                 .with_hint(
@@ -1066,10 +1129,24 @@ fn commit_um_locked(
                 .with_details(json!({
                     "expected_file_rev": file_rev_snapshot,
                     "actual_file_rev": file_rev_now,
-                    "attempts": attempts,
+                    "attempts": re_applications,
                 })));
             }
-            let fresh_descriptor = container.find_note_by_path(&descriptor.path)?.clone();
+            let fresh_descriptor = match container.find_note_by_path(&descriptor.path) {
+                Ok(fresh) => fresh.clone(),
+                // WHY: a note missing from the fresh manifest is a competitor's
+                // move/delete of the TARGET — a stale package base (§8.6 step 7,
+                // exit 7), not a lookup failure; genuine IO/torn errors from the
+                // open/read calls above stay transparent
+                Err(err) if err.code == ErrorCode::Internal => {
+                    return Err(revision_mismatch(
+                        &package.base_note_rev,
+                        "<absent>",
+                        "the target note",
+                    ));
+                }
+                Err(err) => return Err(err),
+            };
             let fresh = container.read_note_with_rev(&fresh_descriptor, limits)?;
             if fresh.note_rev != package.base_note_rev {
                 return Err(revision_mismatch(
@@ -1110,7 +1187,15 @@ fn commit_um_locked(
             pm,
             limits,
         )?;
-        let mode = pre_replace_verification(path, &file_rev_snapshot, "the file")?;
+        let mode = match pre_replace_verification(path, &file_rev_snapshot, "the file") {
+            // §8.6 steps 7–8 in the commit window: the file moved on AFTER the
+            // loop-top recheck, but the TARGET note may be unchanged — re-enter
+            // the CAS loop (the attempt counter bounds it; exhaustion reports
+            // WRITE_CONFLICT). A .note never takes this path: any file change
+            // there IS a target change (commit_note_locked keeps the mismatch).
+            Err(err) if err.code == ErrorCode::NoteRevisionMismatch => continue,
+            result => result?,
+        };
         let new_file_rev = file_sha256(staged.path())?;
         staged.commit_to(path, mode)?;
 
@@ -1223,17 +1308,20 @@ pub fn apply_note_file(
         limits,
     )?;
     // plan == commit (D-4 discipline of migrate): the commit rebuilds the
-    // envelope from the raw payload and refuses non-object `features` /
-    // `schema` fields there — the plan refuses with the same code first
+    // envelope from the fresh raw payload and refuses an envelope whose
+    // `features` / `schema` fields are absent or not objects — the plan
+    // refuses with the same code first (a green dry-run promises a green
+    // commit)
     if let Some(features) = &note_file.features
         && !features.is_object()
     {
         return Err(envelope_field_shape_error("features"));
     }
-    if let Some(schema_field) = &note_file.schema
-        && !schema_field.is_object()
-    {
-        return Err(envelope_field_shape_error("schema"));
+    if marked {
+        match &note_file.schema {
+            Some(schema_field) if schema_field.is_object() => {}
+            _ => return Err(envelope_field_shape_error("schema")),
+        }
     }
 
     check_sidecar_name_fits(path)?;
@@ -1326,6 +1414,11 @@ fn commit_note_locked(
     })?;
     drop(file);
 
+    // CONTRACT (§12): the result passes validation BEFORE the replace — the
+    // staged bytes are re-read through the bounded reader so an oversized or
+    // unparseable serialized result refuses before it can become the target
+    // (parity with validate_staged_um on the .um path)
+    NoteFile::open(staged.path(), limits, false)?;
     let mode = pre_replace_verification(path, expected_rev, "the .note file")?;
     staged.commit_to(path, mode)?;
 
@@ -1809,6 +1902,53 @@ mod tests {
             fs::write(&self.path, buffer.into_inner()).unwrap();
         }
 
+        /// Remove a note from the container entirely (a non-cooperative
+        /// concurrent writer DELETING the target): rewrite the archive
+        /// without the payload entry and without the manifest entry.
+        fn remove_note(&self, note: &str) {
+            let manifest = {
+                let mut archive =
+                    zip::ZipArchive::new(fs::File::open(&self.path).unwrap()).unwrap();
+                let mut entry = archive.by_name("manifest.json").unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+                let mut manifest: Value = serde_json::from_slice(&bytes).unwrap();
+                manifest["notes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|entry| entry["id"].as_str() != Some(note));
+                serde_json::to_vec(&manifest).unwrap()
+            };
+            let skip = format!("notes/{note}.json");
+            let mut archive = zip::ZipArchive::new(fs::File::open(&self.path).unwrap()).unwrap();
+            let buffer = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(buffer);
+            for index in 0..archive.len() {
+                let raw = archive.by_index_raw(index).unwrap();
+                let entry_name = raw.name().unwrap().into_owned();
+                if entry_name == skip {
+                    drop(raw);
+                    continue;
+                }
+                if entry_name == "manifest.json" {
+                    let last_modified = raw.last_modified().unwrap_or_default();
+                    drop(raw);
+                    writer
+                        .start_file(
+                            entry_name.as_str(),
+                            zip::write::SimpleFileOptions::default()
+                                .last_modified_time(last_modified),
+                        )
+                        .unwrap();
+                    std::io::Write::write_all(&mut writer, &manifest).unwrap();
+                } else {
+                    writer.raw_copy_file(raw).unwrap();
+                }
+            }
+            let buffer = writer.finish().unwrap();
+            fs::write(&self.path, buffer.into_inner()).unwrap();
+        }
+
         fn read_note_payload(&self, note: &str) -> Value {
             let limits = self.limits();
             let mut container = UmContainer::open(&self.path, &limits).unwrap();
@@ -1938,7 +2078,63 @@ mod tests {
         let _ = lock.release();
         let err = outcome.expect_err("zero retries must conflict");
         assert_eq!(err.code, ErrorCode::WriteConflict, "code: {err:?}");
+        // zero retries means zero re-applications were performed — the
+        // report must not count the observed-but-never-re-applied change
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|details| details.get("attempts"))
+                .and_then(Value::as_u64),
+            Some(0),
+            "details: {err:?}"
+        );
+        assert!(
+            err.message.contains("0 re-applications"),
+            "message: {}",
+            err.message
+        );
         assert_eq!(fs::read(&h.path).unwrap(), mutated, "no silent overwrite");
+    }
+
+    /// The target note vanished from the fresh generation (a competitor
+    /// deleted it): the recheck refuses with NOTE_REVISION_MISMATCH (exit 7,
+    /// re-read-and-rebuild advice), not a lookup/internal error.
+    #[test]
+    fn target_note_removed_under_the_lock_is_revision_mismatch() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let (package, plan, file_rev_plan) = h.plan_append(&limits);
+        let descriptor = {
+            let container = UmContainer::open(&h.path, &limits).unwrap();
+            container.find_note(&h.note1).unwrap().clone()
+        };
+        h.remove_note(&h.note1);
+
+        let lock =
+            crate::lock::acquire_write_lock(&h.path, "apply", &LockConfig::defaults()).unwrap();
+        let outcome = commit_um_locked(
+            &h.path,
+            &descriptor,
+            &package,
+            &plan,
+            file_rev_plan,
+            &h.rules,
+            &h.generator,
+            &h.addressable,
+            &h.pm,
+            &limits,
+        );
+        let _ = lock.release();
+        let err = outcome.expect_err("the removed target refuses");
+        assert_eq!(err.code, ErrorCode::NoteRevisionMismatch, "code: {err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|details| details.get("actual"))
+                .and_then(Value::as_str),
+            Some("<absent>"),
+            "details: {err:?}"
+        );
     }
 
     /// Engine-level: two insert_after groups on one anchor keep the
@@ -2047,5 +2243,219 @@ mod tests {
             )
             .expect_err("a foreign root id refuses");
         assert_eq!(err.code, ErrorCode::BlockIdImmutable, "code: {err:?}");
+    }
+
+    /// A failed operation names its position in the package (message and
+    /// `operation_index` detail) — here op 1 targets an ID op 0 deleted.
+    #[test]
+    fn engine_failure_names_the_operation_index() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let mut container = UmContainer::open(&h.path, &limits).unwrap();
+        let descriptor = container.find_note(&h.note1).unwrap().clone();
+        let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+        let mut doc = parsed.note.doc.clone();
+        let mut engine = Engine::new(h.rules.attrs_key(), &h.addressable);
+        let err = engine
+            .apply(
+                &mut doc,
+                &[
+                    Operation::Delete {
+                        id: "para1a2b3c".to_owned(),
+                    },
+                    Operation::Delete {
+                        id: "para1a2b3c".to_owned(),
+                    },
+                ],
+            )
+            .expect_err("the second op hits a deleted ID");
+        assert_eq!(err.code, ErrorCode::BlockNotFound, "code: {err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|details| details.get("operation_index"))
+                .and_then(Value::as_u64),
+            Some(1),
+            "details: {err:?}"
+        );
+        assert!(
+            err.message.contains("operation 1"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// A minimal title-family document over the test artifact's vocabulary
+    /// (leading noteTitle with an ID, then one addressable block).
+    fn titled_doc() -> Value {
+        serde_json::json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "attrs": {"id": "t1tl2e3h4e"},
+                 "content": [{"type": "text", "text": "Alpha"}]},
+                {"type": "paragraph", "attrs": {"id": "para1a2b3c"},
+                 "content": [{"type": "text", "text": "one"}]}
+            ]
+        })
+    }
+
+    /// Run `operations` against [`titled_doc`] through the plan pipeline.
+    fn build_titled(
+        h: &Harness,
+        limits: &Limits,
+        operations: Vec<Operation>,
+    ) -> Result<Generation, UmError> {
+        let package = Package {
+            note_id: Some(h.note1.clone()),
+            base_note_rev: format!("sha256:{}", "0".repeat(64)),
+            if_match: None,
+            operations,
+        };
+        build_generation(
+            &titled_doc(),
+            &package,
+            &h.rules,
+            &h.generator,
+            &h.addressable,
+            &h.pm,
+            limits,
+        )
+    }
+
+    /// A title-family source must not lose its leading noteTitle: a delete
+    /// of the title (the artifact root rule `noteTitle block*` would reject
+    /// the result) refuses as CONTENT_NOT_ALLOWED.
+    #[test]
+    fn deleting_the_title_refuses_as_content_not_allowed() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let err = build_titled(
+            &h,
+            &limits,
+            vec![Operation::Delete {
+                id: "t1tl2e3h4e".to_owned(),
+            }],
+        )
+        .expect_err("removing the leading noteTitle refuses");
+        assert_eq!(err.code, ErrorCode::ContentNotAllowed, "code: {err:?}");
+    }
+
+    /// insert_before ahead of the title displaces it from the root head —
+    /// the same title-family loss, the same refusal.
+    #[test]
+    fn inserting_before_the_title_refuses_as_content_not_allowed() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let err = build_titled(
+            &h,
+            &limits,
+            vec![Operation::InsertBefore {
+                id: "t1tl2e3h4e".to_owned(),
+                nodes: vec![serde_json::json!({
+                    "type": "paragraph",
+                    "attrs": {},
+                    "content": [{"type": "text", "text": "ahead of the title"}]
+                })],
+            }],
+        )
+        .expect_err("displacing the leading noteTitle refuses");
+        assert_eq!(err.code, ErrorCode::ContentNotAllowed, "code: {err:?}");
+    }
+
+    /// Appending AFTER the title keeps the family: the gate is not a blanket
+    /// content veto on title-family documents.
+    #[test]
+    fn appending_after_the_title_stays_allowed() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let generation = build_titled(
+            &h,
+            &limits,
+            vec![Operation::AppendChild {
+                parent_id: None,
+                nodes: vec![serde_json::json!({
+                    "type": "paragraph",
+                    "attrs": {},
+                    "content": [{"type": "text", "text": "appended"}]
+                })],
+            }],
+        )
+        .expect("the title stays first");
+        let content = generation.doc["content"].as_array().unwrap();
+        assert_eq!(content.first().unwrap()["type"], "noteTitle");
+        assert_eq!(content.last().unwrap()["content"][0]["text"], "appended");
+    }
+
+    /// A package nested deeper than UM_MAX_DEPTH keeps the container-level
+    /// LIMIT_EXCEEDED verdict (exit 5) — not a package-envelope USAGE.
+    #[test]
+    fn package_over_depth_limit_is_limit_exceeded() {
+        let limits = Limits::defaults();
+        let depth = limits.max_depth + 10;
+        let bytes = format!("{}1{}", "[".repeat(depth), "]".repeat(depth)).into_bytes();
+        let err = parse_package(&bytes, &limits, true, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::LimitExceeded, "code: {err:?}");
+    }
+
+    /// Non-UTF-8 package bytes are an envelope violation: USAGE (exit 2),
+    /// not INVALID_OPERATION.
+    #[test]
+    fn non_utf8_package_is_usage() {
+        let limits = Limits::defaults();
+        let bytes = vec![0x7B, 0xFF, 0x7D];
+        let err = parse_package(&bytes, &limits, true, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage, "code: {err:?}");
+    }
+
+    /// plan == commit for an already-envelope .note whose `schema` key is
+    /// missing: the dry-run refuses with the same code the commit produces
+    /// (NOTE_DOC_INVALID) and the file is left untouched.
+    #[test]
+    fn envelope_without_schema_key_refuses_on_plan_like_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let artifact = dir.path().join("artifact.json");
+        std::fs::write(&artifact, serde_json::to_vec(&*TEST_ARTIFACT).unwrap()).unwrap();
+        let path = dir.path().join("doc.note");
+        let envelope = serde_json::json!({
+            "format": "inscriptum-note",
+            "version": 1,
+            "features": {"block_ids": 1},
+            "document": {
+                "type": "noteDoc",
+                "content": [
+                    {"type": "noteTitle", "attrs": {"id": "t1tl2e3h4e"},
+                     "content": [{"type": "text", "text": "Alpha"}]},
+                    {"type": "paragraph", "attrs": {"id": "para1a2b3c"},
+                     "content": [{"type": "text", "text": "one"}]}
+                ]
+            }
+        });
+        std::fs::write(&path, envelope.to_string()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let package = serde_json::json!({
+            "api_version": 1,
+            "note_id": Value::Null,
+            "base_note_rev": note_rev_for_file_bytes(&before),
+            "operations": [{
+                "op": "append_child",
+                "parent_id": null,
+                "nodes": [{"type": "paragraph", "attrs": {},
+                           "content": [{"type": "text", "text": "appended"}]}]
+            }],
+        });
+        let bytes = serde_json::to_vec(&package).unwrap();
+        let limits = Limits::defaults();
+
+        let dry = apply_note_file(&path, &bytes, None, Some(&artifact), true, &limits)
+            .expect_err("the plan refuses the schema-less envelope");
+        assert_eq!(dry.code, ErrorCode::NoteDocInvalid, "code: {dry:?}");
+        let commit = apply_note_file(&path, &bytes, None, Some(&artifact), false, &limits)
+            .expect_err("the commit refuses with the same code");
+        assert_eq!(commit.code, ErrorCode::NoteDocInvalid, "code: {commit:?}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the refusal touched nothing"
+        );
     }
 }
