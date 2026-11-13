@@ -800,6 +800,10 @@ impl StagedFile {
     /// the staged file over the target, then fsync the parent directory
     /// (best-effort, where the OS supports it — §9.3).
     fn commit_to(mut self, target: &Path, mode: u32) -> Result<(), UmError> {
+        // Permissions are a unix concept (§9.3); on other platforms the mode
+        // argument is intentionally not applied.
+        #[cfg(not(unix))]
+        let _ = mode;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
