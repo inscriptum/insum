@@ -21,6 +21,7 @@ pub enum ErrorCode {
     PointerNotFound,
     // file level
     NotAZip,
+    ReadTorn,
     ManifestMissing,
     ManifestInvalid,
     UnsupportedVersion,
@@ -71,6 +72,7 @@ impl ErrorCode {
             ErrorCode::BlockNotFound => "BLOCK_NOT_FOUND",
             ErrorCode::PointerNotFound => "POINTER_NOT_FOUND",
             ErrorCode::NotAZip => "NOT_A_ZIP",
+            ErrorCode::ReadTorn => "READ_TORN",
             ErrorCode::ManifestMissing => "MANIFEST_MISSING",
             ErrorCode::ManifestInvalid => "MANIFEST_INVALID",
             ErrorCode::UnsupportedVersion => "UNSUPPORTED_VERSION",
@@ -117,6 +119,7 @@ impl ErrorCode {
             | ErrorCode::PointerNotFound => 3,
             // 4 — invalid or unreadable data
             ErrorCode::NotAZip
+            | ErrorCode::ReadTorn
             | ErrorCode::ManifestMissing
             | ErrorCode::ManifestInvalid
             | ErrorCode::UnsupportedVersion
@@ -243,6 +246,7 @@ mod tests {
             (ErrorCode::BlockNotFound, 3),
             (ErrorCode::PointerNotFound, 3),
             (ErrorCode::NotAZip, 4),
+            (ErrorCode::ReadTorn, 4),
             (ErrorCode::ManifestMissing, 4),
             (ErrorCode::ManifestInvalid, 4),
             (ErrorCode::UnsupportedVersion, 4),

@@ -1,7 +1,10 @@
 //! `insum block get` — full subtree of one block.
 //!
-//! Stage A addresses blocks by `--pointer`; `--id` arrives with the migration
-//! stage and is rejected here.
+//! Stage A addresses blocks by `--pointer`; `--id` works whenever the ID is
+//! present in the note (§4.6 п.4, owner decision 2026-10-30: reading by ID
+//! works on presence). Without the `features.block_ids` marker the IDs are
+//! not guaranteed, so the answer carries an explicit warning; the marker
+//! stays mandatory for the write API (stage D).
 
 use std::path::Path;
 
@@ -20,17 +23,16 @@ pub fn run(
     raw: bool,
     limits: &Limits,
 ) -> Result<Value, UmError> {
-    if id.is_some() {
+    if pointer.is_some() && id.is_some() {
         return Err(UmError::usage(
-            "--id is not available on stage A: block IDs are not guaranteed until migration",
-        )
-        .with_hint("Address the block with --pointer for now."));
-    }
-    let Some(pointer) = pointer else {
-        return Err(UmError::usage(
-            "block get requires --pointer <pointer> (stage A)",
+            "--pointer and --id are mutually exclusive ways to address the block",
         ));
-    };
+    }
+    if pointer.is_none() && id.is_none() {
+        return Err(UmError::usage(
+            "block get requires --pointer <pointer> or --id <block-id>",
+        ));
+    }
     let rendered = render_path(path);
     let extension = path
         .extension()
@@ -56,16 +58,40 @@ pub fn run(
 
     // The block must exist as a traversable structural node.
     let all_blocks = insum_core::traverse(&view.doc, None, limits.max_depth).blocks;
-    let entry: &BlockEntry = all_blocks
-        .iter()
-        .find(|block| block.pointer == pointer)
-        .ok_or_else(|| {
-            UmError::new(
-                ErrorCode::PointerNotFound,
-                format!("JSON Pointer {pointer:?} does not address a block of this note"),
-            )
-            .with_hint("Run `insum tree` to get valid pointers for this note revision.")
-        })?;
+    let entry: &BlockEntry = if let Some(id) = id {
+        // --id addresses by presence (§4.6 п.4): a physically present ID
+        // resolves even without the marker, but the answer says the IDs are
+        // not guaranteed (§6.5 warning convention — never a silent answer);
+        // an absent ID is BLOCK_NOT_FOUND either way. The marker gate stays
+        // for the write API (stage D).
+        all_blocks
+            .iter()
+            .find(|block| block.id.as_deref() == Some(id))
+            .ok_or_else(|| {
+                UmError::new(
+                    ErrorCode::BlockNotFound,
+                    format!("block id {id:?} does not address a block of this note"),
+                )
+                .with_hint(
+                    "Run `insum tree` to see the blocks and their ids for this note revision.",
+                )
+            })?
+    } else {
+        all_blocks
+            .iter()
+            .find(|block| block.pointer == pointer.unwrap())
+            .ok_or_else(|| {
+                UmError::new(
+                    ErrorCode::PointerNotFound,
+                    format!(
+                        "JSON Pointer {:?} does not address a block of this note",
+                        pointer.unwrap()
+                    ),
+                )
+                .with_hint("Run `insum tree` to get valid pointers for this note revision.")
+            })?
+    };
+    let pointer = entry.pointer.as_str();
 
     // Full node JSON at the pointer, with `attrs.id` lifted out;
     // `--raw` keeps the original document form.
@@ -92,7 +118,18 @@ pub fn run(
                 .map(str::to_owned)
         });
 
-    let warnings = collect_unknown_types(&node, limits);
+    let mut warnings = collect_unknown_types(&node, limits);
+    // §4.6 п.4: before the marker the note's IDs are not guaranteed — the
+    // successful read says so instead of implying a vouched-for address
+    if id.is_some() && !view.block_ids_enabled {
+        warnings.insert(
+            0,
+            json!({
+                "code": "BLOCK_IDS_NOT_GUARANTEED",
+                "message": "IDs not guaranteed: the note carries no features.block_ids marker (run `insum migrate-ids` to verify the IDs and stamp the marker)",
+            }),
+        );
+    }
     Ok(json!({
         "api_version": 1,
         "path": rendered,

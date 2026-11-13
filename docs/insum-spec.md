@@ -17,18 +17,19 @@ until then this document is the reference for consumers (agents and scripts).
 - Untrusted input: ZIP entry names are validated (no absolute paths, `..`,
   backslashes, duplicates), sizes and totals are enforced on actual data.
 
-## Commands (read-only today)
+## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `insum ls [--hidden] [<path>]` | Classify files and count notes; a directory listing never hashes files or opens payloads |
 | `insum tree <file> [--note <id>]... [--depth n] [--text-limit n] [--max-bytes n] [--cursor t]` | Flat preorder block listing with JSON Pointers |
-| `insum block get <file> [--note <id>] --pointer <p>` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it) |
+| `insum block get <file> [--note <id>] (--pointer <p>\|--id <id>)` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it). `--id` resolves whenever the ID is present in the note; without the `features.block_ids` marker the response carries a `BLOCK_IDS_NOT_GUARANTEED` warning, an absent ID is `BLOCK_NOT_FOUND` |
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |
 | `insum read <file> [--note <id>] [--format json\|annotated]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors |
 | `insum schema [--type <node>] [--schema <file>]` | Show the applicable schema artifact (source, path, hash, validation capability); `--type` shows one node descriptor with its example |
 | `insum validate [--strict] [--hidden] [--schema <file>] <paths>...` | Validation with an explicit level: `structural` or `schema` |
 | `insum history <file> [--note <id\|title>] [--limit n] [--format json\|annotated] [--max-bytes n]` | Change history of the file from git: revisions newest-first, each with a per-note structural diff against its parent |
+| `insum migrate-ids <file> [--note <id>]... [--dry-run] [--schema <file>]` | Assign guaranteed block IDs and stamp the `features.block_ids` marker (the only writer of the marker) — see the stage-C section below |
 
 `--note <value>` resolves the value as the note id (ULID) first, then as an
 exact note title; a title matching several notes fails with their ids listed
@@ -175,6 +176,88 @@ warning, and a single revision that cannot fit is a `LIMIT_EXCEEDED`
 error. The budget applies to the compact JSON document; `--pretty` renders
 larger (a documented systemic property shared by every command).
 
+## Stage C — `migrate-ids` (the one write command today)
+
+`insum migrate-ids <file> [--note <id>]... [--dry-run] [--schema <file>]`
+assigns guaranteed block IDs to a note's addressable blocks (per the schema
+artifact's `id_rules` grammar — generated IDs are cryptographically random
+and grammar-checked) and stamps `features.block_ids: 1` plus the schema
+fingerprint into the note's metadata: the descriptor's `features` object in
+the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
+`.note` is converted to the envelope shape). `--note` takes note ids
+(repeatable; a repeated filter selects the note once).
+
+- **Single writer of the marker.** No other command (and no other tool in
+  this repo) writes `features.block_ids`: the marker is stamped only after
+  the IDs of that exact note have been verified and fixed, together with
+  the schema fingerprint they were verified under. A note whose IDs are
+  already complete still gets the marker — the marker records the
+  verification.
+- **Schema artifact requirement.** Migration writes only under a verified
+  runtime or explicit artifact: the artifact is resolved from the vault
+  containing the target file (walk up from the file's directory; stop at a
+  repository boundary) or from `--schema`. The bundled fallback refuses to
+  write (`SCHEMA_UNAVAILABLE`), an artifact that fails the hash check
+  refuses too (`SCHEMA_MISMATCH`).
+- **`--dry-run`** plans and validates the would-be result but never touches
+  the file bytes or mtime; preview IDs may differ from the commit's (the
+  commit generates its own). A dry-run refuses exactly where the commit
+  would (plan == commit).
+- **Transaction.** The commit takes a sidecar lock (a live editor lease
+  refuses with `WRITE_LOCKED`), rechecks the file and per-note revisions
+  inside the lock (`NOTE_REVISION_MISMATCH` on a change), rewrites the
+  container (untouched ZIP entries are copied byte-identical, unknown
+  manifest fields survive), validates the result over the staged bytes and
+  replaces the file atomically (permissions preserved, symlink sources
+  refused). A source symlink or non-regular file is refused before any
+  work, in dry-run and commit alike. The lock and lease sidecars are named
+  after the target (§9.2 — the plugin counts on the same names, so there
+  is no fallback name): a target whose name leaves no room for the sidecar
+  component (the target name plus the dot and the suffix would exceed the
+  file-name cap) can never take the lock and is refused before any work
+  with `IO_ERROR` and a rename hint, in dry-run and commit alike. The
+  result is staged in a hidden,
+  exclusively created temp file next to the target (`.name.migrate-tmp-<16
+  hex>`, or `.insum-migrate-tmp-<16 hex>` when the target's name is too
+  long to carry the suffix; 0600 on unix, never reused or followed) and
+  unlinked on every error path — after a killed process such orphans may
+  remain next to the target, and deleting them by hand is safe: a later
+  migration always creates a fresh temp file and never reuses an existing
+  one.
+- **Response shape.** `notes[]` per selected note with the
+  `{pointer, old_id, new_id, type}` change mapping; `note_rev` is the
+  PRE-write revision (the CAS base for the stage-D write API) while the
+  additive `new_note_rev` and the top-level `file_rev` are post-write;
+  non-dry-run responses carry `written: true|false`; every response
+  carries `complete`. A rerun on a migrated note is a no-op
+  (`written: false`).
+- **Response budget.** The report respects `UM_MAX_OUTPUT_BYTES`,
+  budgeted over its final shape: a committed report reserves the
+  post-write `new_note_rev` of every note, so the emitted bytes never
+  exceed the budget. Note plans are appended whole while they fit; an
+  oversized report is explicitly incomplete (`complete: false`,
+  `truncated: true`, `notes_total`/`notes_returned`, an `OUTPUT_BUDGET`
+  warning). The write itself always covers every selected note — only
+  the report can be partial. The first note plan above the whole budget
+  is emitted whole (the same documented exception `tree` applies to a
+  single oversized block). There is no cursor pagination: the commit is
+  one transaction. The way to the remainder depends on the mode: in a
+  dry-run (and on a no-op rerun, `written: false`) the file is untouched,
+  so `--note <id>` filters re-derive the missing plans from it; after a
+  commit the file is migrated — a repeated `--note` rerun answers an
+  empty no-op — so the warning points to the stamped ids, readable with
+  `insum tree <file> --note <id>` (or `insum read`), and to the
+  pre-commit copy (git) that still holds the old ids at the same
+  pointers.
+- **Rollback and one-shot semantics.** The migration is one-shot; there is
+  no `--unmark` flag and no built-in undo. Rollback is the user's git
+  (restore the file from history). Removing the marker afterwards means
+  hand-editing the manifest descriptor or the envelope — possible but not
+  recommended: the marker records a verification. An old plugin version
+  resaving the note can drop IDs while the marker remains (known editor
+  limitation, §4.6 п.2 of the spec) — re-run `migrate-ids` to re-verify
+  and re-stamp.
+
 ## Notes on data fidelity
 
 - Unknown node or mark types are preserved verbatim in outputs derived from
@@ -186,5 +269,7 @@ larger (a documented systemic property shared by every command).
   `<!--` is neutralized to `<! --` so it cannot forge CLI anchors or markers;
   inside tables, row/cell/paragraph anchors are emitted inline within the
   cells, and anything unrenderable in a cell is marked explicitly.
-- No stage-A command modifies input files, creates temp files, executes
-  document content, or performs network access.
+- No read command (`ls`, `search`, `tree`, `block get`, `read`, `validate`,
+  `schema`, `history`) modifies input files, creates temp files, executes
+  document content, or performs network access. `migrate-ids` is the one
+  write command and is covered by the stage-C section above.

@@ -160,6 +160,18 @@ impl SchemaArtifact {
     }
 }
 
+/// The artifact's addressable node types (§4.7): the one source of the
+/// id-required universe for the validator and the migration planner. Never
+/// derived from a hardcoded Rust list.
+pub fn addressable_types(artifact: &SchemaArtifact) -> std::collections::BTreeSet<String> {
+    artifact
+        .nodes
+        .iter()
+        .filter(|(_, spec)| spec.addressable)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// SHA-256 of the RFC 8785 canonical JSON of the artifact without the
 /// `schema_hash` and `plugin_version` fields.
 pub fn compute_hash(raw: &Value) -> String {

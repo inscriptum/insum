@@ -7,6 +7,75 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum migrate-ids <file> [--note <id>]... [--dry-run]` (stage C, §7.2):
+  the one command allowed to stamp the `features.block_ids` marker (§4.6).
+  Plans ID fixes per note (missing/duplicate/invalid per document order —
+  the first valid ID is kept), returns the
+  `{pointer, old_id, new_id, type}` mapping; dry-run never touches bytes
+  or mtime and its preview IDs may differ from the commit. Real commit:
+  sidecar lock + dirty-lease refusal (§9), file and per-note revision
+  recheck inside the lock, atomic replace; untouched ZIP entries are
+  copied raw (byte-identical), unknown manifest fields survive. The
+  marker rides in the note descriptor's `features` object
+  (`block_ids: 1` + the schema fingerprint it was stamped under); the
+  descriptor's `schema` field (the editor profile) is untouched. Legacy
+  `.note` converts to the envelope shape of §4.6. A note whose IDs are
+  already complete still gets the marker — the marker records the
+  verification. `block get --id` works whenever the ID is present in the
+  note (§4.6 п.4, owner decision 2026-10-30 — read-by-ID on presence):
+  without the `features.block_ids` marker the response carries a
+  `BLOCK_IDS_NOT_GUARANTEED` warning (§6.5 — no silent answers), an
+  absent ID stays `BLOCK_NOT_FOUND`, and the marker gate remains
+  mandatory for the write API (stage D).
+- `migrate-ids` responses respect `UM_MAX_OUTPUT_BYTES` (§5.5), budgeted
+  over the final response shape — a committed report reserves the
+  post-write `new_note_rev` of every note, so the emitted bytes never
+  exceed the budget (§6.5 — silent truncation is forbidden). Note plans
+  are appended whole while they fit the budget; an oversized report is
+  explicitly incomplete — `complete: false`, `truncated: true`,
+  `notes_total`/`notes_returned` and an `OUTPUT_BUDGET` warning whose
+  way to the remainder is mode-aware: a dry-run (and a no-op rerun,
+  `written: false`) names `--note <id>` filters — the file is untouched
+  and re-derivable; a committed report points to the stamped ids
+  (`insum tree <file> --note <id>`, `insum read`) and to the pre-commit
+  copy (git) that holds the old ids at the same pointers — a repeated
+  `--note` rerun after a commit answers an empty no-op. Every response
+  carries `complete`. A cursor pagination would not fit this command:
+  the commit is one transaction, so a second page could not reproduce
+  mappings from an already-migrated file. The operation itself always
+  covers every selected note — only the report can be partial; the
+  first note plan above the whole budget is emitted whole (the same
+  documented exception `tree` applies to a single oversized block).
+- Non-dry-run `migrate-ids` responses distinguish wrote from no-op with
+  the top-level `written: true|false` flag.
+- `migrate-ids` response revisions are unambiguous: `notes[].note_rev`
+  is the PRE-write revision — the base a stage-D write must build its
+  CAS on (§5.4); the additive `notes[].new_note_rev` (computed from the
+  final bytes, staged descriptor included) and the top-level `file_rev`
+  are post-write. The no-op rerun of a commit reports the committed
+  `new_note_rev` values as its pre-write `note_rev`s.
+- Search attribution invariant pinned: repeated stress runs over a
+  multi-note corpus (heavy text sharing, `--note` filter, `.um`+`.note`
+  mix) verify every match resolves `block get` by its own `note_id` and
+  `pointer`; manifest-faithful attribution (including the foreign
+  descriptor-path data class) is pinned by test — audit outcome for the
+  cli-feedback `search-note-attribution-flake` report.
+- `READ_TORN` error code (exit 4): an absent, empty, or cut-off `.um`
+  container (and an absent or empty `.note`) answers a single speaking
+  diagnosis from every reading command (`ls`, `tree`, `block get`, `read`,
+  `search`, `validate`) with a machine-readable `cause`
+  (`absent`/`empty`/`truncated`) and a retry hint, instead of the
+  misleading `NOTE_NOT_FOUND` (or a bare `NOT_A_ZIP`) the non-atomic
+  rewrites of um-build produced. A `.note` with torn JSON content still
+  answers `NOTE_JSON_INVALID` — a JSON document has no signature to detect
+  truncation. `history` is intentionally exempt: it reads git, not the
+  live container bytes, and keeps its reviewed absent-path contract.
+  `search`/`validate` split the new code by how the file was reached: a
+  container named explicitly on the command line and found absent fails
+  the whole command with `READ_TORN` (exit 4 — a named input is never
+  silently dropped), while torn files discovered by walking a directory
+  fold into the existing per-file `skipped`/`files[]` entries and lower
+  `complete`; error entries in those reports now carry `details` too.
 - Differential TS×Rust corpus (§4.8): a TypeScript harness builds a real
   prosemirror-model Schema from the artifact and records its verdicts for
   122 documents (valid compositions, targeted mutations, unknown types,
@@ -46,6 +115,20 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Fixed
 
+- `migrate-ids` refuses a target whose file name leaves no room for the
+  lock/lease sidecar component (the sidecars are named after the target,
+  §9.2 — a fallback name would break the lock protocol the plugin follows):
+  a 243–255-byte target name used to leave the dry-run green while the
+  commit failed `IO_ERROR` (`ENAMETOOLONG`). Both refuse alike before any
+  work now, with a rename-the-file hint; the bytes are never touched. A
+  242-byte or shorter name keeps the D-6 staging behavior green.
+- `migrate-ids` no longer fails with `INTERNAL` on a repeated `--note <id>`
+  filter: a note named several times is selected and planned once, so the
+  independently generated preview ids can no longer collide in the rewrite.
+- Every note entry of a `migrate-ids` response carries `note_title`
+  (from the manifest descriptor, falling back to the document title) —
+  matching the other per-note responses; consumers match hits to notes
+  without a second `ls`.
 - Annotated reading neutralizes the `<!--` sequence coming from document
   text — document content can no longer forge CLI anchors or markers.
 - The oversized-block marker is no longer lost when content follows the

@@ -241,12 +241,68 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     })
 }
 
-fn sidecar_path(target: &Path, suffix: &str) -> PathBuf {
+/// The file-name component `sidecar_path` builds for `target`: a leading
+/// dot, the target's own name and the sidecar suffix.
+fn sidecar_name(target: &Path, suffix: &str) -> String {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_owned());
-    target.with_file_name(format!(".{name}{suffix}"))
+    format!(".{name}{suffix}")
+}
+
+fn sidecar_path(target: &Path, suffix: &str) -> PathBuf {
+    target.with_file_name(sidecar_name(target, suffix))
+}
+
+/// The file-name component cap of mainstream local filesystems (ext4 and
+/// APFS count bytes, NTFS counts UTF-16 units — all cap at 255).
+const COMPONENT_CAP: usize = 255;
+
+/// The length of a file-name component in the units the platform caps:
+/// bytes on unix, UTF-16 code units on Windows.
+#[cfg(unix)]
+fn component_units(component: &str) -> usize {
+    component.len()
+}
+
+#[cfg(windows)]
+fn component_units(component: &str) -> usize {
+    component.encode_utf16().count()
+}
+
+/// plan == commit (R3COR-1): both sidecars are named after the target
+/// (§9.2) — a cross-tool contract with the plugin (lock-protocol), so a
+/// name that does not fit cannot fall back to another name without
+/// breaking mutual exclusion between the CLI and the plugin. A target
+/// whose name leaves no room for the sidecar component (the target name
+/// plus the dot and the longest of the lock/lease suffixes) can never
+/// take the write lock: the sidecar create fails ENAMETOOLONG, which used
+/// to fail the commit with IO_ERROR while the dry-run stayed green — the
+/// very plan != commit symptom D-6 removed for the staged temp file. The
+/// plan phase calls this before any work so dry-run and commit refuse
+/// alike with the same code and hint; `acquire_write_lock` calls it as
+/// well, so every write path keeps the refusal even without the plan
+/// call. Pure computation: no syscalls on the fast path.
+pub fn check_sidecar_name_fits(target: &Path) -> Result<(), UmError> {
+    let worst = [LOCK_SUFFIX, LEASE_SUFFIX]
+        .into_iter()
+        .map(|suffix| component_units(&sidecar_name(target, suffix)))
+        .max()
+        .unwrap_or(0);
+    if worst <= COMPONENT_CAP {
+        return Ok(());
+    }
+    Err(UmError::new(
+        ErrorCode::IoError,
+        format!(
+            "the name of {} is too long for the lock sidecar: the sidecar component (the target name plus the dot and the lock/lease suffix) would exceed the {COMPONENT_CAP}-unit file-name cap, so the write lock cannot be created",
+            target.display()
+        ),
+    )
+    .with_hint(
+        "filename too long for the lock sidecar; rename the file to a shorter name and re-run",
+    ))
 }
 
 /// A sidecar larger than this is not a legitimate lock/lease — treat it as
@@ -555,6 +611,10 @@ pub fn acquire_write_lock(
     purpose: &str,
     config: &LockConfig,
 ) -> Result<FileLock, UmError> {
+    // R3COR-1: a target without sidecar-name room can never take the lock
+    // — refuse deterministically here (the same error the plan phase
+    // produces) instead of failing the sidecar create with ENAMETOOLONG
+    check_sidecar_name_fits(target)?;
     loop {
         match check_dirty_lease(target, config.stale_after)? {
             LeaseState::Free => break,
@@ -1010,6 +1070,53 @@ mod tests {
         let target = dir.path().join("missing-dir").join("page.um");
         let err = FileLock::acquire(&target, "apply", &fast_config()).unwrap_err();
         assert_eq!(err.code, ErrorCode::IoError);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_name_fit_boundary_tracks_the_longest_suffix() {
+        // R3COR-1: the LEASE component is the longer one (name + 13) — a
+        // 242-byte name fits exactly (1 + 242 + 12 = 255), 243 overflows
+        let dir = tempfile::tempdir().unwrap();
+        let fits = dir.path().join(format!("{}.um", "n".repeat(239)));
+        assert_eq!(fits.file_name().unwrap().len(), 242);
+        std::fs::write(&fits, b"placeholder").unwrap();
+        check_sidecar_name_fits(&fits).unwrap();
+
+        let over = dir.path().join(format!("{}.um", "n".repeat(240)));
+        assert_eq!(over.file_name().unwrap().len(), 243);
+        std::fs::write(&over, b"placeholder").unwrap();
+        let err = check_sidecar_name_fits(&over).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IoError);
+        assert_eq!(err.code.exit_code(), 1);
+        assert!(
+            err.message.contains("too long for the lock sidecar"),
+            "{}",
+            err.message
+        );
+        let hint = err.hint.as_deref().unwrap();
+        assert!(hint.contains("rename the file"), "{hint}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_write_lock_refuses_a_target_without_sidecar_room() {
+        // the write path itself never attempts the doomed create: the
+        // refusal is the plan-phase error, not an ENAMETOOLONG leak
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(format!("{}.um", "n".repeat(247)));
+        assert_eq!(target.file_name().unwrap().len(), 250);
+        std::fs::write(&target, b"placeholder").unwrap();
+        let err = acquire_write_lock(&target, "apply", &fast_config()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IoError);
+        assert!(
+            err.message.contains("too long for the lock sidecar"),
+            "{}",
+            err.message
+        );
+        // neither sidecar was created
+        assert!(!sidecar_path(&target, LOCK_SUFFIX).exists());
+        assert!(!sidecar_path(&target, LEASE_SUFFIX).exists());
     }
 
     #[test]

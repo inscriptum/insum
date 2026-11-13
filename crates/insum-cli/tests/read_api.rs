@@ -511,13 +511,15 @@ fn limits_and_error_codes_are_enforced() {
     let error = stderr_json(&output);
     assert_eq!(error["error"]["code"], "LIMIT_EXCEEDED");
 
-    // PATH_NOT_FOUND exits 3
+    // an absent .um answers READ_TORN (exit 4) — the transient writer
+    // window must not masquerade as a path diagnosis; PATH_NOT_FOUND stays
+    // for absent non-container paths (see read_resilience.rs)
     let output = insum()
         .args(["tree", &corpus.path("missing.um")])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(3));
-    assert_eq!(stderr_json(&output)["error"]["code"], "PATH_NOT_FOUND");
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(stderr_json(&output)["error"]["code"], "READ_TORN");
 
     // NOT_A_ZIP exits 4
     let output = insum()
@@ -541,20 +543,22 @@ fn limits_and_error_codes_are_enforced() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stderr_json(&output)["error"]["code"], "USAGE");
 
-    // --id on stage A → USAGE exit 2
+    // --id on an unmarked note addresses by presence (§4.6 п.4): the
+    // fixture carries no such id, so the miss is BLOCK_NOT_FOUND (exit 3)
     let output = insum()
         .args([
             "block",
             "get",
             &corpus.path("regular.um"),
             "--note",
-            "x",
+            &fixtures::ulid_seq(1),
             "--id",
             "a1b2c3d4e5",
         ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(stderr_json(&output)["error"]["code"], "BLOCK_NOT_FOUND");
 
     // validate --schema with a missing artifact → SCHEMA_UNAVAILABLE exit 6
     let output = insum()

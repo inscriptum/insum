@@ -19,7 +19,7 @@ use insum_core::pmschema::PmSchema;
 use insum_core::schema::{ResolvedSchema, SchemaSource, resolve};
 use insum_core::{Limits, UmError};
 
-use crate::support::{Revs, collect_files, read_notes, render_path};
+use crate::support::{Revs, collect_files, error_value, read_notes, render_path};
 
 pub fn run(
     paths: &[PathBuf],
@@ -81,7 +81,13 @@ pub fn run(
         if file_schema.level != "schema" {
             all_schema = false;
         }
-        let result = validate_file(file, strict, file_schema.pm.as_deref(), limits);
+        let result = validate_file(
+            file,
+            strict,
+            file_schema.pm.as_deref(),
+            file_schema.addressable.as_ref(),
+            limits,
+        );
         match result {
             Ok(mut file_json) => {
                 file_json["path"] = json!(rendered);
@@ -120,10 +126,7 @@ pub fn run(
                     "valid": false,
                     "validation_level": "structural",
                     "notes": [],
-                    "errors": [{
-                        "code": err.code.as_str(),
-                        "message": err.message,
-                    }],
+                    "errors": [error_value(&err)],
                     "warnings": [],
                 }));
             }
@@ -153,9 +156,13 @@ pub fn run(
 /// The per-file artifact decision: which level applies, whether the
 /// ProseMirror-parity check runs, what the report shows and which
 /// configuration diagnostics (stale or unusable artifact) surface.
+/// `addressable` carries the artifact's addressable types (§4.7) for the
+/// id-required universe of marked documents — `None` keeps the conservative
+/// structural universe when no real artifact applies.
 struct FileSchema {
     level: &'static str,
     pm: Option<Arc<PmSchema>>,
+    addressable: Option<std::collections::BTreeSet<String>>,
     info: Option<Value>,
     warnings: Vec<Value>,
 }
@@ -185,6 +192,10 @@ fn file_schema(
             "validation_capability": resolved.artifact.validation_capability,
         })
     };
+    // §4.7: the id-required universe of marked documents is the artifact's
+    // addressable set; only a hash-verified real artifact may define it
+    let addressable_of =
+        |resolved: &ResolvedSchema| insum_core::schema::addressable_types(&resolved.artifact);
 
     if let Some(resolved) = explicit {
         if resolved.hash_verified {
@@ -195,6 +206,7 @@ fn file_schema(
                 return FileSchema {
                     level: "structural",
                     pm: None,
+                    addressable: None,
                     info: Some(info_of(resolved)),
                     warnings: vec![json!({
                         "code": "SCHEMA_ARTIFACT_INVALID",
@@ -205,6 +217,7 @@ fn file_schema(
             return FileSchema {
                 level: "schema",
                 pm: Some(pm),
+                addressable: Some(addressable_of(resolved)),
                 info: Some(info_of(resolved)),
                 warnings: Vec::new(),
             };
@@ -212,6 +225,7 @@ fn file_schema(
         return FileSchema {
             level: "structural",
             pm: None,
+            addressable: None,
             info: Some(info_of(resolved)),
             warnings: vec![json!({
                 "code": "SCHEMA_MISMATCH",
@@ -238,12 +252,14 @@ fn file_schema(
         Ok(resolved) if resolved.source == SchemaSource::BundledFallback => FileSchema {
             level: "structural",
             pm: None,
+            addressable: None,
             info: Some(info_of(&resolved)),
             warnings: Vec::new(),
         },
         Ok(resolved) if !resolved.hash_verified => FileSchema {
             level: "structural",
             pm: None,
+            addressable: None,
             info: Some(info_of(&resolved)),
             warnings: vec![json!({
                 "code": "SCHEMA_MISMATCH",
@@ -274,12 +290,14 @@ fn file_schema(
                 Some(pm) => FileSchema {
                     level: "schema",
                     pm: Some(pm),
+                    addressable: Some(addressable_of(&resolved)),
                     info: Some(info_of(&resolved)),
                     warnings: Vec::new(),
                 },
                 None => FileSchema {
                     level: "structural",
                     pm: None,
+                    addressable: None,
                     info: Some(info_of(&resolved)),
                     warnings: vec![json!({
                         "code": "SCHEMA_ARTIFACT_INVALID",
@@ -293,6 +311,7 @@ fn file_schema(
         Err(err) => FileSchema {
             level: "structural",
             pm: None,
+            addressable: None,
             info: None,
             warnings: vec![json!({
                 "code": err.code.as_str(),
@@ -306,6 +325,7 @@ fn validate_file(
     path: &Path,
     strict: bool,
     pm: Option<&PmSchema>,
+    addressable: Option<&std::collections::BTreeSet<String>>,
     limits: &Limits,
 ) -> Result<Value, UmError> {
     let views = read_notes(path, None, limits, Revs::Skip)?.views;
@@ -320,6 +340,7 @@ fn validate_file(
             view.block_ids_enabled,
             limits,
             pm,
+            addressable,
         )?;
         if !validation.valid() {
             file_valid = false;

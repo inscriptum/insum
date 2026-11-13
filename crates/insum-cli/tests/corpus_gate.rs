@@ -99,7 +99,7 @@ fn rust_validator_agrees_with_prosemirror_on_the_whole_corpus() {
         };
 
         let validation =
-            insum_core::validate_note_doc_with_schema(doc, false, &limits, replay_schema)
+            insum_core::validate_note_doc_with_schema(doc, false, &limits, replay_schema, None)
                 .expect("corpus documents stay within read limits");
         let actual_valid = validation.valid();
         total += 1;
