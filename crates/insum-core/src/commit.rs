@@ -5,13 +5,13 @@
 //! here is the common commit discipline.
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use zip::write::SimpleFileOptions;
+use sha2::{Digest, Sha256};
+use zip::write::{PreparedZipFile, SimpleFileOptions};
 
-use crate::container::UmContainer;
+use crate::container::{UmContainer, format_rev, hex};
 use crate::error::{ErrorCode, UmError};
 
 /// §9.3 MUST: the write path refuses a symlink source and any non-regular
@@ -259,6 +259,46 @@ impl Drop for StagedFile {
     }
 }
 
+/// Tee-writer over the staged file: every written byte also feeds a
+/// SHA-256, so the whole-file revision falls out of the streaming write
+/// pass instead of a second full pass over the staged bytes (PRF-3).
+/// Seek is forwarded honestly; the rebuild below only ever appends, so
+/// the digest tracks the exact file content.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W> HashingWriter<W>
+where
+    W: std::io::Write + std::io::Seek,
+{
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write + std::io::Seek> std::io::Seek for HashingWriter<W> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
 /// Rebuild the `.um` container with the given payload replacements: every
 /// replaced entry is re-deflated under the same name and declared mtime,
 /// every other entry is copied raw (byte-identical, order and timestamps
@@ -267,15 +307,23 @@ impl Drop for StagedFile {
 /// of the path (M-1: a non-cooperative writer cannot mix generations into
 /// the commit). The result is streamed into the staged file next to the
 /// target (m-17: no whole-container buffer, no extra staging copy) and
-/// fsynced there (§9.3).
+/// fsynced there (§9.3). Returns the whole-file revision taken from the
+/// tee-hash of the streamed bytes (PRF-3) — identical to a fresh
+/// `file_sha256` over the staged file, without re-reading it.
+///
+/// WHY prepared entries: `ZipWriter::start_file` patches the local header
+/// in place once the compressed size is known (seek-back + rewrite), which
+/// a linear tee cannot observe correctly. `add_prepared_file` writes the
+/// header complete from the pre-compressed entry, so every write of this
+/// rebuild is append-only and the tee digest is exact.
 pub(crate) fn rewrite_um_entries(
     container: &mut UmContainer,
     replacements: &HashMap<String, Vec<u8>>,
     into: std::fs::File,
-) -> Result<(), UmError> {
+) -> Result<String, UmError> {
     // rebuild: walk the source archive in order through the held handle
     let archive = container.zip_archive();
-    let mut writer = zip::ZipWriter::new(into);
+    let mut writer = zip::ZipWriter::new(HashingWriter::new(into));
     for index in 0..archive.len() {
         let (name, last_modified) = {
             let raw = archive.by_index_raw(index).map_err(|err| {
@@ -299,11 +347,11 @@ pub(crate) fn rewrite_um_entries(
         if let Some(bytes) = replacements.get(name_str) {
             // replace the entry: same name, same declared mtime, fresh deflate
             let options = SimpleFileOptions::default().last_modified_time(last_modified);
+            let prepared = PreparedZipFile::from_data(name_str, options, bytes).map_err(|err| {
+                UmError::internal(format!("cannot compress entry {name:?}: {err}"))
+            })?;
             writer
-                .start_file(name_str, options)
-                .map_err(|err| UmError::internal(format!("cannot start entry {name:?}: {err}")))?;
-            writer
-                .write_all(bytes)
+                .add_prepared_file(prepared)
                 .map_err(|err| UmError::internal(format!("cannot write entry {name:?}: {err}")))?;
         } else {
             // untouched entry: raw copy keeps the compressed bytes verbatim
@@ -318,17 +366,19 @@ pub(crate) fn rewrite_um_entries(
                 .map_err(|err| UmError::internal(format!("cannot copy entry {name:?}: {err}")))?;
         }
     }
-    let file = writer
+    let hashed = writer
         .finish()
         .map_err(|err| UmError::internal(format!("cannot finish the new container: {err}")))?;
+    let digest = hex(&hashed.hasher.finalize());
     // §9.3: fsync the temp file before it can become the target; any error
     // here leaves the staged file to the Drop guard for cleanup (m-2)
-    file.sync_all().map_err(|err| {
+    hashed.inner.sync_all().map_err(|err| {
         UmError::new(
             ErrorCode::IoError,
             format!("cannot sync the staged file: {err}"),
         )
-    })
+    })?;
+    Ok(format_rev(digest))
 }
 
 /// Serialize one JSON document for a note payload (compact — the payload
@@ -336,4 +386,81 @@ pub(crate) fn rewrite_um_entries(
 pub(crate) fn payload_bytes(doc: &Value) -> Result<Vec<u8>, UmError> {
     serde_json::to_vec(doc)
         .map_err(|err| UmError::internal(format!("note payload does not serialize: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container::{UmContainer, file_sha256};
+    use crate::limits::Limits;
+
+    /// PRF-3 invariant: the tee digest collected while streaming the staged
+    /// container equals a fresh full hash over those very bytes — for a
+    /// rewrite that mixes a re-deflated entry with raw copies.
+    #[test]
+    fn rewrite_digest_matches_the_staged_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.um");
+        insum_test_utils::write_um(
+            &path,
+            &[
+                insum_test_utils::FixtureNote::title_page(
+                    &insum_test_utils::ulid_seq(1),
+                    "Alpha",
+                    "first",
+                    &[],
+                ),
+                insum_test_utils::FixtureNote::plain_page(
+                    &insum_test_utils::ulid_seq(2),
+                    "Beta",
+                    &[],
+                ),
+            ],
+        )
+        .unwrap();
+        let limits = Limits::defaults();
+        let mut container = UmContainer::open(&path, &limits).unwrap();
+
+        // replace the first note's payload (exercises the prepared-entry
+        // path); every other entry goes through the raw-copy path
+        let descriptor = container
+            .find_note(&insum_test_utils::ulid_seq(1))
+            .unwrap()
+            .clone();
+        let mut replacements = HashMap::new();
+        let mut doc = container.read_note(&descriptor, &limits).unwrap().doc;
+        doc["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "paragraph",
+                "attrs": {"id": "replaced1"},
+                "content": [{"type": "text", "text": "rewritten"}]
+            }));
+        replacements.insert(descriptor.path.clone(), payload_bytes(&doc).unwrap());
+
+        let (staged, file) = StagedFile::create(&path).unwrap();
+        let rev = rewrite_um_entries(&mut container, &replacements, file).unwrap();
+
+        // the tee digest must equal a re-read of the staged bytes...
+        assert_eq!(rev, file_sha256(staged.path()).unwrap());
+        // ...and the staged container must be a readable, valid rebuild
+        let mut staged_container = UmContainer::open(staged.path(), &limits).unwrap();
+        let staged_descriptor = staged_container
+            .find_note_by_path(&descriptor.path)
+            .unwrap()
+            .clone();
+        let staged_note = staged_container
+            .read_note(&staged_descriptor, &limits)
+            .unwrap();
+        assert_eq!(
+            staged_note.doc["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["attrs"]["id"],
+            "replaced1",
+            "the replaced payload is in the staged container"
+        );
+    }
 }

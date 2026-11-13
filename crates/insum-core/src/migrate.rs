@@ -950,9 +950,10 @@ fn commit_um(
 
     // the result is streamed into a hidden, exclusively created temp file
     // next to the target (§12): one write pass, no second staging copy in a
-    // shared temp directory (M-4/M-5/m-17)
+    // shared temp directory (M-4/M-5/m-17); the whole-file revision falls
+    // out of the same pass as the tee-hash (PRF-3)
     let (staged, file) = StagedFile::create(path)?;
-    rewrite_um(
+    let new_file_rev = rewrite_um(
         &mut reopened,
         selected,
         plans,
@@ -979,7 +980,6 @@ fn commit_um(
     // §9.3 MUST: re-check the source immediately before the replace (still
     // a regular file, still the rechecked revision) and take its permissions
     let mode = pre_replace_verification(path, &file_rev_before, "the file")?;
-    let new_file_rev = crate::container::file_sha256(staged.path())?;
     staged.commit_to(path, mode)?;
 
     // `new_note_rev` lands by POSITION, not by note-id lookup (D-3): the
@@ -1314,6 +1314,8 @@ struct SchemaMeta {
 /// (M-1: a non-cooperative writer cannot mix generations into the commit).
 /// The result is streamed into the staged file next to the target (m-17: no
 /// whole-container buffer, no extra staging copy) and fsynced there (§9.3).
+/// Returns the whole-file revision taken from the tee-hash of the streamed
+/// bytes (PRF-3).
 #[allow(clippy::too_many_arguments)]
 fn rewrite_um(
     container: &mut UmContainer,
@@ -1323,7 +1325,7 @@ fn rewrite_um(
     attrs_key: &str,
     limits: &Limits,
     into: std::fs::File,
-) -> Result<(), UmError> {
+) -> Result<String, UmError> {
     // payloads to replace, by archive entry name
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
     for (descriptor, plan) in selected.iter().zip(plans.iter()) {

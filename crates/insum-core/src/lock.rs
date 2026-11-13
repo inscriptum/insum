@@ -112,22 +112,30 @@ impl Sidecar {
     fn write_atomic(&self, path: &Path) -> Result<(), UmError> {
         let body = serde_json::to_vec(self)
             .map_err(|err| UmError::internal(format!("sidecar does not serialize: {err}")))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // TRAP (S-08): the sidecar records hostname and pid — the mode must
+        // be set at CREATE time, not chmod'ed after the write: a mode passed
+        // to open(2) applies to the first byte, so no world-readable window
+        // ever exists on disk
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         // create_new is the atomic step: exactly one writer wins
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    UmError::new(ErrorCode::WriteLocked, "sidecar already exists")
-                } else {
-                    UmError::from(err)
-                }
-            })?;
+        let mut file = options.open(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                UmError::new(ErrorCode::WriteLocked, "sidecar already exists")
+            } else {
+                UmError::from(err)
+            }
+        })?;
         file.write_all(&body)
             .and_then(|_| file.flush())
             .map_err(UmError::from)?;
-        // the sidecar records hostname and pid — owner-only (S-08)
+        // belt-and-suspenders: re-assert 0600 over the written bytes (e.g.
+        // when a platform layer or umask override slipped past the open mode)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

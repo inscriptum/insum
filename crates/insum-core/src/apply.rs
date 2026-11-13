@@ -22,7 +22,7 @@ use crate::commit::{
     StagedFile, ensure_writable_source, payload_bytes, pre_replace_verification, revision_mismatch,
     rewrite_um_entries,
 };
-use crate::container::{NoteFile, UmContainer, file_sha256, note_rev_for_file_bytes};
+use crate::container::{NoteFile, UmContainer, note_rev_for_file_bytes};
 use crate::error::{ErrorCode, UmError};
 use crate::limits::Limits;
 use crate::lock::{LockConfig, acquire_write_lock, check_sidecar_name_fits};
@@ -360,12 +360,6 @@ fn collect_ids(node: &Value, attrs_key: &str, out: &mut Vec<String>) {
     }
 }
 
-fn all_ids(doc: &Value, attrs_key: &str) -> BTreeSet<String> {
-    let mut out = Vec::new();
-    collect_ids(doc, attrs_key, &mut out);
-    out.into_iter().collect()
-}
-
 /// The JSON content-index path of the node carrying `id`, if any.
 fn find_path(doc: &Value, attrs_key: &str, id: &str) -> Option<Vec<usize>> {
     fn walk(node: &Value, attrs_key: &str, id: &str, path: &mut Vec<usize>) -> Option<()> {
@@ -419,6 +413,36 @@ fn content_array_mut<'a>(doc: &'a mut Value, parent_path: &[usize]) -> &'a mut V
         .expect("the resolved target lives in a content array")
 }
 
+/// Occurrence counts of every `attrs.<id_key>` in the document: the
+/// incremental form of the live-ID set (SEC-4/PRF-1). A count map, not a
+/// set, so that a source carrying a duplicate ID loses exactly one
+/// occurrence per deleted/replaced block — verdicts stay identical to a
+/// fresh full scan even for hand-written documents.
+fn counts_of(ids: impl IntoIterator<Item = String>) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for id in ids {
+        register_id(&mut counts, id);
+    }
+    counts
+}
+
+/// Drop one occurrence of `id` from the counts (subtree removed from the
+/// working copy).
+fn release_id(live_ids: &mut HashMap<String, usize>, id: &str) {
+    if let Some(count) = live_ids.get_mut(id) {
+        *count -= 1;
+        if *count == 0 {
+            live_ids.remove(id);
+        }
+    }
+}
+
+/// Register one occurrence of `id` in the counts (subtree written into the
+/// working copy).
+fn register_id(live_ids: &mut HashMap<String, usize>, id: String) {
+    *live_ids.entry(id).or_insert(0) += 1;
+}
+
 /// Every input ID of the node is checked against the state (§8.2): an ID
 /// that belongs to a block outside the allowed set is `ID_CONFLICT`, any
 /// other input ID is `BLOCK_ID_IMMUTABLE` (the CLI assigns IDs).
@@ -426,7 +450,7 @@ fn check_input_ids(
     node: &Value,
     attrs_key: &str,
     allowed: &BTreeSet<String>,
-    note_ids: &BTreeSet<String>,
+    live_ids: &HashMap<String, usize>,
 ) -> Result<(), UmError> {
     let mut passed = Vec::new();
     collect_ids(node, attrs_key, &mut passed);
@@ -434,7 +458,7 @@ fn check_input_ids(
         if allowed.contains(&id) {
             continue;
         }
-        if note_ids.contains(&id) {
+        if live_ids.contains_key(&id) {
             return Err(UmError::new(
                 ErrorCode::IdConflict,
                 format!(
@@ -465,6 +489,13 @@ fn check_input_ids(
 struct Engine<'a> {
     attrs_key: &'a str,
     addressable: &'a BTreeSet<String>,
+    /// Live `attrs.<id_key>` occurrence counts of the working copy,
+    /// maintained incrementally (SEC-4/PRF-1): one full walk at init, then
+    /// every operation adjusts only its own subtree — no per-operation
+    /// full scan of the document. Counts, not a set, keep the verdicts
+    /// identical to a fresh scan even for a source that carries a
+    /// duplicate ID.
+    live_ids: HashMap<String, usize>,
     /// insert_after cursors per anchor id: how many nodes earlier
     /// operations of this package have already inserted directly after
     /// the anchor (§8.4 — groups must not reverse).
@@ -472,12 +503,24 @@ struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
-    fn new(attrs_key: &'a str, addressable: &'a BTreeSet<String>) -> Self {
+    fn new(
+        attrs_key: &'a str,
+        addressable: &'a BTreeSet<String>,
+        live_ids: HashMap<String, usize>,
+    ) -> Self {
         Self {
             attrs_key,
             addressable,
+            live_ids,
             after_cursor: HashMap::new(),
         }
+    }
+
+    /// The live ID counts after the last applied operation — the same set
+    /// a fresh full walk would produce over the document at that point
+    /// (before `assign_missing_ids` adds the generated IDs).
+    fn into_live_ids(self) -> HashMap<String, usize> {
+        self.live_ids
     }
 
     fn resolve(&self, doc: &Value, id: &str) -> Result<Vec<usize>, UmError> {
@@ -509,8 +552,7 @@ impl<'a> Engine<'a> {
                 // passed (§8.3 replace: IDs from the same subtree only)
                 let mut old_ids = Vec::new();
                 collect_ids(node_at(doc, &path), self.attrs_key, &mut old_ids);
-                let allowed: BTreeSet<String> = old_ids.into_iter().collect();
-                let note_ids = all_ids(doc, self.attrs_key);
+                let allowed: BTreeSet<String> = old_ids.iter().cloned().collect();
                 // the input root may restate the target's ID, never change it
                 if let Some(passed) = node
                     .get("attrs")
@@ -528,7 +570,9 @@ impl<'a> Engine<'a> {
                         "Drop attrs.id from the input node — replace preserves the target's ID itself.",
                     ));
                 }
-                check_input_ids(node, self.attrs_key, &allowed, &note_ids)?;
+                // checks run BEFORE any mutation, so live_ids still counts
+                // the old subtree — exactly the set a fresh scan would see
+                check_input_ids(node, self.attrs_key, &allowed, &self.live_ids)?;
                 // rebuild the root: input attrs minus any passed ID, plus the
                 // target's ID when the new type stays addressable (§8.3)
                 let new_type = node
@@ -554,6 +598,16 @@ impl<'a> Engine<'a> {
                     }
                     object.insert("attrs".to_owned(), Value::Object(attrs));
                 }
+                // live_ids: old subtree out, rebuilt subtree in (a non-
+                // addressable new root drops the target's ID)
+                let mut new_ids = Vec::new();
+                collect_ids(&new_node, self.attrs_key, &mut new_ids);
+                for old in &old_ids {
+                    release_id(&mut self.live_ids, old);
+                }
+                for new in new_ids {
+                    register_id(&mut self.live_ids, new);
+                }
                 let index = *path.last().expect("path is non-empty");
                 let array = content_array_mut(doc, &path[..path.len() - 1]);
                 array[index] = new_node;
@@ -561,18 +615,22 @@ impl<'a> Engine<'a> {
             }
             Operation::Delete { id } => {
                 let path = self.resolve(doc, id)?;
+                let mut subtree_ids = Vec::new();
+                collect_ids(node_at(doc, &path), self.attrs_key, &mut subtree_ids);
                 let index = *path.last().expect("path is non-empty");
                 let array = content_array_mut(doc, &path[..path.len() - 1]);
                 array.remove(index);
                 self.after_cursor.remove(id);
+                for removed in subtree_ids {
+                    release_id(&mut self.live_ids, &removed);
+                }
                 Ok(())
             }
             Operation::InsertBefore { id, nodes } => {
                 let path = self.resolve(doc, id)?;
-                let note_ids = all_ids(doc, self.attrs_key);
                 let empty = BTreeSet::new();
                 for node in nodes {
-                    check_input_ids(node, self.attrs_key, &empty, &note_ids)?;
+                    check_input_ids(node, self.attrs_key, &empty, &self.live_ids)?;
                 }
                 let index = *path.last().expect("path is non-empty");
                 let array = content_array_mut(doc, &path[..path.len() - 1]);
@@ -583,10 +641,9 @@ impl<'a> Engine<'a> {
             }
             Operation::InsertAfter { id, nodes } => {
                 let path = self.resolve(doc, id)?;
-                let note_ids = all_ids(doc, self.attrs_key);
                 let empty = BTreeSet::new();
                 for node in nodes {
-                    check_input_ids(node, self.attrs_key, &empty, &note_ids)?;
+                    check_input_ids(node, self.attrs_key, &empty, &self.live_ids)?;
                 }
                 let index = *path.last().expect("path is non-empty");
                 let offset = self.after_cursor.entry(id.clone()).or_insert(0);
@@ -599,10 +656,9 @@ impl<'a> Engine<'a> {
                 Ok(())
             }
             Operation::AppendChild { parent_id, nodes } => {
-                let note_ids = all_ids(doc, self.attrs_key);
                 let empty = BTreeSet::new();
                 for node in nodes {
-                    check_input_ids(node, self.attrs_key, &empty, &note_ids)?;
+                    check_input_ids(node, self.attrs_key, &empty, &self.live_ids)?;
                 }
                 match parent_id {
                     None => {
@@ -680,20 +736,35 @@ impl<'a> Engine<'a> {
             Operation::ReplaceContent { id, content } => {
                 let path = self.resolve(doc, id)?;
                 // the target's CURRENT content subtree defines the
-                // preservable IDs (§8.3 replace_content)
+                // preservable IDs (§8.3 replace_content); collected over a
+                // borrow — the deep clone bought nothing but a redundant
+                // walk (PRF-2), and the borrow ends before the mutation
                 let mut subtree_ids = Vec::new();
-                collect_ids(
-                    &node_at(doc, &path)
+                {
+                    let empty: Vec<Value> = Vec::new();
+                    let current = node_at(doc, &path)
                         .get("content")
-                        .cloned()
-                        .unwrap_or_else(|| Value::Array(Vec::new())),
-                    self.attrs_key,
-                    &mut subtree_ids,
-                );
-                let allowed: BTreeSet<String> = subtree_ids.into_iter().collect();
-                let note_ids = all_ids(doc, self.attrs_key);
+                        .and_then(Value::as_array)
+                        .unwrap_or(&empty);
+                    for element in current {
+                        collect_ids(element, self.attrs_key, &mut subtree_ids);
+                    }
+                }
+                let allowed: BTreeSet<String> = subtree_ids.iter().cloned().collect();
                 for element in content {
-                    check_input_ids(element, self.attrs_key, &allowed, &note_ids)?;
+                    check_input_ids(element, self.attrs_key, &allowed, &self.live_ids)?;
+                }
+                // live_ids: current content out, new content in (the new
+                // elements may restate IDs from the replaced content)
+                let mut new_ids = Vec::new();
+                for element in content {
+                    collect_ids(element, self.attrs_key, &mut new_ids);
+                }
+                for removed in &subtree_ids {
+                    release_id(&mut self.live_ids, removed);
+                }
+                for new in new_ids {
+                    register_id(&mut self.live_ids, new);
                 }
                 let node = node_at_mut(doc, &path);
                 node["content"] = Value::Array(content.clone());
@@ -750,16 +821,22 @@ fn build_generation(
 ) -> Result<Generation, UmError> {
     let attrs_key = rules.attrs_key();
     let mut doc = doc_source.clone();
-    let ids_before = all_ids(&doc, attrs_key);
+    // one full walk for the initial ID snapshot: the before-set of the
+    // created/deleted diff and the engine's incremental live counts
+    // (SEC-4/PRF-1 — no per-operation full scans follow)
+    let mut initial_ids = Vec::new();
+    collect_ids(&doc, attrs_key, &mut initial_ids);
+    let ids_before: BTreeSet<String> = initial_ids.iter().cloned().collect();
 
-    let mut engine = Engine::new(attrs_key, addressable);
+    let mut engine = Engine::new(attrs_key, addressable, counts_of(initial_ids));
     engine.apply(&mut doc, &package.operations)?;
     let operations_applied = package.operations.len();
     refuse_title_family_loss(doc_source, &doc)?;
 
     // deleted = IDs present before the package and gone after it
-    // (delete ops, replaced subtrees, dropped replace_content content)
-    let ids_after_ops = all_ids(&doc, attrs_key);
+    // (delete ops, replaced subtrees, dropped replace_content content);
+    // the after-set comes from the engine's incremental counts
+    let ids_after_ops: BTreeSet<String> = engine.into_live_ids().into_keys().collect();
     let deleted_ids: Vec<String> = ids_before.difference(&ids_after_ops).cloned().collect();
 
     // assign IDs to the new addressable blocks, document order; a deleted
@@ -1174,7 +1251,9 @@ fn commit_um_locked(
         let mut replacements = HashMap::new();
         replacements.insert(descriptor.path.clone(), payload_bytes(&current.doc)?);
         let (staged, file) = StagedFile::create(path)?;
-        rewrite_um_entries(&mut container, &replacements, file)?;
+        // the whole-file revision arrives from the tee-hash of the streaming
+        // write (PRF-3) — no second full pass over the staged file
+        let new_file_rev = rewrite_um_entries(&mut container, &replacements, file)?;
 
         // §12: the result passes validation BEFORE the rename — over the
         // exact staged bytes; they also yield the post-write note revision
@@ -1196,7 +1275,6 @@ fn commit_um_locked(
             Err(err) if err.code == ErrorCode::NoteRevisionMismatch => continue,
             result => result?,
         };
-        let new_file_rev = file_sha256(staged.path())?;
         staged.commit_to(path, mode)?;
 
         return Ok(commit_response(
@@ -1361,11 +1439,16 @@ fn commit_note_locked(
     plan: &Generation,
     limits: &Limits,
 ) -> Result<Value, UmError> {
-    let (fresh, fresh_raw) = NoteFile::open_with_raw(path, limits, true)?;
-    if fresh.note_rev != expected_rev {
+    // PRF-4: the fresh bytes are read and hashed without a NoteFile parse.
+    // The CAS gate below makes any byte change a refusal, so bytes that
+    // pass it are exactly the planned generation the plan phase already
+    // validated through NoteFile — one bounded parse of them (below) is
+    // enough, the second full parse of the same bytes is gone.
+    let (fresh_raw, fresh_rev) = NoteFile::read_raw_with_rev(path, limits)?;
+    if fresh_rev != expected_rev {
         return Err(revision_mismatch(
             expected_rev,
-            &fresh.note_rev,
+            &fresh_rev,
             "the .note file",
         ));
     }
@@ -1373,8 +1456,9 @@ fn commit_note_locked(
     // unknown top-level fields are preserved as values (§12 — anything that
     // cannot be preserved must abort the write, not be dropped silently)
     let mut envelope: Value = if already_envelope {
-        serde_json::from_slice(&fresh_raw)
-            .map_err(|err| UmError::internal(format!("envelope does not parse: {err}")))?
+        let text = String::from_utf8(fresh_raw)
+            .map_err(|err| UmError::internal(format!("envelope is not UTF-8: {err}")))?;
+        crate::container::parse_json_limited(&text, limits.max_depth, ErrorCode::NoteJsonInvalid)?
     } else {
         json!({})
     };
@@ -1703,6 +1787,14 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::LazyLock;
+
+    /// Live-ID occurrence counts for [`Engine::new`], from one walk over
+    /// the working copy.
+    fn id_counts(doc: &Value, attrs_key: &str) -> HashMap<String, usize> {
+        let mut ids = Vec::new();
+        collect_ids(doc, attrs_key, &mut ids);
+        counts_of(ids)
+    }
 
     /// Self-hashed test artifact (same vocabulary as the CLI contract tests).
     static TEST_ARTIFACT: LazyLock<Value> = LazyLock::new(|| {
@@ -2147,7 +2239,11 @@ mod tests {
         let descriptor = container.find_note(&h.note1).unwrap().clone();
         let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
         let mut doc = parsed.note.doc.clone();
-        let mut engine = Engine::new(h.rules.attrs_key(), &h.addressable);
+        let mut engine = Engine::new(
+            h.rules.attrs_key(),
+            &h.addressable,
+            id_counts(&doc, h.rules.attrs_key()),
+        );
         engine
             .apply(
                 &mut doc,
@@ -2195,7 +2291,11 @@ mod tests {
         let descriptor = container.find_note(&h.note1).unwrap().clone();
         let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
         let mut doc = parsed.note.doc.clone();
-        let mut engine = Engine::new(h.rules.attrs_key(), &h.addressable);
+        let mut engine = Engine::new(
+            h.rules.attrs_key(),
+            &h.addressable,
+            id_counts(&doc, h.rules.attrs_key()),
+        );
 
         // restate the id: fine
         engine
@@ -2255,7 +2355,11 @@ mod tests {
         let descriptor = container.find_note(&h.note1).unwrap().clone();
         let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
         let mut doc = parsed.note.doc.clone();
-        let mut engine = Engine::new(h.rules.attrs_key(), &h.addressable);
+        let mut engine = Engine::new(
+            h.rules.attrs_key(),
+            &h.addressable,
+            id_counts(&doc, h.rules.attrs_key()),
+        );
         let err = engine
             .apply(
                 &mut doc,
@@ -2283,6 +2387,269 @@ mod tests {
             "message: {}",
             err.message
         );
+    }
+
+    /// SEC-4: the incremental live-ID set tracks deletes — the removed ID
+    /// fails later resolution (BLOCK_NOT_FOUND) and its restatement on
+    /// later input is BLOCK_ID_IMMUTABLE (a foreign ID), while surviving
+    /// IDs keep resolving across the shifted sibling indexes and still
+    /// conflict on restatement.
+    #[test]
+    fn delete_updates_the_incremental_live_ids() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let mut container = UmContainer::open(&h.path, &limits).unwrap();
+        let descriptor = container.find_note(&h.note1).unwrap().clone();
+        let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+        let mut doc = parsed.note.doc.clone();
+        let mut engine = Engine::new(
+            h.rules.attrs_key(),
+            &h.addressable,
+            id_counts(&doc, h.rules.attrs_key()),
+        );
+
+        // a later operation on the deleted ID fails with BLOCK_NOT_FOUND
+        let err = engine
+            .apply(
+                &mut doc,
+                &[
+                    Operation::Delete {
+                        id: "para1a2b3c".to_owned(),
+                    },
+                    Operation::SetAttrs {
+                        id: "para1a2b3c".to_owned(),
+                        set: [("data".to_owned(), json!("x"))].into_iter().collect(),
+                        unset: Vec::new(),
+                    },
+                ],
+            )
+            .expect_err("the deleted ID no longer resolves");
+        assert_eq!(err.code, ErrorCode::BlockNotFound, "code: {err:?}");
+
+        // a surviving block stays addressable after the sibling-index shift
+        engine
+            .apply_one(
+                &mut doc,
+                &Operation::SetAttrs {
+                    id: "para4d5e6f".to_owned(),
+                    set: [("data".to_owned(), json!("y"))].into_iter().collect(),
+                    unset: Vec::new(),
+                },
+            )
+            .expect("surviving IDs keep resolving after the delete");
+
+        // the deleted ID left the live set: restating it is a foreign ID
+        let err = engine
+            .apply_one(
+                &mut doc,
+                &Operation::AppendChild {
+                    parent_id: None,
+                    nodes: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "para1a2b3c"},
+                        "content": [{"type": "text", "text": "reborn"}]
+                    })],
+                },
+            )
+            .expect_err("the deleted ID is not a note ID anymore");
+        assert_eq!(err.code, ErrorCode::BlockIdImmutable, "code: {err:?}");
+
+        // a surviving ID still conflicts on restatement
+        let err = engine
+            .apply_one(
+                &mut doc,
+                &Operation::AppendChild {
+                    parent_id: None,
+                    nodes: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "para4d5e6f"},
+                        "content": [{"type": "text", "text": "hijack"}]
+                    })],
+                },
+            )
+            .expect_err("a surviving ID stays in the live set");
+        assert_eq!(err.code, ErrorCode::IdConflict, "code: {err:?}");
+    }
+
+    /// SEC-4: insertions shift sibling indexes, yet later operations on
+    /// other IDs keep resolving, and the live-ID checks stay exact:
+    /// restating a surviving ID conflicts, a fresh ID stays immutable.
+    #[test]
+    fn inserts_keep_later_operations_and_live_ids_valid() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let mut container = UmContainer::open(&h.path, &limits).unwrap();
+        let descriptor = container.find_note(&h.note1).unwrap().clone();
+        let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+        let mut doc = parsed.note.doc.clone();
+        let mut engine = Engine::new(
+            h.rules.attrs_key(),
+            &h.addressable,
+            id_counts(&doc, h.rules.attrs_key()),
+        );
+
+        engine
+            .apply(
+                &mut doc,
+                &[
+                    Operation::InsertBefore {
+                        id: "para4d5e6f".to_owned(),
+                        nodes: vec![serde_json::json!({
+                            "type": "paragraph",
+                            "attrs": {},
+                            "content": [{"type": "text", "text": "before"}]
+                        })],
+                    },
+                    Operation::InsertAfter {
+                        id: "para1a2b3c".to_owned(),
+                        nodes: vec![serde_json::json!({
+                            "type": "paragraph",
+                            "attrs": {},
+                            "content": [{"type": "text", "text": "after"}]
+                        })],
+                    },
+                ],
+            )
+            .expect("the inserts apply");
+
+        // later operations on other IDs still resolve across the shifts
+        engine
+            .apply_one(
+                &mut doc,
+                &Operation::SetAttrs {
+                    id: "para4d5e6f".to_owned(),
+                    set: [("data".to_owned(), json!("z"))].into_iter().collect(),
+                    unset: Vec::new(),
+                },
+            )
+            .expect("post-insert paths stay valid");
+
+        // replace restating its own ID is accepted
+        engine
+            .apply_one(
+                &mut doc,
+                &Operation::Replace {
+                    id: "para1a2b3c".to_owned(),
+                    node: serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "para1a2b3c"},
+                        "content": [{"type": "text", "text": "replaced"}]
+                    }),
+                },
+            )
+            .expect("replace keeps restating its own ID");
+
+        // restating another live ID conflicts
+        let err = engine
+            .apply_one(
+                &mut doc,
+                &Operation::AppendChild {
+                    parent_id: None,
+                    nodes: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "para4d5e6f"},
+                        "content": [{"type": "text", "text": "hijack"}]
+                    })],
+                },
+            )
+            .expect_err("a surviving ID stays in the live set");
+        assert_eq!(err.code, ErrorCode::IdConflict, "code: {err:?}");
+
+        // a fresh ID stays immutable
+        let err = engine
+            .apply_one(
+                &mut doc,
+                &Operation::AppendChild {
+                    parent_id: None,
+                    nodes: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "freshid0001"},
+                        "content": [{"type": "text", "text": "new"}]
+                    })],
+                },
+            )
+            .expect_err("new IDs are assigned by the CLI");
+        assert_eq!(err.code, ErrorCode::BlockIdImmutable, "code: {err:?}");
+    }
+
+    /// PRF-2: replace_content collects the preservable IDs over a borrow of
+    /// the current content — restating an ID from elsewhere in the note is
+    /// ID_CONFLICT, a fresh ID is BLOCK_ID_IMMUTABLE, ID-less content
+    /// applies and lands in the working copy.
+    #[test]
+    fn replace_content_borrowed_subtree_id_rules() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let mut container = UmContainer::open(&h.path, &limits).unwrap();
+        let descriptor = container.find_note(&h.note1).unwrap().clone();
+        let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+        let mut doc = parsed.note.doc.clone();
+        let mut engine = Engine::new(
+            h.rules.attrs_key(),
+            &h.addressable,
+            id_counts(&doc, h.rules.attrs_key()),
+        );
+
+        // restating a live ID from outside the target's current content
+        let err = engine
+            .apply_one(
+                &mut doc,
+                &Operation::ReplaceContent {
+                    id: "para4d5e6f".to_owned(),
+                    content: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "para1a2b3c"},
+                        "content": [{"type": "text", "text": "stolen"}]
+                    })],
+                },
+            )
+            .expect_err("an ID from another block conflicts");
+        assert_eq!(err.code, ErrorCode::IdConflict, "code: {err:?}");
+
+        // a fresh ID is not acceptable either
+        let err = engine
+            .apply_one(
+                &mut doc,
+                &Operation::ReplaceContent {
+                    id: "para4d5e6f".to_owned(),
+                    content: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "freshid0001"},
+                        "content": [{"type": "text", "text": "new"}]
+                    })],
+                },
+            )
+            .expect_err("new IDs are assigned by the CLI");
+        assert_eq!(err.code, ErrorCode::BlockIdImmutable, "code: {err:?}");
+
+        // ID-less content applies over the borrowed collection
+        engine
+            .apply_one(
+                &mut doc,
+                &Operation::ReplaceContent {
+                    id: "para4d5e6f".to_owned(),
+                    content: vec![
+                        serde_json::json!({
+                            "type": "paragraph",
+                            "attrs": {},
+                            "content": [{"type": "text", "text": "new content"}]
+                        }),
+                        serde_json::json!({
+                            "type": "paragraph",
+                            "attrs": {},
+                            "content": [{"type": "text", "text": "second"}]
+                        }),
+                    ],
+                },
+            )
+            .expect("ID-less content applies");
+        let target = doc["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["attrs"]["id"] == "para4d5e6f")
+            .expect("the target survives");
+        assert_eq!(target["content"].as_array().unwrap().len(), 2);
     }
 
     /// A minimal title-family document over the test artifact's vocabulary
