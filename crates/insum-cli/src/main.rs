@@ -219,7 +219,8 @@ enum BlockAction {
 
 #[derive(clap::Subcommand, Debug)]
 enum TableAction {
-    /// Structured read of one table of a note (read-only; §6.7).
+    /// Structured read of one table of a note (read-only; the response
+    /// contract is this help text).
     ///
     /// Address the table with exactly one of: --index N (0-based, document
     /// order), --id <block-id>, --after-heading <text> (the exact text of

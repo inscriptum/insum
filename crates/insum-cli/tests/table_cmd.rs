@@ -873,6 +873,51 @@ fn unknown_node_type_withholds_text_and_warns() {
     assert_eq!(rows[0]["values"]["A"], Value::Null);
 }
 
+#[test]
+fn withheld_heading_context_warns_instead_of_silence() {
+    // A heading whose inline text is withheld (unknown node) leaves the
+    // following table with `heading: null` — the response must say WHY,
+    // the silence must not read as "no heading above".
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("broken-heading.note");
+    let doc = fixtures::plain_doc(&[
+        json!({
+            "type": "heading",
+            "attrs": {"level": 2},
+            "content": [
+                { "type": "text", "text": "Broken " },
+                { "type": "customWidget", "content": [] }
+            ]
+        }),
+        fixtures::table(&[
+            fixtures::table_row(Some("hrow0"), &[fixtures::table_header(Some("hcol0"), "A")]),
+            fixtures::table_row(
+                Some("hrow1"),
+                &[fixtures::table_cell_text(Some("hcell1"), "v")],
+            ),
+        ]),
+    ]);
+    fixtures::write_legacy_note(&path, &doc).expect("fixture");
+    let file = path.to_string_lossy().into_owned();
+    let value = run_json(&["table", "get", &file, "--index", "0"]);
+    assert_eq!(value["table"]["heading"], Value::Null);
+    let warnings = value["warnings"].as_array().unwrap();
+    let heading_warning = warnings.first().expect("the heading warning is first");
+    assert_eq!(heading_warning["code"], "UNKNOWN_NODE_TYPE");
+    assert!(
+        heading_warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("heading text is withheld"),
+        "message: {}",
+        heading_warning["message"]
+    );
+    // the same note read after an addressing miss still fails BLOCK_NOT_FOUND
+    let (code, err) = fail_json(&["table", "get", &file, "--after-heading", "Broken"]);
+    assert_eq!(code, 3);
+    assert_eq!(err["error"]["code"], "BLOCK_NOT_FOUND");
+}
+
 // ---------------------------------------------------------------------------
 // markdown projection
 // ---------------------------------------------------------------------------

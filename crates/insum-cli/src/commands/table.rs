@@ -500,37 +500,24 @@ fn render_markdown(
     warnings: &[Value],
     budget: usize,
 ) -> String {
-    let columns = entry.columns();
-    let mut lines: Vec<String> = Vec::new();
-    if !columns.is_empty() {
-        let header: Vec<String> = columns
-            .iter()
-            .map(|cell| tables::escape_cell_text(cell.text.as_deref().unwrap_or("")))
-            .collect();
-        lines.push(format!("| {} |\n", header.join(" | ")));
-        let separator: Vec<&str> = columns.iter().map(|_| "---").collect();
-        lines.push(format!("| {} |\n", separator.join(" | ")));
-    }
-    let row_lines: Vec<String> = if columns.is_empty() {
+    // The GFM shaping lives in insum-core alone (CONTRACT: one renderer):
+    // this function only measures and fits the core-rendered lines into the
+    // output budget.
+    let header = tables::markdown_header(entry);
+    let row_lines: Vec<String> = if header.is_empty() {
         // markdown cannot represent a column-less table — the rows stay in
         // the JSON projection, the diagnostics explain the shape
         Vec::new()
     } else {
         matched
             .iter()
-            .map(|&index| {
-                let row = &entry.rows[index];
-                let mut rendered: Vec<String> = row
-                    .cells
-                    .iter()
-                    .map(|cell| tables::escape_cell_text(cell.text.as_deref().unwrap_or("")))
-                    .collect();
-                while rendered.len() < columns.len() {
-                    rendered.push(String::new());
-                }
-                format!("| {} |\n", rendered.join(" | "))
-            })
+            .map(|&index| tables::markdown_row(entry, index))
             .collect()
+    };
+    let lines: Vec<String> = if header.is_empty() {
+        Vec::new()
+    } else {
+        vec![header]
     };
     let warning_comments = || -> String {
         let mut text = String::new();

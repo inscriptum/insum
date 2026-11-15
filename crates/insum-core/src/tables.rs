@@ -149,7 +149,7 @@ pub fn collect_tables(doc: &Value, max_json_depth: usize) -> Tables {
     let Some(children) = doc.get("content").and_then(Value::as_array) else {
         return tables;
     };
-    let mut heading: Option<String> = None;
+    let mut heading = HeadingContext::default();
     for (index, child) in children.iter().enumerate() {
         walk(
             child,
@@ -169,7 +169,7 @@ fn walk(
     parent_pointer: Option<&str>,
     index: usize,
     json_depth: usize,
-    heading: &mut Option<String>,
+    heading: &mut HeadingContext,
     max_json_depth: usize,
     tables: &mut Tables,
 ) {
@@ -193,10 +193,32 @@ fn walk(
         // note-title fallback): tables under a title-schema page have the
         // title as their first heading context.
         "heading" | "noteTitle" => {
-            *heading = heading_text(object);
+            *heading = heading_context(object, &pointer, json_depth, max_json_depth, tables);
         }
         "table" => {
-            let entry = collect_table(object, &pointer, heading.clone(), max_json_depth, tables);
+            let mut entry = collect_table(
+                object,
+                &pointer,
+                heading.text.clone(),
+                max_json_depth,
+                tables,
+            );
+            // A withheld heading context explains itself: the table's
+            // `heading: null` must not be mistaken for "no heading above"
+            // (no silent context loss — §10.2).
+            let heading_warnings: Vec<TableDiagnostic> = heading
+                .withheld
+                .iter()
+                .map(|(diag_pointer, node_type)| {
+                    TableDiagnostic::new(
+                        "UNKNOWN_NODE_TYPE",
+                        format!(
+                            "unknown node type {node_type:?} at {diag_pointer}: the heading text is withheld — --after-heading cannot match this heading"
+                        ),
+                    )
+                })
+                .collect();
+            entry.diagnostics.splice(0..0, heading_warnings);
             tables.entries.push(entry);
         }
         _ => {
@@ -217,14 +239,45 @@ fn walk(
     }
 }
 
-/// Heading context of subsequent tables: the exact inline text, or `None`
-/// when the text is withheld (unknown inline node).
-fn heading_text(object: &Map<String, Value>) -> Option<String> {
+/// Heading context of subsequent tables: the exact inline text when
+/// extractable, or the unknown-node evidence when the text is withheld —
+/// a `heading: null` must be distinguishable from "no heading above".
+#[derive(Default, Clone)]
+struct HeadingContext {
+    text: Option<String>,
+    /// Unknown (pointer, type) pairs of the last heading when its text is
+    /// withheld; empty when no heading precedes or the text is plain.
+    withheld: Vec<(String, String)>,
+}
+
+fn heading_context(
+    object: &Map<String, Value>,
+    pointer: &str,
+    json_depth: usize,
+    max_json_depth: usize,
+    tables: &mut Tables,
+) -> HeadingContext {
     let (text, incomplete) = inline_text(object);
-    if incomplete {
-        None
-    } else {
-        Some(text.unwrap_or_default())
+    if !incomplete {
+        return HeadingContext {
+            text: Some(text.unwrap_or_default()),
+            withheld: Vec::new(),
+        };
+    }
+    // Reuse the cell subtree walk to NAME the unknown nodes of the heading
+    // (headings hold inline nodes — no nested tables to expect here).
+    let mut ctx = CellContext::default();
+    gather_object(
+        object,
+        pointer,
+        json_depth,
+        max_json_depth,
+        tables,
+        &mut ctx,
+    );
+    HeadingContext {
+        text: None,
+        withheld: ctx.unknown,
     }
 }
 
@@ -491,13 +544,23 @@ fn gather_cell_text(
     tables: &mut Tables,
     ctx: &mut CellContext,
 ) {
+    if let Some(object) = node.as_object() {
+        gather_object(object, pointer, json_depth, max_json_depth, tables, ctx);
+    }
+}
+
+fn gather_object(
+    object: &Map<String, Value>,
+    pointer: &str,
+    json_depth: usize,
+    max_json_depth: usize,
+    tables: &mut Tables,
+    ctx: &mut CellContext,
+) {
     if json_depth > max_json_depth {
         tables.depth_exceeded = true;
         return;
     }
-    let Some(object) = node.as_object() else {
-        return;
-    };
     let node_type = object.get("type").and_then(Value::as_str).unwrap_or("");
     if node_type == "table" {
         // A nested table is a block of its own, not part of the outer cell
@@ -512,8 +575,10 @@ fn gather_cell_text(
     }
     let (text, incomplete) = inline_text(object);
     if incomplete {
+        // The node's own text is withheld — but the unknown nodes that
+        // caused it must still be NAMED (heading context, cell warnings):
+        // descend instead of returning silently.
         ctx.incomplete = true;
-        return;
     }
     if let Some(text) = text {
         ctx.texts.push(text);
@@ -541,35 +606,57 @@ pub fn escape_cell_text(text: &str) -> String {
     text.replace('\n', "<br>").replace('|', "\\|")
 }
 
-/// Render the GFM table body of one entry: the header line comes from the
-/// first row, `row_indices` selects the DATA rows (never the header row —
-/// it is not a filterable data row). A table without columns renders
-/// nothing — markdown cannot represent a column-less table, the JSON
-/// projection carries the rows instead.
-pub fn markdown_body(entry: &TableEntry, row_indices: &[usize]) -> String {
+/// Header and separator lines of the GFM projection, from the table's
+/// first row. Empty for a column-less table — markdown cannot represent a
+/// column-less table, the JSON projection carries the rows instead.
+pub fn markdown_header(entry: &TableEntry) -> String {
     let columns = entry.columns();
     if columns.is_empty() {
         return String::new();
     }
-    let mut out = String::new();
     let header: Vec<String> = columns
         .iter()
         .map(|cell| escape_cell_text(cell.text.as_deref().unwrap_or("")))
         .collect();
-    out.push_str(&format!("| {} |\n", header.join(" | ")));
     let separator: Vec<&str> = columns.iter().map(|_| "---").collect();
-    out.push_str(&format!("| {} |\n", separator.join(" | ")));
+    format!(
+        "| {} |\n| {} |\n",
+        header.join(" | "),
+        separator.join(" | ")
+    )
+}
+
+/// One DATA row line of the GFM projection (`row_index` addresses the rows
+/// of the entry, the header row included): short rows are padded, long rows
+/// keep their extra cells (the ragged diagnostics name the anomaly — no
+/// content is dropped here). Pipes are escaped and newlines become `<br>`,
+/// byte-for-byte parity with the annotated cell renderer.
+pub fn markdown_row(entry: &TableEntry, row_index: usize) -> String {
+    let columns = entry.columns();
+    if columns.is_empty() {
+        return String::new();
+    }
+    let row = &entry.rows[row_index];
+    let mut rendered: Vec<String> = row
+        .cells
+        .iter()
+        .map(|cell| escape_cell_text(cell.text.as_deref().unwrap_or("")))
+        .collect();
+    while rendered.len() < columns.len() {
+        rendered.push(String::new());
+    }
+    format!("| {} |\n", rendered.join(" | "))
+}
+
+/// Render the GFM table body of one entry: the header line comes from the
+/// first row, `row_indices` selects the DATA rows (never the header row —
+/// it is not a filterable data row). The single GFM shaping implementation:
+/// `insum table get --format markdown` composes the budget fit from
+/// [`markdown_header`] and [`markdown_row`] — do not duplicate the renderer.
+pub fn markdown_body(entry: &TableEntry, row_indices: &[usize]) -> String {
+    let mut out = markdown_header(entry);
     for index in row_indices {
-        let row = &entry.rows[*index];
-        let mut rendered: Vec<String> = row
-            .cells
-            .iter()
-            .map(|cell| escape_cell_text(cell.text.as_deref().unwrap_or("")))
-            .collect();
-        while rendered.len() < columns.len() {
-            rendered.push(String::new());
-        }
-        out.push_str(&format!("| {} |\n", rendered.join(" | ")));
+        out.push_str(&markdown_row(entry, *index));
     }
     out
 }
@@ -782,6 +869,72 @@ mod tests {
         let tables = collect_tables(&document, 128);
         let cell = &tables.entries[0].rows[1].cells[0];
         assert_eq!(cell.text.as_deref(), Some("see план\nbold"));
+    }
+
+    #[test]
+    fn withheld_heading_context_names_itself_instead_of_silence() {
+        let document = doc(vec![
+            json!({
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [
+                    { "type": "text", "text": "Broken " },
+                    { "type": "customWidget", "content": [] }
+                ]
+            }),
+            plain_table(),
+        ]);
+        let tables = collect_tables(&document, 128);
+        let entry = &tables.entries[0];
+        assert_eq!(entry.heading, None, "text withheld, not partial");
+        let first = entry.diagnostics.first().expect("heading warning first");
+        assert_eq!(first.code, "UNKNOWN_NODE_TYPE");
+        assert!(
+            first.message.contains("heading text is withheld"),
+            "message: {}",
+            first.message
+        );
+        assert!(
+            first.message.contains("--after-heading"),
+            "message: {}",
+            first.message
+        );
+        // a plain table without any heading carries no such warning
+        let bare = collect_tables(&doc(vec![plain_table()]), 128);
+        assert!(bare.entries[0].heading.is_none());
+        assert!(
+            bare.entries[0]
+                .diagnostics
+                .iter()
+                .all(|d| d.code != "UNKNOWN_NODE_TYPE"),
+            "no heading context — no heading warning"
+        );
+    }
+
+    #[test]
+    fn granular_markdown_pieces_compose_to_markdown_body() {
+        let document = doc(vec![json!({
+            "type": "table",
+            "content": [
+                row(vec![header("h1", "A|B"), header("h2", "C")]),
+                row(vec![cell("c1", "x|y\nz"), cell("c2", "ok")]),
+                row(vec![cell("c3", "short")]),
+            ]
+        })]);
+        let tables = collect_tables(&document, 128);
+        let entry = &tables.entries[0];
+        let indices = [1usize, 2];
+        let composed = format!(
+            "{}{}",
+            markdown_header(entry),
+            indices
+                .iter()
+                .map(|&i| markdown_row(entry, i))
+                .collect::<String>()
+        );
+        assert_eq!(composed, markdown_body(entry, &indices));
+        // the granular row line escapes and pads on its own
+        assert_eq!(markdown_row(entry, 1), "| x\\|y<br>z | ok |\n");
     }
 
     #[test]
