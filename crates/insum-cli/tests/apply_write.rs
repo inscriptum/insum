@@ -52,7 +52,9 @@ fn artifact_json() -> Value {
                         "marks": ["strong"], "addressable": true, "inline_content": true,
                         "searchable": true},
             "paragraph": {"content": "inline*", "groups": ["block"],
-                          "attrs": {"id": {"default": null}}, "marks": ["strong"],
+                          "attrs": {"id": {"default": null},
+                                    "align": {"default": null}},
+                          "marks": ["strong"],
                           "addressable": true, "inline_content": true, "searchable": true},
             "bulletList": {"content": "listItem+", "groups": ["block"],
                            "attrs": {"id": {"default": null}}, "marks": [],
@@ -360,6 +362,74 @@ fn dry_run_changes_no_bytes_no_mtime_and_leaves_no_temp() {
     );
 }
 
+/// The plan the dry-run reports is the plan the commit applies (§8.6):
+/// same package, fresh copy of the container.
+#[test]
+fn dry_run_plan_matches_the_commit_parity() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // replace with nested nodes: the subtree adds created blocks beyond the
+    // root, delete bookkeeping included
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "replace", "id": "list000001", "node": {"type": "bulletList", "attrs": {}, "content": [
+            {"type": "listItem", "attrs": {}, "content": [
+                {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "one fresh"}]}
+            ]},
+            {"type": "listItem", "attrs": {}, "content": [
+                {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "two fresh"}]}
+            ]}
+        ]}}]),
+    );
+
+    let output = insum()
+        .args([
+            "apply",
+            &file,
+            "--ops",
+            &ops,
+            "--schema",
+            &artifact,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["applied"], false);
+    assert_eq!(plan["operations_validated"], 1);
+
+    // commit the same package onto a fresh copy of the container
+    let copy = fixture.dir_path().join("parity.um");
+    fs::copy(&file, &copy).unwrap();
+    let copy_path = copy.to_string_lossy().into_owned();
+    let output = insum()
+        .args(["apply", &copy_path, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let commit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(commit["applied"], true);
+
+    assert_eq!(
+        commit["created_ids"].as_array().unwrap().len() as u64,
+        plan["would_create_count"],
+        "created bookkeeping matches the promised count"
+    );
+    assert_eq!(
+        commit["deleted_ids"], plan["would_delete_ids"],
+        "deleted ids match the plan exactly"
+    );
+    assert_eq!(
+        commit["operations_applied"], plan["operations_validated"],
+        "applied ops match the validated ops"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Criteria 31–36: operation semantics
 // ---------------------------------------------------------------------------
@@ -405,6 +475,47 @@ fn append_child_null_appends_to_the_root_end() {
         "the created id is stamped in the payload"
     );
     assert_eq!(doc["content"][5]["content"][0]["text"], "last");
+}
+
+#[test]
+fn append_child_into_a_nested_parent_targets_the_subtree() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // the parent is the listItem INSIDE the bulletList, not the root: the
+    // node lands in the parent's subtree, not at the document root
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "append_child", "parent_id": "item000001", "nodes": [
+            {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "inside item"}]}
+        ]}]),
+    );
+    let output = insum()
+        .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let created = response["created_ids"].as_array().unwrap();
+    assert_eq!(created.len(), 1);
+    // the listItem sits at /content/4/content/0; the new paragraph follows
+    // its existing paragraph child
+    assert_eq!(created[0]["pointer"], "/content/4/content/0/content/1");
+    let id = created[0]["id"].as_str().unwrap();
+    let doc: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", fixture.note1()),
+    ))
+    .unwrap();
+    let nested = &doc["content"][4]["content"][0]["content"][1];
+    assert_eq!(nested["attrs"]["id"].as_str().unwrap(), id);
+    assert_eq!(nested["content"][0]["text"], "inside item");
+    // the root keeps exactly one child at the document level (nothing
+    // leaked out of the parent's subtree)
+    assert_eq!(doc["content"].as_array().unwrap().len(), 5);
 }
 
 #[test]
@@ -597,16 +708,119 @@ fn replace_content_keeps_root_id_and_preserves_subtree_ids() {
 }
 
 #[test]
+fn replace_descendants_may_restate_ids_of_the_original_subtree() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // the new subtree restates para000003, an ID of the REPLACED subtree —
+    // that is the documented exception to "input nodes carry no IDs" (§8.2)
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "replace", "id": "list000001", "node": {"type": "bulletList", "attrs": {}, "content": [
+            {"type": "listItem", "attrs": {}, "content": [
+                {"type": "paragraph", "attrs": {"id": "para000003"}, "content": [
+                    {"type": "text", "text": "restated"}
+                ]}
+            ]}
+        ]}}]),
+    );
+    let output = insum()
+        .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // the restated ID survives: it is neither created nor deleted, only the
+    // fresh listItem is (success also proves the staged document validated)
+    let created = response["created_ids"].as_array().unwrap();
+    assert_eq!(created.len(), 1, "only the listItem is new: {created:?}");
+    assert_eq!(created[0]["pointer"], "/content/4/content/0");
+    let created_ids: Vec<&str> = created
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !created_ids.contains(&"para000003"),
+        "a restated ID is not created: {created_ids:?}"
+    );
+    let deleted = response["deleted_ids"].as_array().unwrap();
+    assert_eq!(
+        deleted,
+        &["item000001".to_owned()],
+        "para000003 restated, so it is not deleted: {deleted:?}"
+    );
+    let doc: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", fixture.note1()),
+    ))
+    .unwrap();
+    assert_eq!(doc["content"][4]["attrs"]["id"], "list000001");
+    assert_eq!(
+        doc["content"][4]["content"][0]["attrs"]["id"]
+            .as_str()
+            .unwrap(),
+        created_ids[0],
+        "the fresh listItem id is stamped"
+    );
+    assert_eq!(
+        doc["content"][4]["content"][0]["content"][0]["attrs"]["id"], "para000003",
+        "the restated ID is on the new paragraph"
+    );
+    assert_eq!(
+        doc["content"][4]["content"][0]["content"][0]["content"][0]["text"],
+        "restated"
+    );
+}
+
+#[test]
+fn replace_with_an_id_from_another_branch_is_an_id_conflict() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let before = fs::read(&file).unwrap();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // para000001 lives on another branch of THIS note — outside the replaced
+    // subtree it is a foreign input ID (§8.2), so the plan refuses
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "replace", "id": "list000001", "node": {"type": "bulletList", "attrs": {}, "content": [
+            {"type": "listItem", "attrs": {}, "content": [
+                {"type": "paragraph", "attrs": {"id": "para000001"}, "content": [
+                    {"type": "text", "text": "stolen id"}
+                ]}
+            ]}
+        ]}}]),
+    );
+    let output = insum()
+        .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = stderr_json(&output);
+    assert_eq!(error["error"]["code"], "ID_CONFLICT", "{error}");
+    assert_eq!(output.status.code(), Some(4), "ID_CONFLICT exits 4");
+    assert_eq!(fs::read(&file).unwrap(), before, "bytes untouched");
+}
+
+#[test]
 fn set_attrs_merges_unsets_and_keeps_the_root_id() {
     let fixture = Fixture::new();
     let artifact = fixture.artifact();
     let file = fixture.container();
     let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // `align` is declared in the artifact for paragraph — a declared attr
+    // keeps the parity warnings empty (an undeclared one would carry
+    // SCHEMA_ATTR_UNKNOWN)
     let ops = package(
         &fixture.dir_path(),
         Some(&fixture.note1()),
         &rev,
-        json!([{"op": "set_attrs", "id": "para000001", "set": {"level": 3}, "unset": []}]),
+        json!([{"op": "set_attrs", "id": "para000001", "set": {"align": "center"}, "unset": []}]),
     );
     let output = insum()
         .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
@@ -615,12 +829,16 @@ fn set_attrs_merges_unsets_and_keeps_the_root_id() {
     assert!(output.status.success(), "{:?}", stderr_json(&output));
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(response["created_ids"].as_array().unwrap().is_empty());
+    assert!(
+        response["warnings"].as_array().unwrap().is_empty(),
+        "a declared attr raises no parity warning: {response}"
+    );
     let doc: Value = serde_json::from_slice(&read_entry(
         &file,
         &format!("notes/{}.json", fixture.note1()),
     ))
     .unwrap();
-    assert_eq!(doc["content"][2]["attrs"]["level"], 3);
+    assert_eq!(doc["content"][2]["attrs"]["align"], "center");
     assert_eq!(
         doc["content"][2]["attrs"]["id"], "para000001",
         "root id kept"
@@ -632,7 +850,7 @@ fn set_attrs_merges_unsets_and_keeps_the_root_id() {
         &fixture.dir_path(),
         Some(&fixture.note1()),
         &rev2,
-        json!([{"op": "set_attrs", "id": "para000001", "unset": ["level"]}]),
+        json!([{"op": "set_attrs", "id": "para000001", "unset": ["align"]}]),
     );
     let output2 = insum()
         .args(["apply", &file, "--ops", &ops2, "--schema", &artifact])
@@ -645,7 +863,7 @@ fn set_attrs_merges_unsets_and_keeps_the_root_id() {
     ))
     .unwrap();
     assert!(
-        doc2["content"][2]["attrs"].get("level").is_none(),
+        doc2["content"][2]["attrs"].get("align").is_none(),
         "unset removes the attr: {}",
         doc2["content"][2]["attrs"]
     );
@@ -802,6 +1020,75 @@ unsafe fn libc_stub_hostname(_buf: &mut [u8; 256]) -> usize {
     0
 }
 
+/// The pid of a process that already exited: provably dead on this host,
+/// so `holder_is_gone` declares the lease stale immediately (same-host
+/// pid check, lock.rs). Same technique as lock.rs's own dead_pid().
+fn dead_process_pid() -> u32 {
+    #[cfg(unix)]
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "exit"])
+        .spawn()
+        .expect("spawn cmd");
+    let pid = child.id();
+    let _ = child.wait();
+    pid
+}
+
+/// Pair of `a_live_dirty_lease_blocks_the_write`: a same-host lease whose
+/// holder pid is provably dead does not block — recovery breaks it and the
+/// write goes through (§9.2).
+#[test]
+fn a_stale_lease_with_a_dead_holder_does_not_block() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "delete", "id": "list000001"}]),
+    );
+    // the lease shape of the live test, but the holder already exited:
+    // same hostname (so the pid check applies) + a dead pid
+    let lease = json!({
+        "format": 1,
+        "kind": "lease",
+        "holder": {"kind": "plugin", "pid": dead_process_pid(), "hostname": hostname()},
+        "op_id": "leasetest01",
+        "created_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    });
+    let file_name = Path::new(&file).file_name().unwrap().to_string_lossy();
+    let lease_path = fixture.dir_path().join(format!(".{file_name}.insum-lease"));
+    fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+
+    let output = insum()
+        .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a dead holder does not block: {:?}",
+        stderr_json(&output)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["applied"], true);
+    // the write really went through
+    let doc: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", fixture.note1()),
+    ))
+    .unwrap();
+    assert_eq!(doc["content"].as_array().unwrap().len(), 4);
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 42: source safety and platform hygiene
 // ---------------------------------------------------------------------------
@@ -849,6 +1136,58 @@ fn symlink_source_is_refused_for_dry_run_and_commit() {
     ))
     .unwrap();
     assert_eq!(doc["content"].as_array().unwrap().len(), 5);
+}
+
+/// Windows counterpart of the unix refusal test: a directory link on the
+/// source is refused with the same IO_ERROR class before any work (§9.3).
+/// std offers no stable junction constructor, so the link is a directory
+/// symlink (`symlink_dir`) — the refusal keys on the reparse point itself
+/// (`symlink_metadata`), not on what it points at. Creating the link needs
+/// symlink privileges (Developer Mode or admin); without them the hazard
+/// cannot be staged and the test skips.
+#[cfg(windows)]
+#[test]
+fn symlinked_source_is_refused_on_windows_too() {
+    use std::os::windows::fs::symlink_dir;
+
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let before = fs::read(&file).unwrap();
+    let link = fixture.dir_path().join("link.um");
+    if symlink_dir(fixture.dir_path(), &link).is_err() {
+        eprintln!("skipping: symlink_dir requires privileges on this host");
+        return;
+    }
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "delete", "id": "list000001"}]),
+    );
+    let run_with: [&[&str]; 2] = [&["--dry-run"], &[]];
+    for extra in run_with {
+        let mut args: Vec<String> = vec![
+            "apply".to_owned(),
+            link.to_string_lossy().into_owned(),
+            "--ops".to_owned(),
+            ops.clone(),
+            "--schema".to_owned(),
+            artifact.clone(),
+        ];
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        let output = insum().args(&args).output().unwrap();
+        assert!(!output.status.success(), "args: {args:?}");
+        let error = stderr_json(&output);
+        assert_eq!(
+            error["error"]["code"], "IO_ERROR",
+            "the link is refused before any work: {}",
+            error["error"]["code"]
+        );
+    }
+    // the target never got written through the link
+    assert_eq!(fs::read(&file).unwrap(), before, "bytes untouched");
 }
 
 #[cfg(unix)]
@@ -1165,6 +1504,58 @@ fn registry_codes_carry_exit_codes_and_hints() {
 }
 
 #[test]
+fn a_tampered_artifact_refuses_dry_run_and_commit_as_schema_mismatch() {
+    let fixture = Fixture::new();
+    let file = fixture.container();
+    let before = fs::read(&file).unwrap();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // add a field to the artifact body while keeping the declared
+    // schema_hash: the canonical fingerprint no longer matches (the
+    // hash_verified=false technique of migrate_ids' tampered-artifact test)
+    let mut tampered = artifact_json();
+    tampered["nodes"]["callout"] = json!({
+        "content": "inline*", "groups": ["block"], "attrs": {},
+        "marks": [], "addressable": true, "inline_content": true, "searchable": true
+    });
+    let artifact_path = fixture.dir_path().join("tampered.json");
+    fs::write(&artifact_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let artifact = artifact_path.to_string_lossy().into_owned();
+
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "delete", "id": "list000001"}]),
+    );
+    let run_with: [&[&str]; 2] = [&["--dry-run"], &[]];
+    for extra in run_with {
+        let mut args: Vec<String> = vec![
+            "apply".to_owned(),
+            file.clone(),
+            "--ops".to_owned(),
+            ops.clone(),
+            "--schema".to_owned(),
+            artifact.clone(),
+        ];
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        let output = insum().args(&args).output().unwrap();
+        assert!(!output.status.success(), "args: {args:?}");
+        let error = stderr_json(&output);
+        assert_eq!(
+            error["error"]["code"], "SCHEMA_MISMATCH",
+            "the tampered artifact refuses in mode {extra:?}: {}",
+            error["error"]["code"]
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "SCHEMA_MISMATCH exits 6 per §11"
+        );
+    }
+    assert_eq!(fs::read(&file).unwrap(), before, "bytes untouched");
+}
+
+#[test]
 fn package_envelope_violations_are_usage_errors() {
     let fixture = Fixture::new();
     let artifact = fixture.artifact();
@@ -1301,6 +1692,149 @@ fn limits_bound_the_package() {
     let error = stderr_json(&output);
     assert_eq!(error["error"]["code"], "LIMIT_EXCEEDED", "{error}");
     assert_eq!(output.status.code(), Some(5));
+
+    // UM_MAX_OPS_BYTES bounds the package bytes themselves (§5.5): 64 bytes
+    // is below every real envelope, so the reader refuses before parsing
+    let output = insum()
+        .env("UM_MAX_OPS_BYTES", "64")
+        .args([
+            "apply",
+            &file,
+            "--ops",
+            &ops,
+            "--schema",
+            &artifact,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    let error = stderr_json(&output);
+    assert_eq!(error["error"]["code"], "LIMIT_EXCEEDED", "{error}");
+    assert_eq!(output.status.code(), Some(5));
+}
+
+/// The output budget truncates the created-ID list explicitly — the write
+/// itself covered every operation, and the response says so with
+/// `truncated`, `created_ids_total` and an OUTPUT_BUDGET warning (§6.5).
+#[test]
+fn output_budget_truncates_created_ids_with_explicit_totals() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    const TOTAL: usize = 12;
+    let nodes: Vec<Value> = (0..TOTAL)
+        .map(|index| {
+            json!({"type": "paragraph", "attrs": {}, "content": [
+                {"type": "text", "text": format!("bulk-{index:02}")}
+            ]})
+        })
+        .collect();
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "insert_after", "id": "para000001", "nodes": nodes.clone()}]),
+    );
+
+    // commit: the envelope skeleton is charged first, the entries must fit
+    // the rest — 1500 bytes leaves room for only a prefix of 12 entries
+    let budget = 1500;
+    let output = insum()
+        .env("UM_MAX_OUTPUT_BYTES", budget.to_string())
+        .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["applied"], true);
+    assert_eq!(response["truncated"], true);
+    let created = response["created_ids"].as_array().unwrap();
+    let created_total = response["created_ids_total"].as_u64().unwrap() as usize;
+    assert_eq!(created_total, TOTAL, "the total names every created block");
+    assert!(
+        !created.is_empty(),
+        "the first entry is always kept (§6.5): {response}"
+    );
+    assert!(
+        created.len() < created_total,
+        "the list is actually cut: kept {} of {created_total}",
+        created.len()
+    );
+    // kept + dropped == total, and the warning names exactly the kept/total
+    // pair the array shows (the only honest dropped bookkeeping on the wire)
+    let warning = response["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|warning| warning["code"] == "OUTPUT_BUDGET")
+        .expect("the truncation carries an OUTPUT_BUDGET warning")
+        .clone();
+    let message = warning["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("{}/{} created", created.len(), created_total)),
+        "the warning names the kept/total pair: {message}"
+    );
+    // the serialized response stays within the budget (§5.5)
+    assert!(
+        output.stdout.len() <= budget,
+        "stdout {} exceeds the budget {budget}",
+        output.stdout.len()
+    );
+    // the write covered every operation despite the truncated report
+    let doc: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", fixture.note1()),
+    ))
+    .unwrap();
+    let texts: Vec<String> = doc["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["content"][0]["text"].as_str().map(str::to_owned))
+        .collect();
+    for index in 0..TOTAL {
+        assert!(
+            texts.contains(&format!("bulk-{index:02}")),
+            "bulk-{index:02} landed in the file: {texts:?}"
+        );
+    }
+
+    // dry-run: the count is complete, no final IDs are promised (§8.5) —
+    // and no truncation markers, since there is no created list to cut.
+    // The commit above moved the note revision, so the package is rebuilt
+    // from the current one.
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "insert_after", "id": "para000001", "nodes": nodes}]),
+    );
+    let output = insum()
+        .env("UM_MAX_OUTPUT_BYTES", budget.to_string())
+        .args([
+            "apply",
+            &file,
+            "--ops",
+            &ops,
+            "--schema",
+            &artifact,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["would_create_count"], TOTAL);
+    assert!(
+        response.get("created_ids").is_none(),
+        "dry-run carries no created_ids: {response}"
+    );
+    assert!(
+        response.get("truncated").is_none(),
+        "no created list, no truncation: {response}"
+    );
 }
 
 // ---------------------------------------------------------------------------
