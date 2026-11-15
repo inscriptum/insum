@@ -273,7 +273,10 @@ fn index_zero_returns_the_board_table() {
     let note = corpus.note_id();
     let value = run_json(&["table", "get", &file, "--note", &note, "--index", "0"]);
     assert_eq!(value["api_version"], 1);
-    assert_eq!(value["path"], file);
+    // CONTRACT (§5.2): JSON paths use `/` regardless of the OS — the
+    // expectation is the normalized form, never the OS-native argument
+    // string (a Windows temp path carries `\` and would never match).
+    assert_eq!(value["path"], file.replace('\\', "/"));
     assert_eq!(value["note_id"], note);
     assert!(value["note_rev"].as_str().unwrap().starts_with("sha256:"));
     let table = &value["table"];
