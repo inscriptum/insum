@@ -65,6 +65,14 @@ fn artifact_json() -> Value {
                                     "align": {"default": null}},
                           "marks": ["strong"],
                           "addressable": true, "inline_content": true, "searchable": true},
+            "bulletList": {"content": "listItem+", "groups": ["block"],
+                           "attrs": {"id": {"default": null}}, "marks": [],
+                           "addressable": true, "inline_content": false,
+                           "searchable": false},
+            "listItem": {"content": "paragraph block*", "groups": [],
+                         "attrs": {"id": {"default": null}}, "marks": [],
+                         "addressable": true, "inline_content": false,
+                         "searchable": false},
             "table": {"content": "tableRow+", "groups": ["block"],
                       "attrs": {"borders": {"default": null},
                                 "data": {"default": null},
@@ -1124,6 +1132,346 @@ fn upsert_table_row_creates_missing_cells_of_a_short_row() {
         .unwrap();
     let verdict: Value = serde_json::from_slice(&validate.stdout).unwrap();
     assert_eq!(verdict["valid"], true, "{verdict}");
+}
+
+/// Review MAJOR-1 repro: on a ragged row the created cells must sit at the
+/// positions the HEADER row defines for their columns — never in the order
+/// the payload keys happen to come in. The payload map reaches the engine
+/// as a BTreeMap (alphabetical), so a kanban [Data, Issue, Description]
+/// with a payload {Description, Issue} used to append the values in
+/// alphabetical order: the Description text landed in the Issue column and
+/// the row grew to 4 cells against 3 header columns while validate stayed
+/// green. Both JSON key orders must produce the same grid.
+#[test]
+fn upsert_table_row_places_created_cells_by_column_position() {
+    let fixture = Fixture::new();
+    let (table_id, ragged_row_id) = append_kanban3(&fixture);
+
+    // alphabetical order (Description sorts before Issue — the repro)
+    fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Data": "r"},
+                "row": {"Description": "desc-text", "Issue": "issue-text"}}]),
+    );
+    let doc = fixture.payload(&fixture.note1());
+    let row = find_row_by_id(&doc, &ragged_row_id);
+    let cells = row["content"].as_array().unwrap();
+    assert_eq!(
+        cells.len(),
+        3,
+        "the row must match the header width, not grow beyond it: {row}"
+    );
+    assert_eq!(cells[0]["content"][0]["content"][0]["text"], "r");
+    assert_eq!(
+        cells[1]["content"][0]["content"][0]["text"], "issue-text",
+        "column 1 (Issue) holds the Issue value: {row}"
+    );
+    assert_eq!(
+        cells[2]["content"][0]["content"][0]["text"], "desc-text",
+        "column 2 (Description) holds the Description value: {row}"
+    );
+
+    // reverse JSON key order — the wire map is normalized to alphabetical
+    // before the engine sees it, so the grid must come out identical
+    fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Issue": "issue-text"},
+                "row": {"Issue": "issue-text-2", "Data": "r2", "Description": "desc-text-2"}}]),
+    );
+    let doc = fixture.payload(&fixture.note1());
+    let row = find_row_by_id(&doc, &ragged_row_id);
+    let cells = row["content"].as_array().unwrap();
+    assert_eq!(cells.len(), 3, "{row}");
+    assert_eq!(cells[0]["content"][0]["content"][0]["text"], "r2");
+    assert_eq!(cells[1]["content"][0]["content"][0]["text"], "issue-text-2");
+    assert_eq!(cells[2]["content"][0]["content"][0]["text"], "desc-text-2");
+
+    let validate = insum()
+        .args(["validate", &fixture.file, "--schema", &fixture.artifact])
+        .output()
+        .unwrap();
+    let verdict: Value = serde_json::from_slice(&validate.stdout).unwrap();
+    assert_eq!(verdict["valid"], true, "{verdict}");
+}
+
+/// Gap columns between the row's cell run and the highest mentioned column
+/// get EMPTY cells placed at their header positions — the mentioned values
+/// never drift across them.
+#[test]
+fn upsert_table_row_creates_gap_cells_between_mentioned_columns() {
+    let fixture = Fixture::new();
+    let (table_id, ragged_row_id) = append_kanban3(&fixture);
+
+    fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Data": "r"},
+                "row": {"Data": "x", "Description": "y"}}]),
+    );
+    let doc = fixture.payload(&fixture.note1());
+    let row = find_row_by_id(&doc, &ragged_row_id);
+    let cells = row["content"].as_array().unwrap();
+    assert_eq!(cells.len(), 3, "{row}");
+    assert_eq!(cells[0]["content"][0]["content"][0]["text"], "x");
+    assert_eq!(
+        cells[1]["content"][0]["content"],
+        json!([]),
+        "the gap column (Issue) holds an empty paragraph: {row}"
+    );
+    assert_eq!(cells[2]["content"][0]["content"][0]["text"], "y");
+}
+
+/// MINOR-1: a cell that does not START with a paragraph is rebuilt as one
+/// fresh paragraph — the cell keeps its ID (`changed_ids`), the old blocks
+/// (a bullet list here) leave the note via `deleted_ids`, the new
+/// paragraph lands in `created_ids`.
+#[test]
+fn set_table_cell_rebuilds_a_cell_that_does_not_start_with_a_paragraph() {
+    let fixture = Fixture::new();
+    let response = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "append_child", "parent_id": null, "nodes": [
+            {"type": "table", "attrs": {}, "content": [
+                {"type": "tableRow", "attrs": {}, "content": [
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Tag"}]}
+                    ]}
+                ]},
+                {"type": "tableRow", "attrs": {}, "content": [
+                    {"type": "tableCell", "attrs": {}, "content": [
+                        {"type": "bulletList", "attrs": {}, "content": [
+                            {"type": "listItem", "attrs": {}, "content": [
+                                {"type": "paragraph", "attrs": {}, "content": [
+                                    {"type": "text", "text": "listed"}
+                                ]}
+                            ]}
+                        ]}
+                    ]}
+                ]}
+            ]}
+        ]}]),
+    );
+    // input nodes carry no IDs (§8.2) — capture the generated ones
+    let created = response["created_ids"].as_array().unwrap().clone();
+    let table_id = created[0]["id"].as_str().unwrap().to_owned();
+    let row_id = created
+        .iter()
+        .rev()
+        .find(|entry| entry["type"] == json!("tableRow"))
+        .expect("the data row is created")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cell_id = created
+        .iter()
+        .rev()
+        .find(|entry| entry["type"] == json!("tableCell"))
+        .expect("the data cell is created")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id_of = |kind: &str| -> String {
+        created
+            .iter()
+            .find(|entry| entry["type"] == json!(kind))
+            .unwrap_or_else(|| panic!("a created {kind}"))["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let rebuilt = [
+        id_of("bulletList"),
+        id_of("listItem"),
+        // the rebuilt-away inner paragraph: the LAST created paragraph (the
+        // first belongs to the header cell)
+        created
+            .iter()
+            .rev()
+            .find(|entry| entry["type"] == json!("paragraph"))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    ];
+
+    let response = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "set_table_cell", "id": table_id, "row": {"id": row_id},
+                "column": {"name": "Tag"}, "value": "plain now"}]),
+    );
+    let changed: Vec<&str> = response["changed_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        changed,
+        vec![cell_id.as_str()],
+        "the cell keeps its ID: {response}"
+    );
+    let created_now: Vec<&str> = response["created_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(created_now.len(), 1, "one fresh paragraph: {response}");
+    let mut deleted: Vec<&str> = response["deleted_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap())
+        .collect();
+    deleted.sort_unstable();
+    let mut expected = rebuilt.iter().map(String::as_str).collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(
+        deleted, expected,
+        "the rebuilt-away blocks leave the note: {response}"
+    );
+
+    let doc = fixture.payload(&fixture.note1());
+    let cell = find_cell_by_id(&doc, &cell_id);
+    let content = cell["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{cell}");
+    assert_eq!(content[0]["type"], "paragraph");
+    assert_eq!(content[0]["content"][0]["text"], "plain now");
+}
+
+/// MINOR-1: blocks after the first of a cell are removed — the first
+/// paragraph keeps its ID and gets the text, the rest leave the note via
+/// `deleted_ids`.
+#[test]
+fn set_table_cell_drops_blocks_after_the_first() {
+    let fixture = Fixture::new();
+    let response = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "append_child", "parent_id": null, "nodes": [
+            {"type": "table", "attrs": {}, "content": [
+                {"type": "tableRow", "attrs": {}, "content": [
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Tag"}]}
+                    ]}
+                ]},
+                {"type": "tableRow", "attrs": {}, "content": [
+                    {"type": "tableCell", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "keep"}]},
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "drop"}]}
+                    ]}
+                ]}
+            ]}
+        ]}]),
+    );
+    // input nodes carry no IDs (§8.2): created order is table, header row,
+    // header cell, header paragraph, data row, data cell, first paragraph,
+    // second paragraph
+    let created = response["created_ids"].as_array().unwrap().clone();
+    let table_id = created[0]["id"].as_str().unwrap().to_owned();
+    let row_id = created[4]["id"].as_str().unwrap().to_owned();
+    let cell_id = created[5]["id"].as_str().unwrap().to_owned();
+    let keep_id = created[6]["id"].as_str().unwrap().to_owned();
+    let drop_id = created[7]["id"].as_str().unwrap().to_owned();
+
+    let response = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "set_table_cell", "id": table_id, "row": {"id": row_id},
+                "column": {"name": "Tag"}, "value": "only this"}]),
+    );
+    let changed: Vec<&str> = response["changed_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(changed, vec![cell_id.as_str()], "{response}");
+    assert_eq!(
+        response["deleted_ids"],
+        json!([drop_id]),
+        "the second paragraph leaves the note: {response}"
+    );
+    assert_eq!(
+        response["created_ids"],
+        json!([]),
+        "the first paragraph keeps its identity"
+    );
+
+    let doc = fixture.payload(&fixture.note1());
+    let cell = find_cell_by_id(&doc, &cell_id);
+    let content = cell["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{cell}");
+    assert_eq!(content[0]["type"], "paragraph");
+    assert_eq!(
+        content[0]["attrs"]["id"], keep_id,
+        "the first paragraph keeps its ID"
+    );
+    assert_eq!(content[0]["content"][0]["text"], "only this");
+}
+
+/// A three-column kanban (Data | Issue | Description — the live issues.um
+/// shape) with one ragged data row (only the Data cell); returns the
+/// generated table ID and the generated ragged-row ID.
+fn append_kanban3(fixture: &Fixture) -> (String, String) {
+    let response = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "append_child", "parent_id": null, "nodes": [
+            {"type": "table", "attrs": {}, "content": [
+                {"type": "tableRow", "attrs": {}, "content": [
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Data"}]}
+                    ]},
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Issue"}]}
+                    ]},
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Description"}]}
+                    ]}
+                ]},
+                {"type": "tableRow", "attrs": {}, "content": [
+                    {"type": "tableCell", "attrs": {}, "content": [
+                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "r"}]}
+                    ]}
+                ]}
+            ]}
+        ]}]),
+    );
+    let created = response["created_ids"].as_array().unwrap();
+    let table_id = created[0]["id"].as_str().unwrap().to_owned();
+    let row_id = created
+        .iter()
+        .rev()
+        .find(|entry| entry["type"] == json!("tableRow"))
+        .expect("the ragged row is created")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (table_id, row_id)
+}
+
+/// The node carrying `attrs.id` anywhere in the document (positions shift
+/// across test steps, IDs do not).
+fn find_node_by_id<'a>(node: &'a Value, id: &str) -> Option<&'a Value> {
+    if node
+        .get("attrs")
+        .and_then(|attrs| attrs.get("id"))
+        .and_then(Value::as_str)
+        == Some(id)
+    {
+        return Some(node);
+    }
+    node.get("content")
+        .and_then(Value::as_array)
+        .and_then(|children| children.iter().find_map(|child| find_node_by_id(child, id)))
+}
+
+fn find_row_by_id<'a>(doc: &'a Value, id: &str) -> &'a Value {
+    find_node_by_id(doc, id).unwrap_or_else(|| panic!("row {id} in the payload"))
+}
+
+fn find_cell_by_id<'a>(doc: &'a Value, id: &str) -> &'a Value {
+    find_node_by_id(doc, id).unwrap_or_else(|| panic!("cell {id} in the payload"))
 }
 
 /// upsert_table_row with several key matches refuses (ambiguity), with a

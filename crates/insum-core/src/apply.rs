@@ -1643,40 +1643,72 @@ impl<'a> Engine<'a> {
                 let row_path = pointer_path(&row_entry.pointer).ok_or_else(|| {
                     UmError::internal(format!("row pointer {} does not parse", row_entry.pointer))
                 })?;
+                // CONTRACT (review MAJOR-1): the payload map reaches the
+                // engine as a BTreeMap (alphabetical), so the pair order
+                // carries NO positional meaning — sort by column index and
+                // let the HEADER ROW define where every cell lives. Appending
+                // created cells in pair order could place a value under a
+                // wrong column and grow a ragged row beyond the header width.
+                let mut writes: Vec<(usize, &str)> = row
+                    .iter()
+                    .zip(&row_columns)
+                    .map(|(pair, &index)| (index, pair.1.as_str()))
+                    .collect();
+                writes.sort_by_key(|&(index, _)| index);
+
                 let mut row_children_changed = false;
-                for (entry_pair, &column_index) in row.iter().zip(&row_columns) {
-                    // the column name resolved to `column_index` above; the
-                    // write only needs its text
-                    let text = entry_pair.1.clone();
-                    match row_entry.cells.get(column_index) {
-                        Some(cell) => {
-                            let cell_path = pointer_path(&cell.pointer).ok_or_else(|| {
-                                UmError::internal(format!(
-                                    "cell pointer {} does not parse",
-                                    cell.pointer
-                                ))
+                // 1) rewrite the existing cells — each write targets its own
+                //    node and mutates no sibling positions, so the order of
+                //    these writes cannot shift anything
+                for &(column_index, text) in &writes {
+                    let Some(cell) = row_entry.cells.get(column_index) else {
+                        continue;
+                    };
+                    let cell_path = pointer_path(&cell.pointer).ok_or_else(|| {
+                        UmError::internal(format!("cell pointer {} does not parse", cell.pointer))
+                    })?;
+                    let cell_node = node_at_mut(doc, &cell_path);
+                    self.write_cell_text(cell_node, text);
+                }
+                // 2) create the missing cells for the columns beyond the
+                //    row's cell run — in DESCENDING column order, each at the
+                //    array position the header row defines for that column
+                //    (a regular grid: position == column index). Descending
+                //    keeps the header positions valid across the insertions;
+                //    gap columns between the row's last cell and the highest
+                //    mentioned column get empty cells.
+                let existing_cells = row_entry.cells.len();
+                let highest_mentioned = writes.last().map(|&(index, _)| index);
+                if let Some(highest) = highest_mentioned
+                    && highest >= existing_cells
+                {
+                    let header_positions: Vec<usize> = entry
+                        .columns()
+                        .iter()
+                        .map(|cell| {
+                            pointer_path(&cell.pointer)
+                                .and_then(|path| path.last().copied())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    for column in (existing_cells..=highest).rev() {
+                        // mentioned columns carry the payload text, the gap
+                        // columns between them stay empty
+                        let text = writes
+                            .iter()
+                            .find(|&&(index, _)| index == column)
+                            .map(|&(_, text)| text)
+                            .unwrap_or("");
+                        let at = header_positions.get(column).copied().unwrap_or(column);
+                        let row_node = node_at_mut(doc, &row_path);
+                        let children = row_node
+                            .get_mut("content")
+                            .and_then(Value::as_array_mut)
+                            .ok_or_else(|| {
+                                UmError::internal("a projected row carries a content array")
                             })?;
-                            let cell_node = node_at_mut(doc, &cell_path);
-                            self.write_cell_text(cell_node, &text);
-                        }
-                        None => {
-                            // the row is short (ragged): create the missing
-                            // cells — the gap positions up to the target
-                            // column get empty cells, the target gets the
-                            // text; all of them are new blocks
-                            let row_node = node_at_mut(doc, &row_path);
-                            let children = row_node
-                                .get_mut("content")
-                                .and_then(Value::as_array_mut)
-                                .ok_or_else(|| {
-                                    UmError::internal("a projected row carries a content array")
-                                })?;
-                            while children.len() < column_index {
-                                children.push(new_table_cell(""));
-                            }
-                            children.push(new_table_cell(&text));
-                            row_children_changed = true;
-                        }
+                        children.insert(at.min(children.len()), new_table_cell(text));
+                        row_children_changed = true;
                     }
                 }
                 if row_children_changed && let Some(id) = row_entry.id.clone() {

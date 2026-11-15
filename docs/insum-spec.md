@@ -337,10 +337,13 @@ package is JSON read from a file or stdin (`-`):
   no data row matches the key columns (default bottom = after the last
   row, `top` = right after the header row) and rewrites the mentioned
   cells of the matched row otherwise (unmentioned cells stay; missing
-  cells of a short row are created); the whole table's header names must
-  be unique and every mentioned column must exist. A fresh row carries
-  one `tableCell` per header column (unmentioned columns empty) — the
-  row, its cells and their paragraphs are all new (`created_ids`).
+  cells of a short row are created — each at the position the header row
+  defines for its column, whatever order the payload keys come in);
+  `match` is optional: a package without it always inserts. The whole
+  table's header names must be unique and every mentioned column must
+  exist. A fresh row carries one `tableCell` per header column
+  (unmentioned columns empty) — the row, its cells and their paragraphs
+  are all new (`created_ids`).
   Values of all three operations are text-only in v1: unknown inline
   nodes of a replaced value/cell disappear with the replacement, and the
   table's `attrs.data` (`rowsCount`/`colsCount`) is left untouched — the
