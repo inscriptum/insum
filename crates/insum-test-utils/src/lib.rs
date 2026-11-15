@@ -18,11 +18,33 @@ use serde_json::{Value, json};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-/// Fixed ZIP entry metadata so fixture bytes are reproducible: the timestamp
-/// is pinned explicitly — with the `time` feature enabled, `default()` would
-/// stamp the current wall clock and break byte-determinism.
+/// Fixed ZIP entry metadata so fixture bytes are reproducible ON EVERY
+/// HOST: the timestamp is pinned explicitly (with the `time` feature
+/// enabled, `default()` would stamp the current wall clock), and the two
+/// fields the zip crate derives from the host OS are pinned to constants —
+///
+/// - `system` ("version made by" high byte): with `system: None` the
+///   crate picks `cfg!(windows) ? System::Dos : System::Unix`
+///   (zip 9.2.1 src/types.rs), so the same generator calls produced a
+///   different central-directory byte on Windows — the platform-dependent
+///   fixture bytes behind the windows-latest golden-gate failure;
+/// - `unix_permissions(0o644)`: without it the crate defaults to
+///   `0o644 | S_IFREG` for the external attributes; the pin guards the
+///   fixture contract against a future crate-default drift. Verified
+///   no-op in bytes: the crate's `normalize()` re-adds `S_IFREG` when the
+///   caller set permission bits only (zip 9.2.1 src/write/options.rs), so
+///   the effective external attributes stay `0x81a40000` — the fixture
+///   hash on unix hosts is unchanged and the committed goldens stay valid.
+///
+/// `large_file(false)` is the crate default, pinned for the same reason.
+/// The deflate stream is platform-independent by construction: flate2 is
+/// resolved to the pure-Rust zlib-rs backend on all targets (Cargo.lock).
 fn fixture_zip_options() -> SimpleFileOptions {
-    SimpleFileOptions::default().last_modified_time(zip::DateTime::default()) // 1980-01-01
+    SimpleFileOptions::default()
+        .last_modified_time(zip::DateTime::default()) // 1980-01-01
+        .system(zip::System::Unix)
+        .unix_permissions(0o644)
+        .large_file(false)
 }
 
 // ---------------------------------------------------------------------------
