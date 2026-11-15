@@ -500,6 +500,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "walkdir",
+ "windows-sys 0.59.0",
  "zip",
 ]
 

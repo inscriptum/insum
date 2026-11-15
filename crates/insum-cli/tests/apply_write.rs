@@ -707,6 +707,61 @@ fn replace_content_keeps_root_id_and_preserves_subtree_ids() {
     assert_eq!(item_paragraph["content"][1]["marks"][0]["type"], "strong");
 }
 
+/// D-COR-1: replace_content may RESTATE an ID from the replaced content —
+/// the restated element keeps its ID: it appears in neither created_ids nor
+/// deleted_ids, and the ID survives on the new content (§8.3, the same
+/// exception the replace subtree has).
+#[test]
+fn replace_content_may_restate_an_id_from_the_replaced_content() {
+    let fixture = Fixture::new();
+    let artifact = fixture.artifact();
+    let file = fixture.container();
+    let rev = note_rev(&mut insum(), &file, &fixture.note1());
+    // the listItem's current content carries para000003; the new content
+    // restates it on the replacement paragraph
+    let ops = package(
+        &fixture.dir_path(),
+        Some(&fixture.note1()),
+        &rev,
+        json!([{"op": "replace_content", "id": "item000001", "content": [
+            {"type": "paragraph", "attrs": {"id": "para000003"}, "content": [
+                {"type": "text", "text": "restated in place"}
+            ]}
+        ]}]),
+    );
+    let output = insum()
+        .args(["apply", &file, "--ops", &ops, "--schema", &artifact])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", stderr_json(&output));
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        response["created_ids"].as_array().unwrap().is_empty(),
+        "the restated ID is not created: {response}"
+    );
+    assert!(
+        response["deleted_ids"].as_array().unwrap().is_empty(),
+        "the restated ID is not deleted: {response}"
+    );
+    let doc: Value = serde_json::from_slice(&read_entry(
+        &file,
+        &format!("notes/{}.json", fixture.note1()),
+    ))
+    .unwrap();
+    // list > item > paragraph: the restated ID is on the new paragraph, the
+    // item's own ID is untouched by the content swap
+    let item = &doc["content"][4]["content"][0];
+    assert_eq!(item["attrs"]["id"], "item000001", "the target ID is kept");
+    assert_eq!(
+        item["content"][0]["attrs"]["id"], "para000003",
+        "the restated ID survives on the new content"
+    );
+    assert_eq!(
+        item["content"][0]["content"][0]["text"],
+        "restated in place"
+    );
+}
+
 #[test]
 fn replace_descendants_may_restate_ids_of_the_original_subtree() {
     let fixture = Fixture::new();
@@ -983,30 +1038,49 @@ fn a_live_dirty_lease_blocks_the_write() {
     );
 }
 
-/// The hostname a live-holder check compares against (lock.rs reads it from
-/// the OS; the test needs the same value for a lease this process "owns").
+/// The hostname a live-holder check compares against. TRAP (D-CON-1): the
+/// value must come from the SAME source lock.rs `current_hostname` reads —
+/// per-platform cfg branches mirroring it (unix: gethostname(2), windows:
+/// GetComputerNameExW). A test-only fallback ("unknown") would make the
+/// recorded holder cross-host on Windows, where lock.rs reads the real
+/// name: the dead-holder lease would then be judged by age instead of the
+/// pid check and the stale-lease test would fail deterministically.
+#[cfg(unix)]
 fn hostname() -> String {
-    #[cfg(unix)]
-    {
-        let mut buf = [0u8; 256];
-        let size = unsafe { libc_stub_hostname(&mut buf) };
-        if size > 0 {
-            return String::from_utf8_lossy(&buf[..size.min(255)]).into_owned();
-        }
+    let mut buf = [0u8; 256];
+    let size = unsafe { libc_stub_hostname(&mut buf) };
+    if size > 0 {
+        String::from_utf8_lossy(&buf[..size.min(255)]).into_owned()
+    } else {
+        String::from("unknown")
     }
-    String::from("unknown")
 }
 
-// A tiny indirection so the test does not need a libc dev-dependency: the
-// lease hostname only matters for the live-holder check, and the empty
-// fallback still blocks conservatively (hostname recorded ≠ local hostname
-// makes the holder check age-based, and a fresh lease blocks either way).
+#[cfg(windows)]
+fn hostname() -> String {
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNameDnsHostname, GetComputerNameExW,
+    };
+    // SAFETY: the documented two-call pattern — a null-buffer call for the
+    // required size in UTF-16 units, then a buffer of exactly that size
+    unsafe {
+        let mut size: u32 = 0;
+        let _ = GetComputerNameExW(ComputerNameDnsHostname, std::ptr::null_mut(), &mut size);
+        if size == 0 {
+            return String::from("unknown");
+        }
+        let mut buffer = vec![0u16; size as usize];
+        if GetComputerNameExW(ComputerNameDnsHostname, buffer.as_mut_ptr(), &mut size) == 0 {
+            return String::from("unknown");
+        }
+        String::from_utf16_lossy(&buffer[..size as usize])
+    }
+}
+
+// A tiny indirection so the unix test does not need a libc dev-dependency:
+// the same gethostname(2) call lock.rs makes, declared via extern.
 #[cfg(unix)]
 unsafe fn libc_stub_hostname(buf: &mut [u8; 256]) -> usize {
-    // gethostname(3) via extern — no extra dev-dependency
-    unsafe extern "C" {
-        fn gethostname(name: *mut u8, size: usize) -> i32;
-    }
     // SAFETY: gethostname writes at most `size` bytes into the buffer
     if unsafe { gethostname(buf.as_mut_ptr(), buf.len()) } == 0 {
         buf.iter().position(|b| *b == 0).unwrap_or(255)
@@ -1015,9 +1089,9 @@ unsafe fn libc_stub_hostname(buf: &mut [u8; 256]) -> usize {
     }
 }
 
-#[cfg(not(unix))]
-unsafe fn libc_stub_hostname(_buf: &mut [u8; 256]) -> usize {
-    0
+#[cfg(unix)]
+unsafe extern "C" {
+    fn gethostname(name: *mut u8, size: usize) -> i32;
 }
 
 /// The pid of a process that already exited: provably dead on this host,

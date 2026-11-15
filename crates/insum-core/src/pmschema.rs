@@ -36,6 +36,25 @@ use crate::model::{INLINE_NODE_TYPES, KNOWN_NODE_TYPES};
 use crate::schema::SchemaArtifact;
 use crate::validate::Diag;
 
+/// Bound for an attr key echoed inside a diagnostic message (D-SEC-3).
+const MAX_ECHOED_KEY_CHARS: usize = 128;
+
+/// TRAP (D-SEC-3): an echoed attr key is untrusted input up to
+/// UM_MAX_ENTRY_BYTES — splicing it whole into the warning doubles the
+/// bytes (2:1 amplification), and the output budget's oversized-first-entry
+/// exception would then emit the message whole. Both SCHEMA_ATTR_UNKNOWN
+/// sites (node attrs and mark attrs — the one source for the `validate`
+/// and `apply` paths) echo through this bound: a bounded prefix keeps the
+/// key recognizable, the ellipsis marks the cut.
+fn echo_key(key: &str) -> String {
+    if key.chars().count() <= MAX_ECHOED_KEY_CHARS {
+        return key.to_owned();
+    }
+    let mut bounded: String = key.chars().take(MAX_ECHOED_KEY_CHARS).collect();
+    bounded.push('…');
+    bounded
+}
+
 // ─── Content expression DFA (port of prosemirror-model content.ts) ───────
 
 /// Resource caps for compiling content expressions of an UNTRUSTED
@@ -847,7 +866,8 @@ impl PmSchema {
                     out.warnings.push(Diag {
                         code: "SCHEMA_ATTR_UNKNOWN",
                         message: format!(
-                            "attr {key:?} on node type {type_name:?} is not declared in the applicable schema artifact (the editor drops it)"
+                            "attr {:?} on node type {type_name:?} is not declared in the applicable schema artifact (the editor drops it)",
+                            echo_key(key)
                         ),
                     });
                 }
@@ -985,7 +1005,8 @@ impl PmSchema {
                         out.warnings.push(Diag {
                             code: "SCHEMA_ATTR_UNKNOWN",
                             message: format!(
-                                "attr {key:?} on mark type {mark_type:?} is not declared in the applicable schema artifact (the editor drops it)"
+                                "attr {:?} on mark type {mark_type:?} is not declared in the applicable schema artifact (the editor drops it)",
+                                echo_key(key)
                             ),
                         });
                     }
@@ -1079,6 +1100,61 @@ mod tests {
 
     fn marked_text(s: &str, mark: &str) -> Value {
         json!({"type": "text", "text": s, "marks": [{"type": mark}]})
+    }
+
+    /// D-SEC-3: an untrusted attr key echoed in SCHEMA_ATTR_UNKNOWN is
+    /// bounded — a 4MiB key must not double into an ~8MiB warning message
+    /// that the output budget's oversized-first-entry exception would emit
+    /// whole. Short keys are echoed verbatim (a 128-char key is already at
+    /// the bound and must not gain an ellipsis).
+    #[test]
+    fn echoed_attr_keys_are_bounded_in_warnings() {
+        let schema = PmSchema::build(&artifact()).unwrap();
+        // the KEY is the untrusted echo: a ~1KB attr key would otherwise
+        // double into the warning message
+        let long_key = "x".repeat(MAX_ECHOED_KEY_CHARS * 8);
+        let doc = json!({"type": "doc", "content": [
+            {"type": "section", "content": [
+                {"type": "heading", "attrs": {(long_key.clone()): "1"},
+                 "content": [text("T")]},
+                {"type": "para", "content": [text("a")]}
+            ]}
+        ]});
+        let result = schema.check_document(&doc);
+        assert!(result.valid(), "an unknown attr is a warning, not an error");
+        let warning = result
+            .warnings
+            .iter()
+            .find(|diag| diag.code == "SCHEMA_ATTR_UNKNOWN")
+            .expect("the unknown attr carries its warning");
+        assert!(
+            warning.message.len() < MAX_ECHOED_KEY_CHARS * 2,
+            "the echoed key is bounded: {} bytes",
+            warning.message.len()
+        );
+        assert!(warning.message.contains('…'), "the cut is marked");
+        assert!(warning.message.contains("on node type \"heading\""));
+
+        // a key at the bound itself is echoed verbatim, without the marker
+        let bounded_key = "x".repeat(MAX_ECHOED_KEY_CHARS);
+        let doc = json!({"type": "doc", "content": [
+            {"type": "section", "content": [
+                {"type": "heading", "attrs": {(bounded_key): "1"},
+                 "content": [text("T")]},
+                {"type": "para", "content": [text("a")]}
+            ]}
+        ]});
+        let warning = schema
+            .check_document(&doc)
+            .warnings
+            .into_iter()
+            .find(|diag| diag.code == "SCHEMA_ATTR_UNKNOWN")
+            .unwrap();
+        assert!(
+            !warning.message.contains('…'),
+            "a key at the bound is not cut: {}",
+            warning.message.len()
+        );
     }
 
     #[test]

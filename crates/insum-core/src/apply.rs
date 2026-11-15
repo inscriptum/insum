@@ -1206,7 +1206,7 @@ fn commit_um_locked(
                 .with_details(json!({
                     "expected_file_rev": file_rev_snapshot,
                     "actual_file_rev": file_rev_now,
-                    "attempts": re_applications,
+                    "re_applications": re_applications,
                 })));
             }
             let fresh_descriptor = match container.find_note_by_path(&descriptor.path) {
@@ -1364,7 +1364,7 @@ pub fn apply_note_file(
     let package = parse_package(package_bytes, limits, false, if_match)?;
 
     // plan phase (pre-lock): open, CAS, apply, validate
-    let (note_file, _raw) = NoteFile::open_with_raw(path, limits, true)?;
+    let (note_file, raw) = NoteFile::open_with_raw(path, limits, true)?;
     let marked = note_file
         .note
         .features
@@ -1385,21 +1385,29 @@ pub fn apply_note_file(
         &pm,
         limits,
     )?;
-    // plan == commit (D-4 discipline of migrate): the commit rebuilds the
-    // envelope from the fresh raw payload and refuses an envelope whose
-    // `features` / `schema` fields are absent or not objects — the plan
-    // refuses with the same code first (a green dry-run promises a green
-    // commit)
-    if let Some(features) = &note_file.features
-        && !features.is_object()
-    {
-        return Err(envelope_field_shape_error("features"));
-    }
-    if marked {
-        match &note_file.schema {
-            Some(schema_field) if schema_field.is_object() => {}
-            _ => return Err(envelope_field_shape_error("schema")),
-        }
+    // plan == commit (D-4 discipline of migrate): the envelope is built and
+    // shape-checked exactly as the commit builds it (unknown fields
+    // preserved, `features`/`schema` object shape refused with the same
+    // code), and — D-SEC-1 — its serialized size IS the staged size the
+    // commit produces, so an oversized result refuses HERE: before the
+    // dry-run answers green and before the lock is taken. The commit-only
+    // refusal after the staged write was a plan != commit hole (SEC-2 side
+    // effect). WHY the second bounded parse of the same bytes: an estimate
+    // over the preserved unknown fields can only under-count; the CAS gate
+    // makes this raw the bytes the commit re-reads, so the measurement is
+    // exact.
+    let committed =
+        committed_note_envelope(&raw, note_file.note.envelope, plan.doc.clone(), limits)?;
+    let committed_bytes = serde_json::to_vec(&committed)
+        .map_err(|err| UmError::internal(format!("envelope does not serialize: {err}")))?;
+    if committed_bytes.len() > limits.max_entry_bytes {
+        // the same verdict the commit's staged re-read produces
+        // (`container::read_bounded`), now on the plan
+        return Err(limit_exceeded(format!(
+            "{} exceeds UM_MAX_ENTRY_BYTES ({} bytes)",
+            path.display(),
+            limits.max_entry_bytes
+        )));
     }
 
     check_sidecar_name_fits(path)?;
@@ -1428,6 +1436,48 @@ pub fn apply_note_file(
     }
 }
 
+/// The committed `.note` envelope: the fresh raw payload is parsed and its
+/// unknown top-level fields are preserved as values (§12 — anything that
+/// cannot be preserved must abort the write, not be dropped silently), the
+/// known fields are re-stamped and `document` is swapped for `doc`.
+/// Shared by the commit and the plan-phase size gate (D-SEC-1) so the two
+/// cannot drift: the plan measures exactly the bytes the commit writes —
+/// the CAS gate makes the plan-phase and commit-phase raw payloads
+/// byte-identical, so both calls build the same value.
+fn committed_note_envelope(
+    raw: &[u8],
+    already_envelope: bool,
+    doc: Value,
+    limits: &Limits,
+) -> Result<Value, UmError> {
+    let mut envelope: Value = if already_envelope {
+        let text = String::from_utf8(raw.to_vec())
+            .map_err(|err| UmError::internal(format!("envelope is not UTF-8: {err}")))?;
+        crate::container::parse_json_limited(&text, limits.max_depth, ErrorCode::NoteJsonInvalid)?
+    } else {
+        json!({})
+    };
+    {
+        let map = envelope
+            .as_object_mut()
+            .ok_or_else(|| UmError::internal("envelope root must be an object"))?;
+        map.insert("format".to_owned(), json!("inscriptum-note"));
+        map.insert("version".to_owned(), json!(1));
+        match map.get_mut("features") {
+            Some(Value::Object(features)) => {
+                features.insert("block_ids".to_owned(), json!(1));
+            }
+            _ => return Err(envelope_field_shape_error("features")),
+        }
+        match map.get_mut("schema") {
+            Some(Value::Object(_)) => {}
+            _ => return Err(envelope_field_shape_error("schema")),
+        }
+        map.insert("document".to_owned(), doc);
+    }
+    Ok(envelope)
+}
+
 /// Lock-held commit of a `.note` apply: the fresh read must match the plan
 /// generation (same digest — for `.note` any file change is a target
 /// change), the envelope is rebuilt from the fresh raw bytes with unknown
@@ -1452,34 +1502,7 @@ fn commit_note_locked(
             "the .note file",
         ));
     }
-    // the envelope is built ON the fresh raw payload when one exists:
-    // unknown top-level fields are preserved as values (§12 — anything that
-    // cannot be preserved must abort the write, not be dropped silently)
-    let mut envelope: Value = if already_envelope {
-        let text = String::from_utf8(fresh_raw)
-            .map_err(|err| UmError::internal(format!("envelope is not UTF-8: {err}")))?;
-        crate::container::parse_json_limited(&text, limits.max_depth, ErrorCode::NoteJsonInvalid)?
-    } else {
-        json!({})
-    };
-    {
-        let map = envelope
-            .as_object_mut()
-            .ok_or_else(|| UmError::internal("envelope root must be an object"))?;
-        map.insert("format".to_owned(), json!("inscriptum-note"));
-        map.insert("version".to_owned(), json!(1));
-        match map.get_mut("features") {
-            Some(Value::Object(features)) => {
-                features.insert("block_ids".to_owned(), json!(1));
-            }
-            _ => return Err(envelope_field_shape_error("features")),
-        }
-        match map.get_mut("schema") {
-            Some(Value::Object(_)) => {}
-            _ => return Err(envelope_field_shape_error("schema")),
-        }
-        map.insert("document".to_owned(), plan.doc.clone());
-    }
+    let envelope = committed_note_envelope(&fresh_raw, already_envelope, plan.doc.clone(), limits)?;
     let new_bytes = serde_json::to_vec(&envelope)
         .map_err(|err| UmError::internal(format!("envelope does not serialize: {err}")))?;
 
@@ -1525,6 +1548,11 @@ fn envelope_field_shape_error(field: &str) -> UmError {
     UmError::new(
         ErrorCode::NoteDocInvalid,
         format!("the envelope {field} field is not an object; fix the data before writing"),
+    )
+    // D-CON-9: without a route out of the envelope-shape refusal, the agent
+    // has nothing to do with the verdict — the plugin owns the envelope.
+    .with_hint(
+        "Re-open the document in the editor so the plugin re-stamps the envelope, or fix the file by hand; nothing was written.",
     )
 }
 
@@ -1606,27 +1634,48 @@ fn commit_response(
 /// The OUTPUT_BUDGET warning of a truncated ID list. One source for the
 /// real warning and for the envelope skeleton the budget measures over —
 /// the two cannot drift apart (D-1, same discipline as migrate's).
+/// Mode-aware (D-COR-2, migrate's D-2): on a dry-run nothing was applied,
+/// so the committed "the operation itself covered every operation" clause
+/// would be a lie — the dry-run names the plan instead.
 fn id_list_budget_warning(
     created_returned: usize,
     created_total: usize,
     deleted_returned: usize,
     deleted_total: usize,
+    dry_run: bool,
 ) -> Value {
+    let message = if dry_run {
+        format!(
+            "the plan holds {created_returned}/{created_total} created and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the dry-run applied nothing — re-run without --dry-run to cover every operation, or raise UM_MAX_OUTPUT_BYTES to enumerate the plan"
+        )
+    } else {
+        format!(
+            "the id lists hold {created_returned}/{created_total} created and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs"
+        )
+    };
     json!({
         "code": "OUTPUT_BUDGET",
-        "message": format!(
-            "the id lists hold {created_returned}/{created_total} created and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs",
-        ),
+        "message": message,
     })
 }
 
 /// The OUTPUT_BUDGET warning of a truncated warnings list (COR-4). One
 /// source for the real warning and for the envelope skeleton (D-1).
-fn warnings_budget_warning(warnings_returned: usize, warnings_total: usize) -> Value {
+/// Mode-aware (D-COR-2): the dry-run variant never claims coverage.
+fn warnings_budget_warning(
+    warnings_returned: usize,
+    warnings_total: usize,
+    dry_run: bool,
+) -> Value {
+    let route = if dry_run {
+        "the dry-run applied nothing — re-run without --dry-run or run `insum validate` to enumerate the remaining diagnostics"
+    } else {
+        "the operation itself covered every operation — run `insum validate` on the note to enumerate the remaining diagnostics"
+    };
     json!({
         "code": "OUTPUT_BUDGET",
         "message": format!(
-            "the warnings hold {warnings_returned}/{warnings_total} entries to fit the output budget; the operation itself covered every operation — run `insum validate` on the note to enumerate the remaining diagnostics",
+            "the warnings hold {warnings_returned}/{warnings_total} entries to fit the output budget; {route}",
         ),
     })
 }
@@ -1718,6 +1767,7 @@ fn budget_response(
                     created_json.len(),
                     deleted_json.len() - deleted_dropped,
                     deleted_json.len(),
+                    dry_run,
                 ),
             );
         }
@@ -1727,6 +1777,7 @@ fn budget_response(
                 warnings_budget_warning(
                     warnings_json.len() - warnings_dropped,
                     warnings_json.len(),
+                    dry_run,
                 ),
             );
         }
@@ -1737,7 +1788,9 @@ fn budget_response(
 /// Response envelope overhead measured over the largest possible skeleton
 /// (committed, truncated, both ID-list totals, the warnings total and BOTH
 /// OUTPUT_BUDGET texts) — the budget must hold for whichever shape is
-/// finally emitted (§6.5, same discipline as migrate's D-1).
+/// finally emitted (§6.5, same discipline as migrate's D-1). The warning
+/// texts are the committed variants: the longest of the two mode shapes
+/// (D-COR-2, migrate's D-2 skeleton rule).
 fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
     let skeleton = json!({
         "api_version": 1,
@@ -1760,11 +1813,17 @@ fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
         "truncated": true,
         "warnings_total": 0,
         "warnings": [
-            id_list_budget_warning(0, 0, 0, 0),
-            warnings_budget_warning(0, 0),
+            id_list_budget_warning(0, 0, 0, 0, false),
+            warnings_budget_warning(0, 0, false),
         ],
     });
-    serde_json::to_string(&skeleton).map_or(1024, |s| s.len() + 16)
+    // TRAP (D-SEC-2): the slack must cover the digit-width growth of the
+    // real counts against the skeleton's zeros. Six-digit totals widen the
+    // three `*_total` fields AND the kept/total pairs inside BOTH warning
+    // texts — together ~48-64 bytes when the returned counts are six-digit
+    // too; the former 16-byte slack did not hold that and let such a
+    // response exceed UM_MAX_OUTPUT_BYTES by a few bytes.
+    serde_json::to_string(&skeleton).map_or(1024, |s| s.len() + 96)
 }
 
 // ---------------------------------------------------------------------------
@@ -2124,6 +2183,89 @@ mod tests {
             )
             .unwrap()
         }
+
+        /// A plan with six-figure bookkeeping for the budget shapes (D-SEC-2,
+        /// D-COR-2): `created` id-less paragraphs appended by one operation,
+        /// `deleted` existing id-ed paragraphs removed by one delete op each,
+        /// and `warnings` unknown-attr parity diagnostics. The harness container
+        /// is too small, so the helper writes its own plain-page container
+        /// (no noteTitle — no created/noise beyond the parameters).
+        fn bulk_plan(
+            &self,
+            created: usize,
+            deleted: usize,
+            warnings: usize,
+        ) -> (PathBuf, Generation) {
+            let limits = self.limits();
+            let note_id = insum_test_utils::ulid_seq(11);
+            let path = self._dir.path().join("bulk.um");
+            let doomed: Vec<Value> = (0..deleted)
+                .map(|index| {
+                    json!({
+                        "type": "paragraph",
+                        "attrs": {"id": format!("d{index:09}")},
+                        "content": [{"type": "text", "text": "doomed"}]
+                    })
+                })
+                .collect();
+            insum_test_utils::write_um(
+                &path,
+                &[insum_test_utils::FixtureNote::plain_page(
+                    &note_id, "Bulk", &doomed,
+                )],
+            )
+            .unwrap();
+
+            let mut container = UmContainer::open(&path, &limits).unwrap();
+            let descriptor = container.find_note(&note_id).unwrap().clone();
+            let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+
+            // deletes run first, on the small document; the bulk append lands
+            // after them so its created blocks occupy /content/0..
+            let mut operations: Vec<Operation> = (0..deleted)
+                .map(|index| Operation::Delete {
+                    id: format!("d{index:09}"),
+                })
+                .collect();
+            let mut attrs = Map::new();
+            for index in 0..warnings {
+                attrs.insert(format!("zz{index:04}"), json!(index));
+            }
+            let mut nodes = vec![json!({
+                "type": "paragraph",
+                "attrs": Value::Object(attrs),
+                "content": [{"type": "text", "text": "noisy"}],
+            })];
+            for _ in 0..created.saturating_sub(1) {
+                nodes.push(json!({
+                    "type": "paragraph",
+                    "attrs": {},
+                    "content": [{"type": "text", "text": "bulk"}],
+                }));
+            }
+            operations.push(Operation::AppendChild {
+                parent_id: None,
+                nodes,
+            });
+
+            let package = Package {
+                note_id: Some(note_id.clone()),
+                base_note_rev: parsed.note_rev.clone(),
+                if_match: None,
+                operations,
+            };
+            let plan = build_generation(
+                &parsed.note.doc,
+                &package,
+                &self.rules,
+                &self.generator,
+                &self.addressable,
+                &self.pm,
+                &limits,
+            )
+            .unwrap();
+            (path, plan)
+        }
     }
 
     use std::path::PathBuf;
@@ -2251,7 +2393,7 @@ mod tests {
         assert_eq!(
             err.details
                 .as_ref()
-                .and_then(|details| details.get("attempts"))
+                .and_then(|details| details.get("re_applications"))
                 .and_then(Value::as_u64),
             Some(0),
             "details: {err:?}"
@@ -2355,6 +2497,145 @@ mod tests {
         let ia2 = texts.iter().position(|t| t == "a2").unwrap();
         let ib1 = texts.iter().position(|t| t == "b1").unwrap();
         assert!(ia1 < ia2 && ia2 < ib1, "group order kept: {texts:?}");
+    }
+
+    /// D-COR-4: duplicate IDs in the SOURCE keep the engine's incremental
+    /// live counts equivalent to a fresh scan (the SEC-4 counts discipline).
+    /// The same attrs.id on two blocks: deleting one occurrence must still
+    /// count the second as live — restating the ID then conflicts
+    /// (ID_CONFLICT), it must NOT degrade to BLOCK_ID_IMMUTABLE, which is
+    /// the verdict a fresh scan produces only over a single-occurrence
+    /// source. When the corrected package removes both occurrences, the ID
+    /// lands in deleted_ids exactly once.
+    #[test]
+    fn duplicate_ids_in_the_source_stay_count_equivalent_to_a_fresh_scan() {
+        let h = Harness::new();
+        let limits = h.limits();
+        let doc = serde_json::json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "attrs": {"id": "t1tl2e3h4e"},
+                 "content": [{"type": "text", "text": "Alpha"}]},
+                {"type": "paragraph", "attrs": {"id": "dup0000001"},
+                 "content": [{"type": "text", "text": "first"}]},
+                {"type": "paragraph", "attrs": {"id": "dup0000001"},
+                 "content": [{"type": "text", "text": "second"}]}
+            ]
+        });
+        let package = |operations| Package {
+            note_id: Some(h.note1.clone()),
+            base_note_rev: format!("sha256:{}", "0".repeat(64)),
+            if_match: None,
+            operations,
+        };
+
+        // delete one occurrence, then restate the deleted ID onto the
+        // surviving title's content: the second occurrence is still live,
+        // so the restate is ID_CONFLICT
+        let restate = || {
+            vec![
+                Operation::Delete {
+                    id: "dup0000001".to_owned(),
+                },
+                Operation::ReplaceContent {
+                    id: "t1tl2e3h4e".to_owned(),
+                    content: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {"id": "dup0000001"},
+                        "content": [{"type": "text", "text": "restated"}]
+                    })],
+                },
+            ]
+        };
+        let err = build_generation(
+            &doc,
+            &package(restate()),
+            &h.rules,
+            &h.generator,
+            &h.addressable,
+            &h.pm,
+            &limits,
+        )
+        .expect_err("the restate conflicts with the surviving occurrence");
+        assert_eq!(err.code, ErrorCode::IdConflict, "code: {err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|details| details.get("operation_index"))
+                .and_then(Value::as_u64),
+            Some(1),
+            "details: {err:?}"
+        );
+
+        // the fresh-scan contrast: over a source with ONE occurrence the
+        // same restate after the delete is BLOCK_ID_IMMUTABLE — the counts
+        // track a fresh scan on both source shapes
+        let single = serde_json::json!({
+            "type": "noteDoc",
+            "content": [
+                {"type": "noteTitle", "attrs": {"id": "t1tl2e3h4e"},
+                 "content": [{"type": "text", "text": "Alpha"}]},
+                {"type": "paragraph", "attrs": {"id": "dup0000001"},
+                 "content": [{"type": "text", "text": "only"}]}
+            ]
+        });
+        let err = build_generation(
+            &single,
+            &package(restate()),
+            &h.rules,
+            &h.generator,
+            &h.addressable,
+            &h.pm,
+            &limits,
+        )
+        .expect_err("a fresh ID after the delete is CLI-managed");
+        assert_eq!(err.code, ErrorCode::BlockIdImmutable, "code: {err:?}");
+
+        // the corrected package: the ID dies only when BOTH occurrences are
+        // removed (a replace keeps its target's ID), and the fresh block
+        // receives a generated ID — the deleted ID is reported exactly once
+        let generation = build_generation(
+            &doc,
+            &package(vec![
+                Operation::Delete {
+                    id: "dup0000001".to_owned(),
+                },
+                Operation::Delete {
+                    id: "dup0000001".to_owned(),
+                },
+                Operation::AppendChild {
+                    parent_id: None,
+                    nodes: vec![serde_json::json!({
+                        "type": "paragraph",
+                        "attrs": {},
+                        "content": [{"type": "text", "text": "fresh"}]
+                    })],
+                },
+            ]),
+            &h.rules,
+            &h.generator,
+            &h.addressable,
+            &h.pm,
+            &limits,
+        )
+        .expect("both occurrences removed");
+        assert_eq!(
+            generation.deleted_ids,
+            vec!["dup0000001".to_owned()],
+            "the duplicate is named exactly once: {:?}",
+            generation.deleted_ids
+        );
+        assert_eq!(generation.created.len(), 1, "{:?}", generation.created);
+        assert_ne!(
+            generation.created[0].id, "dup0000001",
+            "a deleted ID is never reused"
+        );
+        let mut leftover = Vec::new();
+        collect_ids(&generation.doc, h.rules.attrs_key(), &mut leftover);
+        assert!(
+            !leftover.contains(&"dup0000001".to_owned()),
+            "no occurrence survives: {leftover:?}"
+        );
     }
 
     /// The wire rule (§8.2): a replace whose input re-states the target id
@@ -2955,6 +3236,11 @@ mod tests {
             message.contains("insum validate"),
             "the warning names the route to the remainder: {message}"
         );
+        // D-COR-2: the dry-run shape never claims the write covered anything
+        assert!(
+            message.contains("the dry-run applied nothing"),
+            "the dry-run variant of the warning: {message}"
+        );
 
         // the commit response shares the same discipline: the warnings fit
         // into what the created/deleted lists left over, the lists stay
@@ -2994,6 +3280,13 @@ mod tests {
                     warnings.len() - 1
                 )),
             "the committed warning names the honest counts"
+        );
+        assert!(
+            warnings.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .contains("the operation itself covered every operation"),
+            "the committed variant keeps the coverage clause (D-COR-2)"
         );
     }
 
@@ -3044,6 +3337,207 @@ mod tests {
         assert_eq!(
             response["deleted_ids"].as_array().unwrap().len(),
             plan.deleted_ids.len()
+        );
+    }
+
+    /// D-SEC-1: an oversized `.note` RESULT refuses on the PLAN with the
+    /// code the commit's staged re-read produces (`container::read_bounded`,
+    /// LIMIT_EXCEEDED) — dry-run and commit refuse alike and the file is
+    /// untouched. The commit-only refusal after the staged write was a
+    /// plan != commit hole (SEC-2 side effect): a green dry-run promised a
+    /// red commit. The gate is proportional: the same package over the
+    /// default limit commits.
+    #[test]
+    fn oversized_note_result_refuses_on_plan_like_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let artifact = dir.path().join("artifact.json");
+        std::fs::write(&artifact, serde_json::to_vec(&*TEST_ARTIFACT).unwrap()).unwrap();
+        let path = dir.path().join("doc.note");
+        let envelope = serde_json::json!({
+            "format": "inscriptum-note",
+            "version": 1,
+            "features": {"block_ids": 1},
+            "schema": {"id": "inscriptum"},
+            "document": {
+                "type": "noteDoc",
+                "content": [
+                    {"type": "noteTitle", "attrs": {"id": "t1tl2e3h4e"},
+                     "content": [{"type": "text", "text": "Alpha"}]},
+                    {"type": "paragraph", "attrs": {"id": "para1a2b3c"},
+                     "content": [{"type": "text", "text": "one"}]}
+                ]
+            }
+        });
+        std::fs::write(&path, envelope.to_string()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let package = serde_json::json!({
+            "api_version": 1,
+            "note_id": Value::Null,
+            "base_note_rev": note_rev_for_file_bytes(&before),
+            "operations": [{
+                "op": "append_child",
+                "parent_id": null,
+                "nodes": [{"type": "paragraph", "attrs": {},
+                           "content": [{"type": "text", "text": "x".repeat(4096)}]}]
+            }],
+        });
+        let bytes = serde_json::to_vec(&package).unwrap();
+
+        // tight enough that the RESULT (~5KB) exceeds it while the source
+        // (~800B) passes the read cap
+        let mut limits = Limits::defaults();
+        limits.max_entry_bytes = 2048;
+
+        let dry = apply_note_file(&path, &bytes, None, Some(&artifact), true, &limits)
+            .expect_err("the plan refuses the oversized result");
+        assert_eq!(dry.code, ErrorCode::LimitExceeded, "code: {dry:?}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the dry-run touched nothing"
+        );
+
+        let commit = apply_note_file(&path, &bytes, None, Some(&artifact), false, &limits)
+            .expect_err("the commit refuses with the same code");
+        assert_eq!(commit.code, ErrorCode::LimitExceeded, "code: {commit:?}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the refusal touched nothing"
+        );
+
+        let limits = Limits::defaults();
+        apply_note_file(&path, &bytes, None, Some(&artifact), false, &limits)
+            .expect("the same package fits the default limit and commits");
+    }
+
+    /// D-SEC-2: the envelope skeleton's slack covers the digit-width growth
+    /// of the real counts. Six-digit totals over a small budget truncate all
+    /// three lists — the totals and BOTH warning texts widen against the
+    /// skeleton together (~48-64 bytes), which the former 16-byte slack did
+    /// not hold: the serialized response could exceed UM_MAX_OUTPUT_BYTES.
+    #[test]
+    fn six_digit_totals_stay_inside_the_output_budget() {
+        let h = Harness::new();
+        let (path, plan) = h.bulk_plan(100_000, 300, 40);
+        let mut limits = h.limits();
+        limits.max_output_bytes = 16384;
+
+        let response = commit_response(
+            &path,
+            Some(&h.note1),
+            &plan,
+            "old",
+            "new",
+            "old",
+            "new",
+            &limits,
+        );
+        let bytes = serde_json::to_string(&response).unwrap();
+        let warnings_total = plan.warnings.len();
+        assert_eq!(response["truncated"], true, "all three lists are cut");
+        assert_eq!(response["created_ids_total"], 100_000, "six-digit total");
+        assert_eq!(response["deleted_ids_total"], 300);
+        assert_eq!(response["warnings_total"], warnings_total);
+        let created = response["created_ids"].as_array().unwrap();
+        assert!(
+            created.len() > 50 && created.len() < 100_000,
+            "hundreds of entries are kept, the rest cut: {}",
+            created.len()
+        );
+        assert!(
+            bytes.len() <= limits.max_output_bytes,
+            "the response ({} bytes) exceeds the budget {}",
+            bytes.len(),
+            limits.max_output_bytes
+        );
+        let id_message = id_warning_message(&response);
+        assert!(
+            id_message.contains("the operation itself covered every operation"),
+            "{id_message}"
+        );
+
+        // the dry-run shape of the same plan: the mode-aware text (D-COR-2)
+        // and the budget bound
+        let mut small = h.limits();
+        small.max_output_bytes = 3000;
+        let response = dry_run_response(&path, Some(&h.note1), &plan, &small);
+        let bytes = serde_json::to_string(&response).unwrap();
+        assert!(
+            bytes.len() <= small.max_output_bytes,
+            "the dry-run response ({} bytes) exceeds the budget {}",
+            bytes.len(),
+            small.max_output_bytes
+        );
+        assert_eq!(response["truncated"], true);
+        let message = id_warning_message(&response);
+        assert!(message.contains("the plan holds"), "{message}");
+        assert!(message.contains("the dry-run applied nothing"), "{message}");
+    }
+
+    /// The OUTPUT_BUDGET warning of the truncated ID lists (both lists share
+    /// one warning; the warnings-list warning reads differently).
+    fn id_warning_message(response: &Value) -> String {
+        response["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|warning| {
+                warning["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("created and"))
+            })
+            .expect("the truncated ID lists carry their warning")["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// D-COR-2: the OUTPUT_BUDGET texts are mode-aware. A truncated dry-run
+    /// must not claim "the operation itself covered every operation" —
+    /// nothing was applied; it names the plan and the way out instead. The
+    /// committed variant keeps the coverage clause (migrate's D-2 split).
+    #[test]
+    fn id_list_budget_warning_is_mode_aware() {
+        let h = Harness::new();
+        let (path, plan) = h.bulk_plan(1, 300, 0);
+        let mut limits = h.limits();
+        limits.max_output_bytes = 2500;
+
+        let dry = dry_run_response(&path, Some(&h.note1), &plan, &limits);
+        assert_eq!(dry["truncated"], true);
+        let message = id_warning_message(&dry);
+        assert!(message.contains("the plan holds"), "{message}");
+        assert!(message.contains("the dry-run applied nothing"), "{message}");
+        assert!(
+            !message.contains("the operation itself covered"),
+            "the dry-run never claims coverage: {message}"
+        );
+        assert!(
+            serde_json::to_string(&dry).unwrap().len() <= limits.max_output_bytes,
+            "the dry-run response fits the budget"
+        );
+
+        let commit = commit_response(
+            &path,
+            Some(&h.note1),
+            &plan,
+            "old",
+            "new",
+            "old",
+            "new",
+            &limits,
+        );
+        assert_eq!(commit["truncated"], true);
+        let message = id_warning_message(&commit);
+        assert!(message.contains("the id lists hold"), "{message}");
+        assert!(
+            message.contains("the operation itself covered every operation"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("the dry-run applied nothing"),
+            "{message}"
         );
     }
 }
