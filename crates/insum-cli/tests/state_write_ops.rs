@@ -1223,6 +1223,138 @@ fn upsert_table_row_creates_gap_cells_between_mentioned_columns() {
     assert_eq!(cells[2]["content"][0]["content"][0]["text"], "y");
 }
 
+/// Review DELTA-1: a FAR column on a short row. The round-1 descending
+/// insert clamped at the row's current length, so the payload of a far
+/// column landed on the prefix and the intermediate pads stacked on top of
+/// it (5 columns, 1-cell row, payload for column 4 landed at index 2).
+/// Pad-then-write: the row is padded to the header width once (empty cells
+/// appended), then every mentioned column is written at its own index —
+/// row width == header width, payload on its column, gaps empty.
+#[test]
+fn upsert_table_row_writes_a_far_column_of_a_short_row_at_its_position() {
+    // 4 columns (2+ gap): payload for the last column only
+    let fixture = Fixture::new();
+    let (table_id, row_id) =
+        append_table_with_columns(&fixture, &["Data", "Issue", "Description", "Done"]);
+    fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Data": "r"},
+                "row": {"Done": "far4"}}]),
+    );
+    let doc = fixture.payload(&fixture.note1());
+    let row = find_row_by_id(&doc, &row_id);
+    let cells = row["content"].as_array().unwrap();
+    assert_eq!(cells.len(), 4, "row width == header width: {row}");
+    assert_eq!(cells[0]["content"][0]["content"][0]["text"], "r");
+    assert_eq!(cells[1]["content"][0]["content"], json!([]), "gap 1: {row}");
+    assert_eq!(cells[2]["content"][0]["content"], json!([]), "gap 2: {row}");
+    assert_eq!(
+        cells[3]["content"][0]["content"][0]["text"], "far4",
+        "the far column holds its payload: {row}"
+    );
+
+    // 5 columns (3+ gap) — the reviewer's shape: only the farthest column
+    // is mentioned (and it sorts first alphabetically, so the payload-key
+    // order cannot rescue the placement)
+    let fixture = Fixture::new();
+    let (table_id, row_id) = append_table_with_columns(
+        &fixture,
+        &["Data", "Issue", "Description", "Done", "Blocked"],
+    );
+    fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Data": "r"},
+                "row": {"Blocked": "far5"}}]),
+    );
+    let doc = fixture.payload(&fixture.note1());
+    let row = find_row_by_id(&doc, &row_id);
+    let cells = row["content"].as_array().unwrap();
+    assert_eq!(cells.len(), 5, "row width == header width: {row}");
+    assert_eq!(cells[0]["content"][0]["content"][0]["text"], "r");
+    for (gap, cell) in cells.iter().enumerate().skip(1).take(3) {
+        assert_eq!(cell["content"][0]["content"], json!([]), "gap {gap}: {row}");
+    }
+    assert_eq!(
+        cells[4]["content"][0]["content"][0]["text"], "far5",
+        "the farthest column holds its payload: {row}"
+    );
+
+    let validate = insum()
+        .args(["validate", &fixture.file, "--schema", &fixture.artifact])
+        .output()
+        .unwrap();
+    let verdict: Value = serde_json::from_slice(&validate.stdout).unwrap();
+    assert_eq!(verdict["valid"], true, "{verdict}");
+}
+
+/// The DELTA-1 cascade: after a far-column write the row must stay
+/// findable by its key — a repeated upsert UPDATES the row (the written
+/// cell lands in changed_ids, nothing is created, the table does not
+/// grow, the value changes).
+#[test]
+fn upsert_table_row_still_finds_the_row_after_a_far_column_write() {
+    let fixture = Fixture::new();
+    let (table_id, row_id) = append_table_with_columns(
+        &fixture,
+        &["Data", "Issue", "Description", "Done", "Blocked"],
+    );
+    let first = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Data": "r"},
+                "row": {"Blocked": "v1"}}]),
+    );
+    // the padding creates the cells for columns 1..4 (each with its
+    // paragraph); the far cell is the LAST created tableCell
+    let far_cell_id = first["created_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|entry| entry["type"] == json!("tableCell"))
+        .expect("the padded far cell is created")["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rows_before = table_row_count(&fixture, &table_id);
+
+    // the repeat matches by the FAR column itself — on the misplacing
+    // round-1 code the payload sat under a wrong column, the key found no
+    // row and the upsert silently inserted a duplicate
+    let response = fixture.apply(
+        &fixture.note1(),
+        json!([{"op": "upsert_table_row", "id": table_id,
+                "match": {"Blocked": "v1"},
+                "row": {"Blocked": "v2"}}]),
+    );
+    assert_eq!(
+        response["created_ids"],
+        json!([]),
+        "the row is found, not duplicated: {response}"
+    );
+    let changed: Vec<&str> = response["changed_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        changed,
+        vec![far_cell_id.as_str()],
+        "the matched row's far cell is rewritten in place: {response}"
+    );
+    assert_eq!(
+        table_row_count(&fixture, &table_id),
+        rows_before,
+        "no silent duplicate row"
+    );
+    let doc = fixture.payload(&fixture.note1());
+    let row = find_row_by_id(&doc, &row_id);
+    assert_eq!(row["content"][4]["content"][0]["content"][0]["text"], "v2");
+}
+
 /// MINOR-1: a cell that does not START with a paragraph is rebuilt as one
 /// fresh paragraph — the cell keeps its ID (`changed_ids`), the old blocks
 /// (a bullet list here) leave the note via `deleted_ids`, the new
@@ -1410,25 +1542,23 @@ fn set_table_cell_drops_blocks_after_the_first() {
     assert_eq!(content[0]["content"][0]["text"], "only this");
 }
 
-/// A three-column kanban (Data | Issue | Description — the live issues.um
-/// shape) with one ragged data row (only the Data cell); returns the
-/// generated table ID and the generated ragged-row ID.
-fn append_kanban3(fixture: &Fixture) -> (String, String) {
+/// A kanban table with the given column names and one ragged data row
+/// (only the FIRST column cell, text "r" — the live issues.um shape);
+/// returns the generated table ID and the generated ragged-row ID.
+fn append_table_with_columns(fixture: &Fixture, columns: &[&str]) -> (String, String) {
+    let headers: Vec<Value> = columns
+        .iter()
+        .map(|name| {
+            json!({"type": "tableHeader", "attrs": {}, "content": [
+                {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": name}]}
+            ]})
+        })
+        .collect();
     let response = fixture.apply(
         &fixture.note1(),
         json!([{"op": "append_child", "parent_id": null, "nodes": [
             {"type": "table", "attrs": {}, "content": [
-                {"type": "tableRow", "attrs": {}, "content": [
-                    {"type": "tableHeader", "attrs": {}, "content": [
-                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Data"}]}
-                    ]},
-                    {"type": "tableHeader", "attrs": {}, "content": [
-                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Issue"}]}
-                    ]},
-                    {"type": "tableHeader", "attrs": {}, "content": [
-                        {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "Description"}]}
-                    ]}
-                ]},
+                {"type": "tableRow", "attrs": {}, "content": headers},
                 {"type": "tableRow", "attrs": {}, "content": [
                     {"type": "tableCell", "attrs": {}, "content": [
                         {"type": "paragraph", "attrs": {}, "content": [{"type": "text", "text": "r"}]}
@@ -1448,6 +1578,12 @@ fn append_kanban3(fixture: &Fixture) -> (String, String) {
         .unwrap()
         .to_owned();
     (table_id, row_id)
+}
+
+/// A three-column kanban (Data | Issue | Description — the live issues.um
+/// shape) with one ragged data row (only the Data cell).
+fn append_kanban3(fixture: &Fixture) -> (String, String) {
+    append_table_with_columns(fixture, &["Data", "Issue", "Description"])
 }
 
 /// The node carrying `attrs.id` anywhere in the document (positions shift
@@ -1472,6 +1608,13 @@ fn find_row_by_id<'a>(doc: &'a Value, id: &str) -> &'a Value {
 
 fn find_cell_by_id<'a>(doc: &'a Value, id: &str) -> &'a Value {
     find_node_by_id(doc, id).unwrap_or_else(|| panic!("cell {id} in the payload"))
+}
+
+/// The number of rows (children) of the table carrying this ID.
+fn table_row_count(fixture: &Fixture, table_id: &str) -> usize {
+    let doc = fixture.payload(&fixture.note1());
+    let table = find_node_by_id(&doc, table_id).expect("the table in the payload");
+    table["content"].as_array().unwrap().len()
 }
 
 /// upsert_table_row with several key matches refuses (ambiguity), with a

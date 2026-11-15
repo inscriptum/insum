@@ -1657,59 +1657,69 @@ impl<'a> Engine<'a> {
                 writes.sort_by_key(|&(index, _)| index);
 
                 let mut row_children_changed = false;
-                // 1) rewrite the existing cells — each write targets its own
-                //    node and mutates no sibling positions, so the order of
-                //    these writes cannot shift anything
-                for &(column_index, text) in &writes {
-                    let Some(cell) = row_entry.cells.get(column_index) else {
-                        continue;
-                    };
-                    let cell_path = pointer_path(&cell.pointer).ok_or_else(|| {
-                        UmError::internal(format!("cell pointer {} does not parse", cell.pointer))
-                    })?;
-                    let cell_node = node_at_mut(doc, &cell_path);
-                    self.write_cell_text(cell_node, text);
-                }
-                // 2) create the missing cells for the columns beyond the
-                //    row's cell run — in DESCENDING column order, each at the
-                //    array position the header row defines for that column
-                //    (a regular grid: position == column index). Descending
-                //    keeps the header positions valid across the insertions;
-                //    gap columns between the row's last cell and the highest
-                //    mentioned column get empty cells.
+                // CONTRACT (review DELTA-1): pad-then-write. When the
+                // payload mentions a column beyond the row's cell run, the
+                // row is padded ONCE — empty cells APPENDED up to the header
+                // width (a regular grid: the run of cells is a prefix, so
+                // the appended cells occupy exactly the missing header
+                // positions) — and every mentioned column is then written
+                // by its column index. No positional inserts, no clamping:
+                // an insert at a position past the row's length clamps to
+                // the prefix and stacks the far columns on top of each
+                // other (the round-1 descending-insert fix failed exactly
+                // there).
                 let existing_cells = row_entry.cells.len();
-                let highest_mentioned = writes.last().map(|&(index, _)| index);
-                if let Some(highest) = highest_mentioned
-                    && highest >= existing_cells
+                let width = entry.columns().len();
+                let padded_base = if writes
+                    .last()
+                    .is_some_and(|&(index, _)| index >= existing_cells)
                 {
-                    let header_positions: Vec<usize> = entry
-                        .columns()
-                        .iter()
-                        .map(|cell| {
-                            pointer_path(&cell.pointer)
-                                .and_then(|path| path.last().copied())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    for column in (existing_cells..=highest).rev() {
-                        // mentioned columns carry the payload text, the gap
-                        // columns between them stay empty
-                        let text = writes
-                            .iter()
-                            .find(|&&(index, _)| index == column)
-                            .map(|&(_, text)| text)
-                            .unwrap_or("");
-                        let at = header_positions.get(column).copied().unwrap_or(column);
-                        let row_node = node_at_mut(doc, &row_path);
-                        let children = row_node
-                            .get_mut("content")
-                            .and_then(Value::as_array_mut)
-                            .ok_or_else(|| {
-                                UmError::internal("a projected row carries a content array")
-                            })?;
-                        children.insert(at.min(children.len()), new_table_cell(text));
-                        row_children_changed = true;
+                    let row_node = node_at_mut(doc, &row_path);
+                    let children = row_node
+                        .get_mut("content")
+                        .and_then(Value::as_array_mut)
+                        .ok_or_else(|| {
+                            UmError::internal("a projected row carries a content array")
+                        })?;
+                    let base = children.len();
+                    for _ in existing_cells..width {
+                        children.push(new_table_cell(""));
                     }
+                    row_children_changed = true;
+                    Some(base)
+                } else {
+                    None
+                };
+                // write the payload by column index (ascending): existing
+                // cells through their projection pointers, padded cells
+                // through their array index — the append above moves no
+                // existing child, so both addressing forms stay valid at
+                // the same time
+                for &(column_index, text) in &writes {
+                    let cell_node = match row_entry.cells.get(column_index) {
+                        Some(cell) => {
+                            let cell_path = pointer_path(&cell.pointer).ok_or_else(|| {
+                                UmError::internal(format!(
+                                    "cell pointer {} does not parse",
+                                    cell.pointer
+                                ))
+                            })?;
+                            node_at_mut(doc, &cell_path)
+                        }
+                        None => {
+                            let base = padded_base.expect("padding ran for an out-of-run column");
+                            let row_node = node_at_mut(doc, &row_path);
+                            let children = row_node
+                                .get_mut("content")
+                                .and_then(Value::as_array_mut)
+                                .ok_or_else(|| {
+                                    UmError::internal("a projected row carries a content array")
+                                })?;
+                            let at = base + (column_index - existing_cells);
+                            &mut children[at]
+                        }
+                    };
+                    self.write_cell_text(cell_node, text);
                 }
                 if row_children_changed && let Some(id) = row_entry.id.clone() {
                     self.note_changed(&id);
