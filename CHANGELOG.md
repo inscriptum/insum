@@ -7,6 +7,15 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum table get <file> --note <id> (--index <n> | --id <block-id> |
+  --after-heading <text>) [--where COL=VALUE] [--format json|markdown]`:
+  structured read-only access to one table of a note — kanbans and
+  state-tables no longer need markdown parsing or raw ProseMirror JSON.
+  JSON gives headers, rows and per-row cell ids/pointers (values by column
+  name); markdown gives a GFM table with escaped pipes. Ragged rows,
+  duplicate header names, colspan/rowspan and nested tables are reported
+  as explicit warnings, never silently reinterpreted; the read never
+  modifies the file.
 - `insum apply <file> --ops <file|-> [--dry-run] [--if-match <prefix>]`
   (stage D, §8): addressed write of blocks by ID with a revision CAS.
   One package mutates one note; `base_note_rev` (from `tree` / `read` /
