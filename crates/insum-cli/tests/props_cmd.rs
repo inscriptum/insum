@@ -113,7 +113,10 @@ fn props_lists_several_properties_with_ids_and_pointers() {
     let file = corpus.path("props.um");
     let json = run_json(&["props", &file]);
     assert_eq!(json["api_version"], 1);
-    assert_eq!(json["path"], file);
+    // WHY normalized: the input path is native (`\` on Windows) while the
+    // CLI renders `/` on every OS (render_path) — a raw equality compare
+    // is a deterministic windows-latest failure (round-2 CI)
+    assert_eq!(json["path"], rendered(&file));
     assert_eq!(json["note_id"], fixtures::ulid_seq(1));
     assert_eq!(json["note_title"], "issues");
     assert!(
@@ -497,7 +500,9 @@ fn ls_directory_listing_gains_note_details_with_the_flags() {
 
     let notebook = entries
         .iter()
-        .find(|entry| entry["kind"] == "notebook" && entry["path"] == corpus.path("props.um"))
+        .find(|entry| {
+            entry["kind"] == "notebook" && entry["path"] == rendered(&corpus.path("props.um"))
+        })
         .expect("props.um entry");
     // the cheap-listing fields stay, the details are additive
     assert_eq!(notebook["notes"], 2);
@@ -516,7 +521,9 @@ fn ls_directory_listing_gains_note_details_with_the_flags() {
 
     let note = entries
         .iter()
-        .find(|entry| entry["kind"] == "note" && entry["path"] == corpus.path("single.note"))
+        .find(|entry| {
+            entry["kind"] == "note" && entry["path"] == rendered(&corpus.path("single.note"))
+        })
         .expect("single.note entry");
     assert!(note["note_rev"].is_string());
     assert_eq!(note["properties"][0]["name"], "status");
@@ -621,9 +628,15 @@ fn ls_without_the_flags_keeps_the_plain_listing_shape() {
 ///
 /// Regenerate the goldens with `INSUM_UPDATE_GOLDEN=1 cargo test --test
 /// props_cmd` and commit the diff (it should be exactly the intentional
-/// listing change). Windows-safe: the output is one JSON document with `/`
-/// paths, and the comparison strips `\r` from the golden bytes, so an
-/// autocrlf checkout cannot fail the gate.
+/// listing change). Windows-safe by three layers: the output is one JSON
+/// document whose paths always render with `/`; BOTH sides of the
+/// comparison are stripped of `\r` (the committed golden too — defense in
+/// depth on top of the `*.golden -text` .gitattributes rule, in case an
+/// autocrlf checkout converts line endings); and the path normalization
+/// accepts every absolute-path shape a Windows temp dir can produce
+/// (`C:\…` short 8.3 names like `RUNNER~1`, lowercase drives, `//?/`-style
+/// UNC forms — after render_path they all start with a drive prefix or a
+/// `/`).
 #[test]
 fn ls_without_flags_matches_the_golden_bytes() {
     let dir = TempDir::new().expect("tempdir");
@@ -686,13 +699,19 @@ fn ls_without_flags_matches_the_golden_bytes() {
 /// The only run-dependent fields of a listing are the user path (a temp
 /// directory here) and the file mtime; both are replaced with markers and
 /// the document is re-serialized compactly — the same rendering the CLI
-/// uses, so the re-serialization is byte-faithful.
+/// uses, so the re-serialization is byte-faithful. The `\r` strip applies
+/// to BOTH compared sides (a JSON string never carries a raw `\r` — it is
+/// escaped — so this is a no-op for well-formed output and only neutralizes
+/// a line-ending-converted golden).
 fn normalize_listing(stdout: &[u8]) -> Vec<u8> {
     let mut value: Value = serde_json::from_slice(stdout).expect("one JSON document");
     normalize_paths_and_mtime(&mut value);
     let mut text = serde_json::to_string(&value).expect("re-serialize");
     text.push('\n');
     text.into_bytes()
+        .into_iter()
+        .filter(|byte| *byte != b'\r')
+        .collect()
 }
 
 fn normalize_paths_and_mtime(value: &mut Value) {
@@ -717,9 +736,12 @@ fn normalize_paths_and_mtime(value: &mut Value) {
     }
 }
 
-/// Only ABSOLUTE paths are run-specific (the temp directory: a leading `/`
-/// on unix, a `C:\`-style drive prefix on windows). Manifest payload paths
-/// like `notes/<id>.json` are relative and deterministic — they stay
+/// Only ABSOLUTE paths are run-specific. Every absolute path reaching the
+/// output is already rendered with `/` (render_path), so: a leading `/`
+/// covers unix absolute paths AND windows UNC forms (`//?/C:/…`); a
+/// `<drive>:` prefix (any case) covers windows paths — short 8.3 names
+/// like `C:/Users/RUNNER~1/…` included. Manifest payload paths like
+/// `notes/<id>.json` are relative and deterministic — they stay
 /// byte-pinned in the golden.
 fn is_run_specific_path(text: &str) -> bool {
     if text.starts_with('/') {
@@ -790,17 +812,31 @@ fn ls_directory_deep_read_surfaces_unreadable_note_payloads() {
     assert_eq!(entries[0]["error"]["code"], "NOTE_JSON_INVALID");
 }
 
-/// Paths in the output always render with `/`, whatever the host separator
-/// (CI runs on three OSes; expectations never depend on `\`).
+/// The input path as the CLI renders it: `render_path` replaces the host
+/// separator with `/` on every OS (CI lesson of round 2: a raw equality
+/// compare against a native `\`-built path is a deterministic windows-only
+/// failure — assertions compare the normalized form, never the raw one).
+fn rendered(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Paths in the OUTPUT always render with `/`, whatever the host separator
+/// and whatever separators the INPUT carried — the assertion targets the
+/// rendered field, not the argument string.
 #[test]
 fn ls_and_props_render_paths_with_forward_slashes() {
     let corpus = Corpus::new();
-    let file = corpus.path("props.um");
-    assert!(!file.contains('\\'));
+    let file = corpus.path("props.um"); // native separators: `\` on Windows
     let json = run_json(&["props", &file]);
-    assert_eq!(json["path"], file);
+    let path = json["path"].as_str().expect("path");
+    assert!(path.contains('/'), "output path renders /: {path}");
+    assert!(
+        !path.contains('\\'),
+        "output never carries the host separator: {path}"
+    );
+    assert_eq!(path, rendered(&file));
     let json = run_json(&["ls", "--with-rev", &file]);
-    assert_eq!(json["path"], file);
+    assert_eq!(json["path"].as_str().expect("path"), rendered(&file));
 }
 
 /// The source files must not be touched: read-only commands hash-identical
