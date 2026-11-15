@@ -21,7 +21,8 @@ until then this document is the reference for consumers (agents and scripts).
 
 | Command | Purpose |
 | --- | --- |
-| `insum ls [--hidden] [<path>]` | Classify files and count notes; a directory listing never hashes files or opens payloads |
+| `insum ls [--hidden] [--with-properties] [--with-rev] [<path>]` | Classify files and count notes; a directory listing never hashes files or opens payloads. The opt-in flags add per-note property summaries and `note_rev` (file listing: on the descriptors; directory listing: a `note_details` array) at the cost of reading every payload — without them the output is unchanged |
+| `insum props <file> [--note <id\|title>] [--get <name>]` | Read-only properties of one note page: `noteProperty` rows as `{name, value, name_id, value_id, name_pointer, value_pointer, property_pointer}` entries; see the properties section below |
 | `insum tree <file> [--note <id>]... [--depth n] [--text-limit n] [--max-bytes n] [--cursor t]` | Flat preorder block listing with JSON Pointers |
 | `insum block get <file> [--note <id>] (--pointer <p>\|--id <id>)` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it). `--id` resolves whenever the ID is present in the note; without the `features.block_ids` marker the response carries a `BLOCK_IDS_NOT_GUARANTEED` warning, an absent ID is `BLOCK_NOT_FOUND` |
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |
@@ -367,6 +368,38 @@ package is JSON read from a file or stdin (`-`):
   `warnings_total`, an `OUTPUT_BUDGET` warning) — the remainder is
   re-derivable with `insum validate`. `--pretty` only reformats.
 
+## Note properties (`props`, read-only)
+
+`insum props <file>` reads the `noteProperty` rows of one page. Without
+`--note` the target is the title note of a `.um` container (the first note
+in manifest order); `--note <id|title>` resolves like everywhere else; a
+`.note` file is always its single document (`--note` is a usage error).
+
+- Each row (one `notePropertyName` + zero or more `notePropertyValue`
+  nodes) flattens into one entry per value node with the pair text, the
+  node ids and JSON Pointers of both nodes plus the row's own address.
+  Values are read as-is: the concatenated inline text, marks ignored, no
+  type interpolation (a "list" row repeats the name per value, an empty
+  value reads as an empty string).
+- A page without `noteProperty` rows is `PROPERTY_NOT_FOUND` (exit 3) with
+  a hint that this is a normal state (plain pages and title-v2 pages have
+  none) — never a silent empty answer. A missed `--get <name>` is the same
+  code; a name matching several rows is an ambiguity error listing the row
+  pointers (no silent first match).
+- Document family versions (`schemaVersion` 2/3/4 in the manifest) are
+  application semantics outside the schema artifact: `props` reads the
+  nodes that are physically present, whatever the family version.
+- The response is one JSON envelope: `api_version`, `path`, `note_id`,
+  `note_title`, `note_rev`, `properties`, `complete: true`, `warnings`.
+
+`insum ls --with-properties --with-rev` reuses the same extraction for a
+bulk scan: file listings add `note_rev` / `properties` (and
+`properties_incomplete: true` when some text was withheld) to each note
+descriptor; directory listings add a `note_details` array (`id`,
+`note_rev`, `properties`) to notebook entries and the same fields to `.note`
+entries. Both flags read and decompress every payload — much slower than
+the default listing, which stays byte-identical without them.
+
 ## Notes on data fidelity
 
 - Unknown node or mark types are preserved verbatim in outputs derived from
@@ -379,7 +412,7 @@ package is JSON read from a file or stdin (`-`):
   inside tables, row/cell/paragraph anchors are emitted inline within the
   cells, and anything unrenderable in a cell is marked explicitly.
 - No read command (`ls`, `search`, `tree`, `block get`, `read`, `validate`,
-  `schema`, `history`) modifies input files, creates temp files, executes
-  document content, or performs network access. The write commands
+  `schema`, `history`, `props`) modifies input files, creates temp files,
+  executes document content, or performs network access. The write commands
   (`migrate-ids`, `apply`) are covered by the stage-C and stage-D sections
   above.

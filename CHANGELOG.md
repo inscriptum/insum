@@ -7,6 +7,17 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum props <file> [--note <id|title>] [--get <name>]` — read-only
+  properties of one note page (`noteProperty` rows as
+  `{name, value, name_id, value_id}` with node pointers and `note_rev` in
+  the envelope); a page without properties or a missed `--get` name is an
+  explicit `PROPERTY_NOT_FOUND` (exit 3) whose hint explains that this is
+  a normal state, and a duplicated name is an ambiguity error.
+- `insum ls --with-properties --with-rev` — opt-in per-note property
+  summaries and revisions (note descriptors in a file listing,
+  `note_details` in a directory listing); without the flags the listing
+  output stays byte-identical.
+
 - `insum apply <file> --ops <file|-> [--dry-run] [--if-match <prefix>]`
   (stage D, §8): addressed write of blocks by ID with a revision CAS.
   One package mutates one note; `base_note_rev` (from `tree` / `read` /

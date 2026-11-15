@@ -142,6 +142,55 @@ pub fn plain_doc(blocks: &[Value]) -> Value {
     json!({ "type": "noteDoc", "content": blocks })
 }
 
+/// Counter behind the synthetic property node ids (grammar-conformant
+/// `^[a-z0-9]{8,12}$`, deterministic per fixture-construction sequence).
+fn next_property_id() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+    format!("p{:010}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A `noteProperty` row (title-family v3): one `notePropertyName` node plus
+/// one `notePropertyValue` node per value, all carrying synthetic
+/// `attrs.id`. `type` is "text" for exactly one value, "list" otherwise —
+/// the plugin's own convention (umSchemas.createNoteProperty).
+pub fn note_property(name: &str, values: &[&str]) -> Value {
+    let row_id = next_property_id();
+    let name_id = next_property_id();
+    let property_type = if values.len() == 1 { "text" } else { "list" };
+    let mut content = vec![json!({
+        "type": "notePropertyName",
+        "attrs": { "id": name_id },
+        "content": if name.is_empty() { vec![] } else { vec![text(name)] },
+    })];
+    for value in values {
+        content.push(json!({
+            "type": "notePropertyValue",
+            "attrs": { "id": next_property_id() },
+            "content": [text(value)],
+        }));
+    }
+    json!({
+        "type": "noteProperty",
+        "attrs": { "id": row_id, "type": property_type },
+        "content": content,
+    })
+}
+
+/// A title-page document of the v3 family: mandatory `noteTitle` +
+/// `noteProperty` rows + content blocks (`schema: "title"`,
+/// `schemaVersion: 3`).
+pub fn title_doc_v3(title: &str, properties: &[Value], blocks: &[Value]) -> Value {
+    let mut content = vec![json!({
+        "type": "noteTitle",
+        "attrs": { "id": next_property_id() },
+        "content": [text(title)],
+    })];
+    content.extend(properties.iter().cloned());
+    content.extend(blocks.iter().cloned());
+    json!({ "type": "noteDoc", "content": content })
+}
+
 // ---------------------------------------------------------------------------
 // .um container writer
 // ---------------------------------------------------------------------------
@@ -175,6 +224,16 @@ impl FixtureNote {
             title: title.to_owned(),
             schema: "plain",
             doc: plain_doc(blocks),
+        }
+    }
+
+    /// A v3 title page: noteTitle + noteProperty rows (no noteSummary).
+    pub fn title_page_v3(id: &str, title: &str, properties: &[Value], blocks: &[Value]) -> Self {
+        Self {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            schema: "title",
+            doc: title_doc_v3(title, properties, blocks),
         }
     }
 }

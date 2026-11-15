@@ -20,6 +20,7 @@ pub mod migrate;
 pub mod model;
 pub mod pmschema;
 pub mod pointer;
+pub mod props;
 pub mod schema;
 pub mod validate;
 
@@ -28,4 +29,7 @@ pub use error::{ErrorCode, UmError};
 pub use limits::Limits;
 pub use model::{BlockEntry, Manifest, NoteDescriptor, NoteDoc, traverse};
 pub use pointer::{encode_token, resolve, split};
+pub use props::{
+    NoteProperties, PropertyName, PropertyRow, PropertyValue, collect as collect_properties,
+};
 pub use validate::{Diag, NoteValidation, validate_note_doc, validate_note_doc_with_schema};
