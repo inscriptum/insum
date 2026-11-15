@@ -108,20 +108,23 @@ enum Command {
         /// Files or directories to search; defaults to `.`.
         paths: Vec<PathBuf>,
     },
-    /// Read whole notes: JSON envelope or annotated projection.
+    /// Read whole notes: JSON envelope or markdown projection (annotated / compact).
     Read {
         /// A .um container or a .note file.
         file: PathBuf,
         /// Note id for .um.
         #[arg(long)]
         note: Option<String>,
-        /// `json` (default) or `annotated`.
+        /// `json` (default), `annotated` (projection with anchors) or `compact` (anchor-free projection).
         #[arg(long, default_value = "json")]
         format: String,
+        /// Add the annotated anchor comments to the compact projection.
+        #[arg(long)]
+        with_anchors: bool,
         /// Output budget in bytes.
         #[arg(long)]
         max_bytes: Option<usize>,
-        /// Resume an annotated projection from a cursor.
+        /// Resume an annotated or compact projection from a cursor.
         #[arg(long)]
         cursor: Option<String>,
     },
@@ -312,12 +315,14 @@ fn main() {
             file,
             note,
             format,
+            with_anchors,
             max_bytes,
             cursor,
         }) => commands::read::run(
             file,
             note.as_deref(),
             format,
+            *with_anchors,
             *max_bytes,
             cursor.as_deref(),
             &limits,

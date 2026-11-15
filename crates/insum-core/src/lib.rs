@@ -20,7 +20,9 @@ pub mod migrate;
 pub mod model;
 pub mod pmschema;
 pub mod pointer;
+pub mod projection;
 pub mod schema;
+pub mod tables;
 pub mod validate;
 
 pub use container::{NoteFile, UmContainer};
@@ -28,4 +30,6 @@ pub use error::{ErrorCode, UmError};
 pub use limits::Limits;
 pub use model::{BlockEntry, Manifest, NoteDescriptor, NoteDoc, traverse};
 pub use pointer::{encode_token, resolve, split};
+pub use projection::{Projection, escape_comment_value};
+pub use tables::{ColumnLookup, TableEntry, Tables};
 pub use validate::{Diag, NoteValidation, validate_note_doc, validate_note_doc_with_schema};

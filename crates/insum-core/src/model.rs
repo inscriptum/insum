@@ -430,7 +430,11 @@ fn walk(
 /// reports unknown inline node types: their text is unknowable without a
 /// schema artifact, so partial text is withheld instead of silently
 /// returned.
-fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
+///
+/// Public: `table get` reuses the exact tree/search text rules for cell
+/// values and heading contexts — one text discipline, not per-command
+/// variants.
+pub fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
     let Some(children) = object.get("content").and_then(Value::as_array) else {
         return (None, false);
     };
