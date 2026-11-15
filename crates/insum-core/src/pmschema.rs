@@ -36,8 +36,9 @@ use crate::model::{INLINE_NODE_TYPES, KNOWN_NODE_TYPES};
 use crate::schema::SchemaArtifact;
 use crate::validate::Diag;
 
-/// Bound for an attr key echoed inside a diagnostic message (D-SEC-3).
-const MAX_ECHOED_KEY_CHARS: usize = 128;
+/// Bound, in BYTES, for an attr key echoed inside a diagnostic message
+/// (D-SEC-3).
+const MAX_ECHOED_KEY_BYTES: usize = 96;
 
 /// TRAP (D-SEC-3): an echoed attr key is untrusted input up to
 /// UM_MAX_ENTRY_BYTES — splicing it whole into the warning doubles the
@@ -46,12 +47,21 @@ const MAX_ECHOED_KEY_CHARS: usize = 128;
 /// sites (node attrs and mark attrs — the one source for the `validate`
 /// and `apply` paths) echo through this bound: a bounded prefix keeps the
 /// key recognizable, the ellipsis marks the cut.
+///
+/// WHY bytes, not chars: the budget is byte-denominated, so a char-counted
+/// bound lets 128 four-byte chars through as a ~515-byte echo (~650-byte
+/// warning) — enough to re-open that exception. A char is taken only while
+/// the prefix stays within the byte bound, so a multi-byte key is never
+/// split mid-sequence.
 fn echo_key(key: &str) -> String {
-    if key.chars().count() <= MAX_ECHOED_KEY_CHARS {
-        return key.to_owned();
+    let mut bounded = String::new();
+    for ch in key.chars() {
+        if bounded.len() + ch.len_utf8() > MAX_ECHOED_KEY_BYTES {
+            bounded.push('…');
+            return bounded;
+        }
+        bounded.push(ch);
     }
-    let mut bounded: String = key.chars().take(MAX_ECHOED_KEY_CHARS).collect();
-    bounded.push('…');
     bounded
 }
 
@@ -1105,56 +1115,76 @@ mod tests {
     /// D-SEC-3: an untrusted attr key echoed in SCHEMA_ATTR_UNKNOWN is
     /// bounded — a 4MiB key must not double into an ~8MiB warning message
     /// that the output budget's oversized-first-entry exception would emit
-    /// whole. Short keys are echoed verbatim (a 128-char key is already at
-    /// the bound and must not gain an ellipsis).
+    /// whole. The bound counts BYTES (a char-counted bound would let 128
+    /// four-byte chars through as a ~515-byte echo): keys up to 96 bytes
+    /// are echoed verbatim (the bound itself gains no ellipsis), anything
+    /// longer is cut on a char boundary with the ellipsis marker.
     #[test]
     fn echoed_attr_keys_are_bounded_in_warnings() {
         let schema = PmSchema::build(&artifact()).unwrap();
         // the KEY is the untrusted echo: a ~1KB attr key would otherwise
         // double into the warning message
-        let long_key = "x".repeat(MAX_ECHOED_KEY_CHARS * 8);
-        let doc = json!({"type": "doc", "content": [
-            {"type": "section", "content": [
-                {"type": "heading", "attrs": {(long_key.clone()): "1"},
-                 "content": [text("T")]},
-                {"type": "para", "content": [text("a")]}
-            ]}
-        ]});
-        let result = schema.check_document(&doc);
-        assert!(result.valid(), "an unknown attr is a warning, not an error");
-        let warning = result
-            .warnings
-            .iter()
-            .find(|diag| diag.code == "SCHEMA_ATTR_UNKNOWN")
-            .expect("the unknown attr carries its warning");
-        assert!(
-            warning.message.len() < MAX_ECHOED_KEY_CHARS * 2,
-            "the echoed key is bounded: {} bytes",
-            warning.message.len()
+        let attr_warning = |key: String| {
+            let doc = json!({"type": "doc", "content": [
+                {"type": "section", "content": [
+                    {"type": "heading", "attrs": {(key): "1"},
+                     "content": [text("T")]},
+                    {"type": "para", "content": [text("a")]}
+                ]}
+            ]});
+            let result = schema.check_document(&doc);
+            assert!(result.valid(), "an unknown attr is a warning, not an error");
+            result
+                .warnings
+                .into_iter()
+                .find(|diag| diag.code == "SCHEMA_ATTR_UNKNOWN")
+                .expect("the unknown attr carries its warning")
+        };
+
+        let warning = attr_warning("x".repeat(MAX_ECHOED_KEY_BYTES * 8));
+        assert_eq!(
+            warning.message.matches('x').count(),
+            MAX_ECHOED_KEY_BYTES,
+            "the echoed key is cut to the byte bound"
         );
         assert!(warning.message.contains('…'), "the cut is marked");
         assert!(warning.message.contains("on node type \"heading\""));
 
+        // one byte past the bound is already cut
+        let warning = attr_warning("x".repeat(MAX_ECHOED_KEY_BYTES + 1));
+        assert_eq!(
+            warning.message.matches('x').count(),
+            MAX_ECHOED_KEY_BYTES,
+            "the cut lands on the byte bound, not the char count"
+        );
+        assert!(warning.message.contains('…'));
+
+        // a multi-byte key is cut on a char boundary: 200 four-byte emoji
+        // leave 24 whole emoji (96 bytes) plus the marker, and the warning
+        // stays far under the output budget on the wire
+        let emoji = "\u{1F525}";
+        let warning = attr_warning(emoji.repeat(200));
+        let serialized = serde_json::to_string(&warning.message).unwrap();
+        assert!(
+            serialized.len() < 256,
+            "the multi-byte echo stays bounded when serialized: {} bytes",
+            serialized.len()
+        );
+        assert_eq!(
+            warning.message.matches(emoji).count(),
+            MAX_ECHOED_KEY_BYTES / 4,
+            "the cut keeps whole multi-byte chars, never a split sequence"
+        );
+        assert!(warning.message.contains('…'));
+
         // a key at the bound itself is echoed verbatim, without the marker
-        let bounded_key = "x".repeat(MAX_ECHOED_KEY_CHARS);
-        let doc = json!({"type": "doc", "content": [
-            {"type": "section", "content": [
-                {"type": "heading", "attrs": {(bounded_key): "1"},
-                 "content": [text("T")]},
-                {"type": "para", "content": [text("a")]}
-            ]}
-        ]});
-        let warning = schema
-            .check_document(&doc)
-            .warnings
-            .into_iter()
-            .find(|diag| diag.code == "SCHEMA_ATTR_UNKNOWN")
-            .unwrap();
+        let warning = attr_warning("x".repeat(MAX_ECHOED_KEY_BYTES));
         assert!(
             !warning.message.contains('…'),
             "a key at the bound is not cut: {}",
             warning.message.len()
         );
+        assert_eq!(warning.message.matches('x').count(), MAX_ECHOED_KEY_BYTES);
     }
 
     #[test]
