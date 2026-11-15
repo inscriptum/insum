@@ -3,26 +3,38 @@
 //! A directory listing classifies files without computing `file_rev` and
 //! without opening note payloads; a `.um` file listing reads
 //! the central directory and the manifest, but never decompresses payload.
+//! The opt-in `--with-properties` / `--with-rev` flags buy per-note
+//! property summaries and note revisions at the cost of reading and
+//! decompressing every payload; without them every code path below is
+//! byte-identical to the plain listing (regression-tested).
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use insum_core::container::{argument_stat_error, peek_um_manifest};
-use insum_core::{ErrorCode, Limits, NoteFile, UmContainer, UmError};
+use insum_core::{
+    ErrorCode, Limits, NoteDescriptor, NoteFile, UmContainer, UmError, collect_properties,
+};
 
 use crate::support::{error_value, hidden_below, mtime_iso, render_path};
 
-pub fn run(path: Option<String>, hidden: bool, limits: &Limits) -> Result<Value, UmError> {
+pub fn run(
+    path: Option<String>,
+    hidden: bool,
+    with_properties: bool,
+    with_rev: bool,
+    limits: &Limits,
+) -> Result<Value, UmError> {
     let path = PathBuf::from(path.unwrap_or_else(|| ".".to_owned()));
     // the explicit argument is opened directly (even a symlink); traversal
     // inside directories still never follows symlinks
     let metadata = std::fs::metadata(&path).map_err(|err| argument_stat_error(&path, &err))?;
 
     if metadata.is_dir() {
-        list_directory(&path, hidden, limits)
+        list_directory(&path, hidden, with_properties, with_rev, limits)
     } else if metadata.is_file() {
-        list_file(&path, limits)
+        list_file(&path, with_properties, with_rev, limits)
     } else {
         Err(UmError::new(
             ErrorCode::PathNotFound,
@@ -31,7 +43,18 @@ pub fn run(path: Option<String>, hidden: bool, limits: &Limits) -> Result<Value,
     }
 }
 
-fn list_directory(dir: &Path, hidden: bool, limits: &Limits) -> Result<Value, UmError> {
+/// Whether the flags demand payload reads (the augmented paths).
+fn deep(with_properties: bool, with_rev: bool) -> bool {
+    with_properties || with_rev
+}
+
+fn list_directory(
+    dir: &Path,
+    hidden: bool,
+    with_properties: bool,
+    with_rev: bool,
+    limits: &Limits,
+) -> Result<Value, UmError> {
     let mut entries = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -80,6 +103,15 @@ fn list_directory(dir: &Path, hidden: bool, limits: &Limits) -> Result<Value, Um
         };
 
         let result = match kind {
+            "notebook" if deep(with_properties, with_rev) => notebook_entry_deep(
+                &path,
+                &rendered,
+                bytes,
+                &file_metadata,
+                with_properties,
+                with_rev,
+                limits,
+            ),
             // central directory + manifest only; payloads stay closed
             "notebook" => peek_um_manifest(&path, limits).map(|(manifest, parts)| {
                 json!({
@@ -91,6 +123,15 @@ fn list_directory(dir: &Path, hidden: bool, limits: &Limits) -> Result<Value, Um
                     "parts": parts,
                 })
             }),
+            "note" if deep(with_properties, with_rev) => note_entry_deep(
+                &path,
+                &rendered,
+                bytes,
+                &file_metadata,
+                with_properties,
+                with_rev,
+                limits,
+            ),
             _ => Ok(json!({
                 "path": rendered,
                 "kind": "note",
@@ -131,7 +172,126 @@ fn mtime_json(metadata: &Result<std::fs::Metadata, std::io::Error>) -> Value {
     }
 }
 
-fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
+/// Directory notebook entry with the opt-in per-note details: every payload
+/// is read once (revision and properties in the same pass when both flags
+/// are set). A payload that fails to read turns the entry `invalid` — the
+/// file-level best-effort semantics of the directory listing.
+fn notebook_entry_deep(
+    path: &Path,
+    rendered: &str,
+    bytes: u64,
+    file_metadata: &Result<std::fs::Metadata, std::io::Error>,
+    with_properties: bool,
+    with_rev: bool,
+    limits: &Limits,
+) -> Result<Value, UmError> {
+    let mut container = UmContainer::open(path, limits)?;
+    let descriptors: Vec<NoteDescriptor> =
+        container.notes_in_order().into_iter().cloned().collect();
+    let mut details = Vec::new();
+    for descriptor in &descriptors {
+        let mut detail = json!({ "id": descriptor.id });
+        if with_rev {
+            let parsed = container.read_note_with_rev(descriptor, limits)?;
+            detail["note_rev"] = json!(parsed.note_rev);
+            if with_properties {
+                let (summary, incomplete) = properties_summary(&parsed.note.doc, limits)?;
+                detail["properties"] = Value::Array(summary);
+                if incomplete {
+                    detail["properties_incomplete"] = json!(true);
+                }
+            }
+        } else {
+            let note = container.read_note(descriptor, limits)?;
+            let (summary, incomplete) = properties_summary(&note.doc, limits)?;
+            detail["properties"] = Value::Array(summary);
+            if incomplete {
+                detail["properties_incomplete"] = json!(true);
+            }
+        }
+        details.push(detail);
+    }
+    let (manifest, parts) = (container.manifest.clone(), container.parts.clone());
+    Ok(json!({
+        "path": rendered,
+        "kind": "notebook",
+        "bytes": bytes,
+        "mtime": mtime_json(file_metadata),
+        "notes": manifest.notes.len(),
+        "parts": parts,
+        "note_details": details,
+    }))
+}
+
+/// Directory `.note` entry with the opt-in summary/revision: the file is
+/// opened (once), so an unreadable `.note` becomes an `invalid` entry.
+fn note_entry_deep(
+    path: &Path,
+    rendered: &str,
+    bytes: u64,
+    file_metadata: &Result<std::fs::Metadata, std::io::Error>,
+    with_properties: bool,
+    with_rev: bool,
+    limits: &Limits,
+) -> Result<Value, UmError> {
+    let note_file = NoteFile::open(path, limits, with_rev)?;
+    let mut entry = json!({
+        "path": rendered,
+        "kind": "note",
+        "bytes": bytes,
+        "mtime": mtime_json(file_metadata),
+    });
+    if with_rev {
+        entry["note_rev"] = json!(note_file.note_rev);
+    }
+    if with_properties {
+        let (summary, incomplete) = properties_summary(&note_file.note.doc, limits)?;
+        entry["properties"] = Value::Array(summary);
+        if incomplete {
+            entry["properties_incomplete"] = json!(true);
+        }
+    }
+    Ok(entry)
+}
+
+/// Compact per-note property summary for `ls --with-properties`: one
+/// `{name, value}` pair per value node; `null` marks withheld text (unknown
+/// inline node type) or an unrepresented part — never a silent loss.
+/// `incomplete` is true when any text was withheld or a row carried
+/// unexpected children.
+fn properties_summary(doc: &Value, limits: &Limits) -> Result<(Vec<Value>, bool), UmError> {
+    let collected = collect_properties(doc, limits.max_depth);
+    if collected.depth_exceeded {
+        return Err(UmError::new(
+            ErrorCode::LimitExceeded,
+            format!("document deeper than UM_MAX_DEPTH ({})", limits.max_depth),
+        ));
+    }
+    let incomplete = collected.unknown_inline
+        || collected
+            .rows
+            .iter()
+            .any(|row| !row.shape_warnings.is_empty());
+    let mut summary = Vec::new();
+    for row in &collected.rows {
+        let name = row.name.as_ref().and_then(|name| name.text.clone());
+        if row.values.is_empty() {
+            summary.push(json!({ "name": name, "value": Value::Null }));
+            continue;
+        }
+        for value in &row.values {
+            summary.push(json!({ "name": name, "value": value.text }));
+        }
+    }
+    Ok((summary, incomplete))
+}
+
+fn list_file(
+    path: &Path,
+    with_properties: bool,
+    with_rev: bool,
+    limits: &Limits,
+) -> Result<Value, UmError> {
     let rendered = render_path(path);
     let metadata = std::fs::metadata(path).map_err(|err| {
         UmError::new(
@@ -151,6 +311,15 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
     match extension.as_deref() {
         Some("um") => {
             let mut container = UmContainer::open(path, limits)?;
+            let notes: Vec<Value> = if deep(with_properties, with_rev) {
+                note_descriptors_deep(&mut container, with_properties, with_rev, limits)?
+            } else {
+                container
+                    .notes_in_order()
+                    .iter()
+                    .map(|descriptor| descriptor.to_output())
+                    .collect()
+            };
             Ok(json!({
                 "api_version": 1,
                 "path": rendered,
@@ -162,11 +331,7 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
                 "type": container.manifest.container_type,
                 "features": container.manifest.features,
                 "parts": container.parts,
-                "notes": container
-                    .notes_in_order()
-                    .iter()
-                    .map(|descriptor| descriptor.to_output())
-                    .collect::<Vec<_>>(),
+                "notes": notes,
             }))
         }
         Some("note") => {
@@ -186,6 +351,13 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
                 entry["features"] = note_file.features.clone().unwrap_or(Value::Null);
                 entry["schema"] = note_file.schema.clone().unwrap_or(Value::Null);
             }
+            if with_properties {
+                let (summary, incomplete) = properties_summary(&note_file.note.doc, limits)?;
+                entry["properties"] = Value::Array(summary);
+                if incomplete {
+                    entry["properties_incomplete"] = json!(true);
+                }
+            }
             Ok(entry)
         }
         _ => Err(UmError::new(
@@ -193,4 +365,43 @@ fn list_file(path: &Path, limits: &Limits) -> Result<Value, UmError> {
             format!("not a .um or .note file: {rendered}"),
         )),
     }
+}
+
+/// The descriptor list of a `.um` file listing, augmented with the opt-in
+/// `note_rev` (payload + descriptor per the revision rule) and the property
+/// summary; each payload is read exactly once. Unlike the directory
+/// listing, a file listing is fail-fast: a payload that cannot be read
+/// fails the command.
+fn note_descriptors_deep(
+    container: &mut UmContainer,
+    with_properties: bool,
+    with_rev: bool,
+    limits: &Limits,
+) -> Result<Vec<Value>, UmError> {
+    let descriptors: Vec<NoteDescriptor> =
+        container.notes_in_order().into_iter().cloned().collect();
+    let mut notes = Vec::with_capacity(descriptors.len());
+    for descriptor in &descriptors {
+        let mut value = descriptor.to_output();
+        if with_rev {
+            let parsed = container.read_note_with_rev(descriptor, limits)?;
+            value["note_rev"] = json!(parsed.note_rev);
+            if with_properties {
+                let (summary, incomplete) = properties_summary(&parsed.note.doc, limits)?;
+                value["properties"] = Value::Array(summary);
+                if incomplete {
+                    value["properties_incomplete"] = json!(true);
+                }
+            }
+        } else {
+            let note = container.read_note(descriptor, limits)?;
+            let (summary, incomplete) = properties_summary(&note.doc, limits)?;
+            value["properties"] = Value::Array(summary);
+            if incomplete {
+                value["properties_incomplete"] = json!(true);
+            }
+        }
+        notes.push(value);
+    }
+    Ok(notes)
 }

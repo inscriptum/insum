@@ -19,6 +19,7 @@ pub enum ErrorCode {
     NoteNotFound,
     BlockNotFound,
     PointerNotFound,
+    PropertyNotFound,
     // file level
     NotAZip,
     ReadTorn,
@@ -71,6 +72,7 @@ impl ErrorCode {
             ErrorCode::NoteNotFound => "NOTE_NOT_FOUND",
             ErrorCode::BlockNotFound => "BLOCK_NOT_FOUND",
             ErrorCode::PointerNotFound => "POINTER_NOT_FOUND",
+            ErrorCode::PropertyNotFound => "PROPERTY_NOT_FOUND",
             ErrorCode::NotAZip => "NOT_A_ZIP",
             ErrorCode::ReadTorn => "READ_TORN",
             ErrorCode::ManifestMissing => "MANIFEST_MISSING",
@@ -112,11 +114,12 @@ impl ErrorCode {
             ErrorCode::Usage | ErrorCode::BlockIdImmutable | ErrorCode::InvalidOperation => 2,
             // 1 — internal error or I/O
             ErrorCode::IoError | ErrorCode::Internal => 1,
-            // 3 — path, note or block not found
+            // 3 — path, note, block or property not found
             ErrorCode::PathNotFound
             | ErrorCode::NoteNotFound
             | ErrorCode::BlockNotFound
-            | ErrorCode::PointerNotFound => 3,
+            | ErrorCode::PointerNotFound
+            | ErrorCode::PropertyNotFound => 3,
             // 4 — invalid or unreadable data
             ErrorCode::NotAZip
             | ErrorCode::ReadTorn
@@ -253,6 +256,7 @@ mod tests {
             (ErrorCode::NoteNotFound, 3),
             (ErrorCode::BlockNotFound, 3),
             (ErrorCode::PointerNotFound, 3),
+            (ErrorCode::PropertyNotFound, 3),
             (ErrorCode::NotAZip, 4),
             (ErrorCode::ReadTorn, 4),
             (ErrorCode::ManifestMissing, 4),

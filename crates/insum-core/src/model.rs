@@ -431,9 +431,9 @@ fn walk(
 /// schema artifact, so partial text is withheld instead of silently
 /// returned.
 ///
-/// Public: `table get` reuses the exact tree/search text rules for cell
-/// values and heading contexts — one text discipline, not per-command
-/// variants.
+/// The unified text discipline for every read command (`tree`, `search`,
+/// `table get`, note properties): marks never alter the text — one text
+/// discipline, not per-command variants.
 pub fn inline_text(object: &Map<String, Value>) -> (Option<String>, bool) {
     let Some(children) = object.get("content").and_then(Value::as_array) else {
         return (None, false);

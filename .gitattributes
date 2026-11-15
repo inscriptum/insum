@@ -1,0 +1,4 @@
+# Golden stdout snapshots are compared byte-wise by the tests; keep git
+# from converting their line endings on checkout (autocrlf). The golden
+# test additionally strips \r from both compared sides as defense in depth.
+*.golden -text

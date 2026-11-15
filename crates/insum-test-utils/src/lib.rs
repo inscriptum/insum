@@ -18,11 +18,33 @@ use serde_json::{Value, json};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-/// Fixed ZIP entry metadata so fixture bytes are reproducible: the timestamp
-/// is pinned explicitly — with the `time` feature enabled, `default()` would
-/// stamp the current wall clock and break byte-determinism.
+/// Fixed ZIP entry metadata so fixture bytes are reproducible ON EVERY
+/// HOST: the timestamp is pinned explicitly (with the `time` feature
+/// enabled, `default()` would stamp the current wall clock), and the two
+/// fields the zip crate derives from the host OS are pinned to constants —
+///
+/// - `system` ("version made by" high byte): with `system: None` the
+///   crate picks `cfg!(windows) ? System::Dos : System::Unix`
+///   (zip 9.2.1 src/types.rs), so the same generator calls produced a
+///   different central-directory byte on Windows — the platform-dependent
+///   fixture bytes behind the windows-latest golden-gate failure;
+/// - `unix_permissions(0o644)`: without it the crate defaults to
+///   `0o644 | S_IFREG` for the external attributes; the pin guards the
+///   fixture contract against a future crate-default drift. Verified
+///   no-op in bytes: the crate's `normalize()` re-adds `S_IFREG` when the
+///   caller set permission bits only (zip 9.2.1 src/write/options.rs), so
+///   the effective external attributes stay `0x81a40000` — the fixture
+///   hash on unix hosts is unchanged and the committed goldens stay valid.
+///
+/// `large_file(false)` is the crate default, pinned for the same reason.
+/// The deflate stream is platform-independent by construction: flate2 is
+/// resolved to the pure-Rust zlib-rs backend on all targets (Cargo.lock).
 fn fixture_zip_options() -> SimpleFileOptions {
-    SimpleFileOptions::default().last_modified_time(zip::DateTime::default()) // 1980-01-01
+    SimpleFileOptions::default()
+        .last_modified_time(zip::DateTime::default()) // 1980-01-01
+        .system(zip::System::Unix)
+        .unix_permissions(0o644)
+        .large_file(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +206,55 @@ pub fn plain_doc(blocks: &[Value]) -> Value {
     json!({ "type": "noteDoc", "content": blocks })
 }
 
+/// Counter behind the synthetic property node ids (grammar-conformant
+/// `^[a-z0-9]{8,12}$`, deterministic per fixture-construction sequence).
+fn next_property_id() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+    format!("p{:010}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A `noteProperty` row (title-family v3): one `notePropertyName` node plus
+/// one `notePropertyValue` node per value, all carrying synthetic
+/// `attrs.id`. `type` is "text" for exactly one value, "list" otherwise —
+/// the plugin's own convention (umSchemas.createNoteProperty).
+pub fn note_property(name: &str, values: &[&str]) -> Value {
+    let row_id = next_property_id();
+    let name_id = next_property_id();
+    let property_type = if values.len() == 1 { "text" } else { "list" };
+    let mut content = vec![json!({
+        "type": "notePropertyName",
+        "attrs": { "id": name_id },
+        "content": if name.is_empty() { vec![] } else { vec![text(name)] },
+    })];
+    for value in values {
+        content.push(json!({
+            "type": "notePropertyValue",
+            "attrs": { "id": next_property_id() },
+            "content": [text(value)],
+        }));
+    }
+    json!({
+        "type": "noteProperty",
+        "attrs": { "id": row_id, "type": property_type },
+        "content": content,
+    })
+}
+
+/// A title-page document of the v3 family: mandatory `noteTitle` +
+/// `noteProperty` rows + content blocks (`schema: "title"`,
+/// `schemaVersion: 3`).
+pub fn title_doc_v3(title: &str, properties: &[Value], blocks: &[Value]) -> Value {
+    let mut content = vec![json!({
+        "type": "noteTitle",
+        "attrs": { "id": next_property_id() },
+        "content": [text(title)],
+    })];
+    content.extend(properties.iter().cloned());
+    content.extend(blocks.iter().cloned());
+    json!({ "type": "noteDoc", "content": content })
+}
+
 // ---------------------------------------------------------------------------
 // .um container writer
 // ---------------------------------------------------------------------------
@@ -217,6 +288,16 @@ impl FixtureNote {
             title: title.to_owned(),
             schema: "plain",
             doc: plain_doc(blocks),
+        }
+    }
+
+    /// A v3 title page: noteTitle + noteProperty rows (no noteSummary).
+    pub fn title_page_v3(id: &str, title: &str, properties: &[Value], blocks: &[Value]) -> Self {
+        Self {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            schema: "title",
+            doc: title_doc_v3(title, properties, blocks),
         }
     }
 }

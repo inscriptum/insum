@@ -52,8 +52,36 @@ enum Command {
         /// Include hidden files.
         #[arg(long)]
         hidden: bool,
+        /// Add a per-note property summary (name/value pairs) to note
+        /// descriptors; reads and decompresses every note payload — much
+        /// slower than the default listing, which never opens payloads.
+        #[arg(long)]
+        with_properties: bool,
+        /// Add `note_rev` to note descriptors (payload + manifest
+        /// descriptor per the revision rule); also reads every payload.
+        #[arg(long)]
+        with_rev: bool,
         /// Directory or file; defaults to `.`.
         path: Option<String>,
+    },
+    /// Read-only properties of one note page (`noteProperty` rows).
+    Props {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Note by id (ULID) or exact title; default: the title note of a
+        /// .um container (the first note in manifest order) or the single
+        /// document of a .note file.
+        #[arg(long)]
+        note: Option<String>,
+        /// Return only the property with this exact name; a name held by
+        /// one row returns all its value entries (a list-typed row yields
+        /// several), a miss is PROPERTY_NOT_FOUND, a name held by several
+        /// rows is an ambiguity error.
+        #[arg(long)]
+        get: Option<String>,
+        /// Output format; only `json` is supported.
+        #[arg(long, default_value = "json")]
+        format: String,
     },
     /// Compact block structure with JSON Pointers.
     Tree {
@@ -310,9 +338,20 @@ fn main() {
             let _ = Cli::command().print_help();
             std::process::exit(0);
         }
-        Some(Command::Ls { path, hidden }) => {
-            commands::ls::run(path.clone(), *hidden, &limits).map(Output::Json)
-        }
+        Some(Command::Ls {
+            path,
+            hidden,
+            with_properties,
+            with_rev,
+        }) => commands::ls::run(path.clone(), *hidden, *with_properties, *with_rev, &limits)
+            .map(Output::Json),
+        Some(Command::Props {
+            file,
+            note,
+            get,
+            format,
+        }) => commands::props::run(file, note.as_deref(), get.as_deref(), format, &limits)
+            .map(Output::Json),
         Some(Command::Tree {
             file,
             note,
