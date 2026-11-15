@@ -7,6 +7,15 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum apply` state operations — `set_property`, `set_table_cell` and
+  `upsert_table_row` — plus a new `changed_ids` field in the commit
+  response. An agent can now flip a page's `Status` property, write one
+  kanban cell or move a kanban row (insert on top / bottom by key
+  columns, missing cells created) inside one CAS package instead of
+  replacing the whole page with um-build set-page. Addressing by name
+  follows the read side (`insum props`, `insum table get`): duplicate
+  names refuse, ragged rows refuse cell writes, spanning tables refuse
+  the table operations; values are text-only in v1.
 - `insum table get <file> --note <id> (--index <n> | --id <block-id> |
   --after-heading <text>) [--where COL=VALUE] [--format json|markdown]`:
   structured read-only access to one table of a note — kanbans and

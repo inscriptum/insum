@@ -312,6 +312,46 @@ package is JSON read from a file or stdin (`-`):
   subtree (they are preserved); new addressable blocks receive
   generator IDs at commit. `set_attrs` must not touch the ID attribute.
   `set_text` and `move` do not exist in v1 (`INVALID_OPERATION`).
+- **State operations.** Three package operations address mutable state
+  without rebuilding blocks by hand:
+  `{"op": "set_property", "name": …, "value": …}` upserts a `noteProperty`
+  row of the note's TITLE page by exact name — an existing row keeps the
+  row node, its attrs and its name node, the first value node keeps its
+  ID and gets the new text (extra value nodes of a list row leave the
+  note via `deleted_ids`), a missing name creates the row next to the
+  other property rows; a name held by several rows refuses
+  (`BLOCK_NOT_FOUND`, `details.ambiguous`), a plain page without a
+  leading `noteTitle` refuses (`INVALID_OPERATION`).
+  `{"op": "set_table_cell", "id": <table>, "row": {"id": …} | {"where":
+  {col: text}}, "column": {"id": …} | {"name": …}, "value": …}` writes
+  one cell: the cell keeps its ID (`changed_ids`), its first paragraph
+  keeps its ID and gets the text-only value, blocks after the first are
+  removed; the row and column must address exactly one position
+  (`BLOCK_NOT_FOUND`, ambiguous detail on several matches — the same
+  strictness as `table get --where`), a ragged row with no cell at the
+  column refuses (`BLOCK_NOT_FOUND` — cells are never created here),
+  spanning cells (`colspan`/`rowspan` > 1) refuse the operation
+  (`INVALID_OPERATION`).
+  `{"op": "upsert_table_row", "id": <table>, "match": {col: text},
+  "row": {col: text, …}, "position": "top"|"bottom"}` inserts a row when
+  no data row matches the key columns (default bottom = after the last
+  row, `top` = right after the header row) and rewrites the mentioned
+  cells of the matched row otherwise (unmentioned cells stay). When a
+  mentioned column has no cell in the matched row, the row is padded
+  ONCE to the header width with empty cells and the payload is written
+  by column indexes — the row ends up exactly the header width, the
+  payload lands on its own column whatever order the payload keys come
+  in; `match` is optional: a package without it always inserts. The
+  whole table's header names must be unique and every mentioned column
+  must exist. A fresh row carries one `tableCell` per header column
+  (unmentioned columns empty) — the row, its cells and their paragraphs
+  are all new (`created_ids`).
+  Values of all three operations are text-only in v1: unknown inline
+  nodes of a replaced value/cell disappear with the replacement, and the
+  table's `attrs.data` (`rowsCount`/`colsCount`) is left untouched — the
+  editor recomputes that metadata. The row/column lookups reuse the
+  `insum table get` projection, the property scan reuses `insum props`
+  — addressing by name agrees with the read side.
 - **Semantics (§8.3–8.4).** Operations apply sequentially to a working
   copy; each resolves its IDs in the current state. `insert_after` groups
   on one anchor keep the operation order (no reversal); a deleted block
@@ -332,8 +372,9 @@ package is JSON read from a file or stdin (`-`):
   are `USAGE` (exit 2).
 - **`--dry-run`** validates the package against the current state and
   reports `operations_validated`, `would_create_count`,
-  `would_delete_ids` and parity warnings — applied stays `false`, no
-  final IDs are promised, and the file bytes, mtime and directory stay
+  `would_change_count`, `would_delete_ids` and parity warnings — applied
+  stays `false`, no final IDs are promised for new blocks, and the file
+  bytes, mtime and directory stay
   untouched (no temp files). A dry-run refuses wherever the commit's plan
   phase refuses (plan == commit), except the commit-time lock and
   dirty-lease guard (`WRITE_LOCKED`) and the in-lock rechecks (a changed
@@ -359,8 +400,13 @@ package is JSON read from a file or stdin (`-`):
   unknown manifest and envelope fields survive.
 - **Response.** On success: `applied: true`, `old/new note_rev`,
   `old/new file_rev`, `operations_applied`, `created_ids` (every new
-  addressable block with its final `{id, pointer, type}`, nested included)
-  and `deleted_ids` (every ID that left the note). The ID lists respect
+  addressable block with its final `{id, pointer, type}`, nested
+  included), `changed_ids` (every EXISTING block the operations rewrote
+  in place — a property's value node plus the property row when its
+  value list changes structurally, a written table cell, an
+  upsert-written cell and a row that gained cells; `{id, pointer, type}`
+  with the pointer in the final document, in document order) and
+  `deleted_ids` (every ID that left the note). The ID lists respect
   `UM_MAX_OUTPUT_BYTES`: an oversized list is truncated explicitly
   (`truncated: true`, totals, an `OUTPUT_BUDGET` warning) — the write
   itself always covered every operation. The parity warnings share the
