@@ -1636,7 +1636,10 @@ fn commit_response(
 /// the two cannot drift apart (D-1, same discipline as migrate's).
 /// Mode-aware (D-COR-2, migrate's D-2): on a dry-run nothing was applied,
 /// so the committed "the operation itself covered every operation" clause
-/// would be a lie — the dry-run names the plan instead.
+/// would be a lie — the dry-run names the plan instead. A dry-run also
+/// never enumerates created blocks (§8.5: final IDs are not promised, only
+/// `would_create_count` is sent), so its text carries the created COUNT —
+/// a kept/total pair would read as if a created list had been truncated.
 fn id_list_budget_warning(
     created_returned: usize,
     created_total: usize,
@@ -1646,7 +1649,7 @@ fn id_list_budget_warning(
 ) -> Value {
     let message = if dry_run {
         format!(
-            "the plan holds {created_returned}/{created_total} created and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the dry-run applied nothing — re-run without --dry-run to cover every operation, or raise UM_MAX_OUTPUT_BYTES to enumerate the plan"
+            "the plan holds {created_total} created blocks (counted, not enumerated) and {deleted_returned}/{deleted_total} deleted ids to fit the output budget; the dry-run applied nothing — re-run without --dry-run to cover every operation, or raise UM_MAX_OUTPUT_BYTES to enumerate the plan"
         )
     } else {
         format!(
@@ -1785,12 +1788,17 @@ fn budget_response(
     response
 }
 
-/// Response envelope overhead measured over the largest possible skeleton
-/// (committed, truncated, both ID-list totals, the warnings total and BOTH
-/// OUTPUT_BUDGET texts) — the budget must hold for whichever shape is
-/// finally emitted (§6.5, same discipline as migrate's D-1). The warning
-/// texts are the committed variants: the longest of the two mode shapes
-/// (D-COR-2, migrate's D-2 skeleton rule).
+/// Response envelope overhead measured over the union of both response
+/// shapes (committed + dry-run fields, truncated, both ID-list totals, the
+/// warnings total and BOTH OUTPUT_BUDGET texts) — the budget must hold for
+/// whichever shape is finally emitted (§6.5, same discipline as migrate's
+/// D-1). The warning texts embedded here are the committed variants: they
+/// are the single source the real texts of both modes measure against. The
+/// slack below covers what the skeleton itself cannot: the delta of the
+/// longer dry-run id-list wording (D-COR-2), the digit-width growth of the
+/// real counts (D-SEC-2), and the oversized-first-entry allowance of the
+/// fitted warnings — when the parity warnings truncate, `budget::fit` keeps
+/// their first entry even above the cap so the response names what it did.
 fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
     let skeleton = json!({
         "api_version": 1,
@@ -1822,8 +1830,14 @@ fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
     // three `*_total` fields AND the kept/total pairs inside BOTH warning
     // texts — together ~48-64 bytes when the returned counts are six-digit
     // too; the former 16-byte slack did not hold that and let such a
-    // response exceed UM_MAX_OUTPUT_BYTES by a few bytes.
-    serde_json::to_string(&skeleton).map_or(1024, |s| s.len() + 96)
+    // response exceed UM_MAX_OUTPUT_BYTES by a few bytes. The production-
+    // width revision test (sha256 + 64 hex, the width measured here) then
+    // exposed a second term the skeleton cannot model: when the parity
+    // warnings truncate, their FIRST entry is kept even above the cap
+    // (budget::fit's documented oversized-first-entry exception), landing
+    // the ledger up to one warning (~200B) over. 96 covered only the growth
+    // term and ran ~66 bytes short in that corner; 192 holds both terms.
+    serde_json::to_string(&skeleton).map_or(1024, |s| s.len() + 192)
 }
 
 // ---------------------------------------------------------------------------
@@ -3412,10 +3426,15 @@ mod tests {
     }
 
     /// D-SEC-2: the envelope skeleton's slack covers the digit-width growth
-    /// of the real counts. Six-digit totals over a small budget truncate all
-    /// three lists — the totals and BOTH warning texts widen against the
-    /// skeleton together (~48-64 bytes), which the former 16-byte slack did
-    /// not hold: the serialized response could exceed UM_MAX_OUTPUT_BYTES.
+    /// of the real counts AND the oversized-first-entry allowance of the
+    /// fitted warnings. The revisions carry the production width (sha256
+    /// plus 64 hex, the width the skeleton measures) — short revisions
+    /// would sit ~272 bytes under the skeleton and a too-small slack would
+    /// pass unguarded. Six-digit totals over a small budget truncate all
+    /// three lists; the first kept parity warning lands above the cap
+    /// (budget::fit's documented exception) and the totals and BOTH warning
+    /// texts widen against the skeleton together — the serialized response
+    /// must still stay inside UM_MAX_OUTPUT_BYTES.
     #[test]
     fn six_digit_totals_stay_inside_the_output_budget() {
         let h = Harness::new();
@@ -3423,14 +3442,15 @@ mod tests {
         let mut limits = h.limits();
         limits.max_output_bytes = 16384;
 
+        let rev = format!("sha256:{}", "a".repeat(64));
         let response = commit_response(
             &path,
             Some(&h.note1),
             &plan,
-            "old",
-            "new",
-            "old",
-            "new",
+            &rev,
+            &rev,
+            &rev,
+            &rev,
             &limits,
         );
         let bytes = serde_json::to_string(&response).unwrap();
@@ -3476,7 +3496,9 @@ mod tests {
     }
 
     /// The OUTPUT_BUDGET warning of the truncated ID lists (both lists share
-    /// one warning; the warnings-list warning reads differently).
+    /// one warning; the warnings-list warning reads differently). The
+    /// mode-aware wordings differ, but both name the deleted ids — the one
+    /// marker the warnings-list text never carries.
     fn id_warning_message(response: &Value) -> String {
         response["warnings"]
             .as_array()
@@ -3485,7 +3507,7 @@ mod tests {
             .find(|warning| {
                 warning["message"]
                     .as_str()
-                    .is_some_and(|message| message.contains("created and"))
+                    .is_some_and(|message| message.contains("deleted"))
             })
             .expect("the truncated ID lists carry their warning")["message"]
             .as_str()
@@ -3508,6 +3530,14 @@ mod tests {
         assert_eq!(dry["truncated"], true);
         let message = id_warning_message(&dry);
         assert!(message.contains("the plan holds"), "{message}");
+        assert!(
+            message.contains("created blocks (counted, not enumerated)"),
+            "the dry-run counts the created blocks instead of a kept/total pair: {message}"
+        );
+        assert!(
+            !message.contains("created and"),
+            "the dry-run never enumerates created ids, so no created pair: {message}"
+        );
         assert!(message.contains("the dry-run applied nothing"), "{message}");
         assert!(
             !message.contains("the operation itself covered"),

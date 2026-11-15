@@ -28,4 +28,4 @@ insum-test-utils = { path = "../insum-test-utils" }
 # the lease tests must record the same hostname lock.rs reads on the write
 # path (GetComputerNameExW) — any other value makes their holder cross-host
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }

@@ -576,7 +576,11 @@ fn budgeted_report(
     // WHY: the pre-consolidation fit counter charged len+2 per note plan
     // (serialized bytes, comma, plus one conservative byte); the shared
     // `budget::fit` charges len+1. Charging one byte per plan here keeps the
-    // old truncation boundary exactly where it was instead of loosening it.
+    // truncation threshold never looser than before: a report that keeps
+    // every plan decides on the same bytes as the old counter (the reserve
+    // is fully spent), while a truncated report charges the full
+    // plans.len() reserve against fewer kept entries — mid-list the
+    // boundary can sit slightly earlier, but it never loosens.
     let legacy_fit_reserve = plans.len();
     let mut budget = crate::budget::OutputBudget::new(
         limits.output_bytes(None),
