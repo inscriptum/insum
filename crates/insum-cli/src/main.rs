@@ -192,6 +192,16 @@ enum Command {
         dry_run: bool,
     },
     /// Addressed write of blocks by ID with a revision CAS (stage D; §8).
+    ///
+    /// Operations: replace, delete, insert_before, insert_after,
+    /// append_child, set_attrs, replace_content — plus the state
+    /// operations: set_property (upsert a noteProperty row of the title
+    /// page by name, text-only value), set_table_cell (write one cell by
+    /// table ID + row/column address) and upsert_table_row (insert or
+    /// update a row by key columns). IDs are managed by the CLI: new
+    /// addressable blocks receive IDs at commit (`created_ids`), existing
+    /// blocks the operations rewrite in place keep theirs and are reported
+    /// in `changed_ids`.
     Apply {
         /// A .um container or a .note file.
         file: PathBuf,

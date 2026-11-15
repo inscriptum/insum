@@ -67,6 +67,61 @@ enum Operation {
         id: String,
         content: Vec<Value>,
     },
+    /// Upsert a `noteProperty` row of the TITLE page by name: replace the
+    /// value when a row with this name exists (duplicates refuse), create
+    /// the row next to the other property rows otherwise. `value` is
+    /// text-only in v1.
+    SetProperty {
+        name: String,
+        value: String,
+    },
+    /// Write the text of one table cell (text-only v1): the table by block
+    /// ID, the row by ID or key columns, the column by header cell ID or
+    /// name. A missing cell (ragged row) refuses — cell creation belongs to
+    /// `upsert_table_row`.
+    SetTableCell {
+        table: String,
+        row: RowSelector,
+        column: ColumnSelector,
+        value: String,
+    },
+    /// Insert or update a table row addressed by key columns: a matching
+    /// row gets its mentioned cells rewritten (missing cells are created),
+    /// a miss inserts a fresh row (`position`: top = right after the header
+    /// row, bottom = after the last row, default bottom).
+    UpsertTableRow {
+        table: String,
+        match_keys: Vec<(String, String)>,
+        row: Vec<(String, String)>,
+        position: RowPosition,
+    },
+}
+
+/// How `set_table_cell` addresses one row of the table.
+#[derive(Debug)]
+enum RowSelector {
+    /// A `tableRow` child of the table carrying this block ID.
+    Id(String),
+    /// Key columns over the DATA rows (the header row is never matched):
+    /// every key must match the cell text exactly; the match must be
+    /// unique.
+    Keys(Vec<(String, String)>),
+}
+
+/// How `set_table_cell` addresses one column of the table.
+#[derive(Debug)]
+enum ColumnSelector {
+    /// A header-row cell carrying this block ID.
+    Id(String),
+    /// Exact text of the header cell.
+    Name(String),
+}
+
+/// Where `upsert_table_row` inserts a row when no key matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowPosition {
+    Top,
+    Bottom,
 }
 
 /// The parsed operations package: one note, one base revision, N operations.
@@ -334,10 +389,174 @@ fn parse_operation(value: &Value) -> Result<Operation, UmError> {
                 content: content.clone(),
             })
         }
+        "set_property" => {
+            let name = match object.get("name") {
+                Some(Value::String(name)) if !name.is_empty() => name.clone(),
+                Some(_) => {
+                    return Err(invalid_operation(
+                        "operation \"set_property\" needs a non-empty string `name`",
+                    ));
+                }
+                None => {
+                    return Err(invalid_operation(
+                        "operation \"set_property\" is missing `name`",
+                    ));
+                }
+            };
+            let value = match object.get("value") {
+                Some(Value::String(value)) => value.clone(),
+                Some(_) => {
+                    return Err(invalid_operation(
+                        "operation \"set_property\" needs a string `value` (text-only in v1; marks are not expressible)",
+                    ));
+                }
+                None => {
+                    return Err(invalid_operation(
+                        "operation \"set_property\" is missing `value`",
+                    ));
+                }
+            };
+            Ok(Operation::SetProperty { name, value })
+        }
+        "set_table_cell" => {
+            let row = parse_row_selector(op, object)?;
+            let column = match object.get("column") {
+                Some(Value::Object(column)) => {
+                    let id = column.get("id").and_then(Value::as_str);
+                    let name = column.get("name").and_then(Value::as_str);
+                    match (id, name) {
+                        (Some(id), _) if !id.is_empty() => ColumnSelector::Id(id.to_owned()),
+                        (_, Some(name)) if !name.is_empty() => {
+                            ColumnSelector::Name(name.to_owned())
+                        }
+                        _ => {
+                            return Err(invalid_operation(
+                                "operation \"set_table_cell\" needs `column` as {\"id\": \"<header cell id>\"} or {\"name\": \"<header text>\"}",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(invalid_operation(
+                        "operation \"set_table_cell\" is missing object `column` ({\"id\": …} or {\"name\": …})",
+                    ));
+                }
+            };
+            let value = match object.get("value") {
+                Some(Value::String(value)) => value.clone(),
+                Some(_) => {
+                    return Err(invalid_operation(
+                        "operation \"set_table_cell\" needs a string `value` (text-only in v1; marks are not expressible)",
+                    ));
+                }
+                None => {
+                    return Err(invalid_operation(
+                        "operation \"set_table_cell\" is missing `value`",
+                    ));
+                }
+            };
+            Ok(Operation::SetTableCell {
+                table: id("id")?,
+                row,
+                column,
+                value,
+            })
+        }
+        "upsert_table_row" => {
+            // `match` is optional: a package without it always inserts
+            let match_keys = match object.get("match") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(_) => string_pairs(op, object.get("match"), "`match`")?,
+            };
+            let row = string_pairs(op, object.get("row"), "`row`")?;
+            if row.is_empty() {
+                return Err(invalid_operation(
+                    "operation \"upsert_table_row\" needs a non-empty `row` map (column name → cell text)",
+                ));
+            }
+            let position = match object.get("position") {
+                None | Some(Value::Null) => RowPosition::Bottom,
+                Some(Value::String(value)) if value == "top" => RowPosition::Top,
+                Some(Value::String(value)) if value == "bottom" => RowPosition::Bottom,
+                Some(_) => {
+                    return Err(invalid_operation(
+                        "operation \"upsert_table_row\" needs `position` \"top\" or \"bottom\" (default \"bottom\")",
+                    ));
+                }
+            };
+            Ok(Operation::UpsertTableRow {
+                table: id("id")?,
+                match_keys,
+                row,
+                position,
+            })
+        }
         other => Err(invalid_operation(format!(
-            "unknown operation {other:?} (supported: replace, delete, insert_before, insert_after, append_child, set_attrs, replace_content; set_text and move are not in v1)"
+            "unknown operation {other:?} (supported: replace, delete, insert_before, insert_after, append_child, set_attrs, replace_content, set_property, set_table_cell, upsert_table_row; set_text and move are not in v1)"
         ))),
     }
+}
+
+/// The `row` selector of `set_table_cell`: `{"id": "<row block id>"}` or
+/// `{"where": {"<column>": "<text>"}}` — exactly one of the two forms.
+fn parse_row_selector(op: &str, object: &Map<String, Value>) -> Result<RowSelector, UmError> {
+    let row = object
+        .get("row")
+        .ok_or_else(|| invalid_operation(format!("operation {op:?} is missing object `row`")))?
+        .as_object()
+        .ok_or_else(|| {
+            invalid_operation(format!(
+                "operation {op:?} needs `row` as {{\"id\": \"<row id>\"}} or {{\"where\": {{…}}}}"
+            ))
+        })?;
+    let id = row.get("id").and_then(Value::as_str);
+    let where_keys = row.get("where");
+    match (id, where_keys) {
+        (Some(id), None) if !id.is_empty() => Ok(RowSelector::Id(id.to_owned())),
+        (Some(_), _) => Err(invalid_operation(format!(
+            "operation {op:?} takes `row.id` or `row.where`, not both"
+        ))),
+        (None, Some(Value::Object(_))) => Ok(RowSelector::Keys(string_pairs(
+            op,
+            row.get("where"),
+            "`row.where`",
+        )?)),
+        (None, Some(_)) => Err(invalid_operation(format!(
+            "operation {op:?} needs `row.where` as an object of column name → cell text"
+        ))),
+        (None, None) => Err(invalid_operation(format!(
+            "operation {op:?} needs `row` with `id` or `where`"
+        ))),
+    }
+}
+
+/// A JSON object of column name → cell text, kept as an ordered pair list
+/// (every value must be a string — the writes are text-only in v1).
+fn string_pairs(
+    op: &str,
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Vec<(String, String)>, UmError> {
+    let Some(Value::Object(map)) = value else {
+        return Err(invalid_operation(format!(
+            "operation {op:?} needs object {field} (column name → cell text)"
+        )));
+    };
+    let mut pairs = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        let Some(text) = value.as_str() else {
+            return Err(invalid_operation(format!(
+                "operation {op:?} carries a non-string cell text for column {key:?} in {field} (text-only in v1)"
+            )));
+        };
+        if key.is_empty() {
+            return Err(invalid_operation(format!(
+                "operation {op:?} carries an empty column name in {field}"
+            )));
+        }
+        pairs.push((key.clone(), text.to_owned()));
+    }
+    Ok(pairs)
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +719,15 @@ struct Engine<'a> {
     /// operations of this package have already inserted directly after
     /// the anchor (§8.4 — groups must not reverse).
     after_cursor: HashMap<String, usize>,
+    /// UM_MAX_DEPTH — the read projections the state operations reuse
+    /// (`props::collect`, `tables::collect_tables`) enforce it.
+    max_json_depth: usize,
+    /// IDs of existing blocks the operations rewrote in place (property
+    /// value nodes, table cells, upsert-written cells, rows whose child
+    /// list changed). Duplicates possible (two operations may touch one
+    /// block); `build_generation` dedupes, filters and resolves the final
+    /// pointers (§8.5 `changed_ids`).
+    changed: Vec<String>,
 }
 
 impl<'a> Engine<'a> {
@@ -507,20 +735,31 @@ impl<'a> Engine<'a> {
         attrs_key: &'a str,
         addressable: &'a BTreeSet<String>,
         live_ids: HashMap<String, usize>,
+        max_json_depth: usize,
     ) -> Self {
         Self {
             attrs_key,
             addressable,
             live_ids,
             after_cursor: HashMap::new(),
+            max_json_depth,
+            changed: Vec::new(),
         }
     }
 
-    /// The live ID counts after the last applied operation — the same set
-    /// a fresh full walk would produce over the document at that point
-    /// (before `assign_missing_ids` adds the generated IDs).
-    fn into_live_ids(self) -> HashMap<String, usize> {
-        self.live_ids
+    /// The live ID counts and the changed-ID journal after the last applied
+    /// operation — the counts are the same set a fresh full walk would
+    /// produce over the document at that point (before `assign_missing_ids`
+    /// adds the generated IDs).
+    fn finish(self) -> (HashMap<String, usize>, Vec<String>) {
+        (self.live_ids, self.changed)
+    }
+
+    /// Record one existing block as changed by the current operation (§8.5
+    /// `changed_ids`). The node carries an ID by construction here: the
+    /// writes go through the read projections that expose it.
+    fn note_changed(&mut self, id: &str) {
+        self.changed.push(id.to_owned());
     }
 
     fn resolve(&self, doc: &Value, id: &str) -> Result<Vec<usize>, UmError> {
@@ -770,8 +1009,839 @@ impl<'a> Engine<'a> {
                 node["content"] = Value::Array(content.clone());
                 Ok(())
             }
+            Operation::SetProperty { name, value } => self.set_property(doc, name, value),
+            Operation::SetTableCell {
+                table,
+                row,
+                column,
+                value,
+            } => self.set_table_cell(doc, table, row, column, value),
+            Operation::UpsertTableRow {
+                table,
+                match_keys,
+                row,
+                position,
+            } => self.upsert_table_row(doc, table, match_keys, row, *position),
         }
     }
+
+    // -- set_property (§8.3, state-write-ops) --------------------------------
+
+    /// Upsert a `noteProperty` row of the title page by name. The read
+    /// projection (`props::collect`) drives the name matching so the write
+    /// sees exactly what `insum props` reports; a row's name must be
+    /// readable (no unknown inline node inside it) or the match cannot be
+    /// proven unambiguous.
+    fn set_property(&mut self, doc: &mut Value, name: &str, value: &str) -> Result<(), UmError> {
+        // noteProperty rows live on the title page: the operation refuses a
+        // plain page instead of building a document the artifact's root
+        // rule (noteTitle noteProperty* block*) would reject anyway
+        if first_root_child_type(doc) != Some("noteTitle") {
+            return Err(invalid_operation(
+                "set_property targets the title page of the note: the document does not start with a noteTitle block, so it has no property area",
+            )
+            .with_hint(
+                "noteProperty rows live on the title page only; address a plain page with the block operations instead.",
+            ));
+        }
+        let collected = crate::props::collect(doc, self.max_json_depth);
+        if collected.depth_exceeded {
+            return Err(limit_exceeded(format!(
+                "the note document exceeds UM_MAX_DEPTH ({})",
+                self.max_json_depth
+            )));
+        }
+        // a name the read side cannot extract cannot be matched honestly —
+        // no silent "probably not a match"
+        for row in &collected.rows {
+            if row.name.as_ref().is_none_or(|n| n.text.is_none()) {
+                return Err(invalid_operation(format!(
+                    "set_property cannot verify the property names: a noteProperty row at {} carries no readable name (unknown inline node type)",
+                    row.pointer
+                ))
+                .with_hint(
+                    "Read the page with `insum props` to see which rows are readable; the operation refuses rather than guess.",
+                ));
+            }
+        }
+        let matches: Vec<&crate::props::PropertyRow> = collected
+            .rows
+            .iter()
+            .filter(|row| {
+                row.name
+                    .as_ref()
+                    .and_then(|n| n.text.as_deref())
+                    .is_some_and(|text| text == name)
+            })
+            .collect();
+        match matches.len() {
+            0 => self.create_property_row(doc, name, value),
+            1 => self.replace_property_value(doc, matches[0], value),
+            _ => {
+                let pointers: Vec<&str> = matches.iter().map(|row| row.pointer.as_str()).collect();
+                Err(UmError::new(
+                    ErrorCode::BlockNotFound,
+                    format!(
+                        "property name {name:?} is ambiguous: {} noteProperty rows match (pointers: {})",
+                        matches.len(),
+                        pointers.join(", ")
+                    ),
+                )
+                .with_hint(
+                    "The note holds several rows with this name; rename one of them (or drop one) before upserting the value.",
+                )
+                .with_details(json!({ "ambiguous": true, "pointers": pointers })))
+            }
+        }
+    }
+
+    /// One readable row carries the name: keep the row node, its attrs and
+    /// the name node untouched, rewrite the FIRST value node's inline
+    /// content with the text-only value (its ID survives — `changed_ids`),
+    /// drop any further value nodes (a list-typed row collapses to the one
+    /// text value; their IDs leave the note via `deleted_ids`).
+    fn replace_property_value(
+        &mut self,
+        doc: &mut Value,
+        row: &crate::props::PropertyRow,
+        value: &str,
+    ) -> Result<(), UmError> {
+        let row_path = pointer_path(&row.pointer).ok_or_else(|| {
+            UmError::internal(format!(
+                "property row pointer {} does not parse as a content path",
+                row.pointer
+            ))
+        })?;
+        // CONTRACT: a matched row must sit on the title page (a top-level
+        // child right after the noteTitle). Rows nested deeper are read
+        // but not written — they are not part of the property area.
+        if row_path.len() != 1 {
+            return Err(invalid_operation(format!(
+                "the noteProperty row matching the name lives at {}, not on the title page",
+                row.pointer
+            ))
+            .with_hint(
+                "noteProperty rows live on the title page only; the nested row was found by the name scan and is not writable by set_property.",
+            ));
+        }
+        let row_node = node_at_mut(doc, &row_path);
+        let row_id = node_id_of(row_node);
+        let children = row_node
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                UmError::internal("a collected noteProperty row carries a content array")
+            })?;
+        let value_indexes: Vec<usize> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| {
+                child.get("type").and_then(Value::as_str) == Some("notePropertyValue")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if value_indexes.is_empty() {
+            // a zero-value row gains its first value node — the row's child
+            // list changes, the row itself is reported changed
+            children.push(json!({
+                "type": "notePropertyValue",
+                "attrs": {},
+                "content": value_inline_content(value),
+            }));
+            if let Some(id) = &row_id {
+                self.note_changed(id);
+            }
+            return Ok(());
+        }
+        // extra value nodes leave the row (the row's child list changes —
+        // report the row too); their IDs are released so a later operation
+        // of the package sees the same live set a fresh scan would
+        let removed: Vec<Value> = value_indexes[1..]
+            .iter()
+            .map(|&index| children[index].clone())
+            .collect();
+        let row_child_list_changed = !removed.is_empty();
+        if row_child_list_changed {
+            let mut removed_ids = Vec::new();
+            for node in &removed {
+                collect_ids(node, self.attrs_key, &mut removed_ids);
+            }
+            for id in &removed_ids {
+                release_id(&mut self.live_ids, id);
+            }
+        }
+        // first value node keeps its identity, its inline content is
+        // replaced (unknown inline nodes of the old value disappear — the
+        // boundary of the text-only v1 write)
+        let first = value_indexes[0];
+        children[first]["content"] = Value::Array(value_inline_content(value));
+        if let Some(id) = node_id_of(&children[first]) {
+            self.note_changed(&id);
+        }
+        if row_child_list_changed {
+            if let Some(id) = &row_id {
+                self.note_changed(id);
+            }
+            let keep_first_value = value_indexes[0];
+            let kept: Vec<Value> = children
+                .iter()
+                .enumerate()
+                .filter(|(index, child)| {
+                    let is_value =
+                        child.get("type").and_then(Value::as_str) == Some("notePropertyValue");
+                    !is_value || *index == keep_first_value
+                })
+                .map(|(_, child)| child.clone())
+                .collect();
+            *children = kept;
+        }
+        Ok(())
+    }
+
+    /// No row carries the name: create one at the end of the property run
+    /// that follows the noteTitle (keeps the artifact root rule
+    /// `noteTitle noteProperty* block*` intact). The new row, name and
+    /// value nodes are id-less — the CLI assigns their IDs at commit, so
+    /// they land in `created_ids`.
+    fn create_property_row(
+        &mut self,
+        doc: &mut Value,
+        name: &str,
+        value: &str,
+    ) -> Result<(), UmError> {
+        let root = doc
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| UmError::internal("the document root carries a content array"))?;
+        // insertion index: after the contiguous run of top-level property
+        // rows that follows the title (the title itself is root child 0 —
+        // the title-family gate above already proved it)
+        let mut insert_at = 1;
+        while root
+            .get(insert_at)
+            .and_then(|child| child.get("type"))
+            .and_then(Value::as_str)
+            == Some("noteProperty")
+        {
+            insert_at += 1;
+        }
+        let row = json!({
+            "type": "noteProperty",
+            "attrs": {"type": "text"},
+            "content": [
+                {
+                    "type": "notePropertyName",
+                    "attrs": {},
+                    "content": [{"type": "text", "text": name}],
+                },
+                {
+                    "type": "notePropertyValue",
+                    "attrs": {},
+                    "content": value_inline_content(value),
+                },
+            ],
+        });
+        root.insert(insert_at, row);
+        Ok(())
+    }
+
+    // -- table state writes (§8.3, state-write-ops) --------------------------
+
+    /// Resolve the table block and rebuild its read projection from the
+    /// CURRENT working copy: the projection (headers, cell texts, spans,
+    /// ragged diagnostics) is exactly what `insum table get` reports, so
+    /// addressing by name/keys agrees with the read side.
+    fn table_view(
+        &self,
+        doc: &Value,
+        table_id: &str,
+    ) -> Result<(crate::tables::TableEntry, Vec<usize>), UmError> {
+        let path = self.resolve(doc, table_id)?;
+        let node = node_at(doc, &path);
+        let node_type = node.get("type").and_then(Value::as_str).unwrap_or("");
+        if node_type != "table" {
+            return Err(invalid_operation(format!(
+                "block {table_id:?} is a {node_type:?}, not a table"
+            ))
+            .with_hint(
+                "set_table_cell and upsert_table_row address the table block by its ID — take the ID from `insum table get`.",
+            ));
+        }
+        let collected = crate::tables::collect_tables(doc, self.max_json_depth);
+        if collected.depth_exceeded {
+            return Err(limit_exceeded(format!(
+                "the note document exceeds UM_MAX_DEPTH ({})",
+                self.max_json_depth
+            )));
+        }
+        let pointer = path_to_pointer(&path);
+        let Some(entry) = collected
+            .entries
+            .iter()
+            .find(|entry| entry.pointer == pointer)
+        else {
+            // the block exists and is a table, but the read projection has
+            // no entry for it — the only such case is a table nested inside
+            // a cell of another table (the projection excludes it)
+            return Err(invalid_operation(format!(
+                "table {table_id:?} is nested inside a cell of another table; the state operations address top-level tables only"
+            )));
+        };
+        // a table with spanning cells is not a plain grid: the positional
+        // column mapping is unreliable, so both state operations refuse
+        let spanning: Vec<&str> = entry
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|cell| cell.colspan > 1 || cell.rowspan > 1)
+            .map(|cell| cell.pointer.as_str())
+            .collect();
+        if !spanning.is_empty() {
+            return Err(invalid_operation(format!(
+                "table {table_id:?} carries colspan/rowspan cells ({}); set_table_cell and upsert_table_row v1 address a plain grid only",
+                spanning.len()
+            ))
+            .with_details(json!({ "pointers": spanning })));
+        }
+        Ok((entry.clone(), path))
+    }
+
+    /// Resolve the column selector against the table's header row (the
+    /// first row, the same GFM convention the read projection uses).
+    fn resolve_column(
+        &self,
+        entry: &crate::tables::TableEntry,
+        column: &ColumnSelector,
+    ) -> Result<usize, UmError> {
+        match column {
+            ColumnSelector::Name(name) => match entry.lookup_column(name) {
+                crate::tables::ColumnLookup::Found(index) => Ok(index),
+                crate::tables::ColumnLookup::Ambiguous(indices) => {
+                    let pointers: Vec<&str> = indices
+                        .iter()
+                        .map(|&i| entry.columns()[i].pointer.as_str())
+                        .collect();
+                    Err(UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "column {name:?} is ambiguous: {} columns of the table at {} share this name",
+                            indices.len(),
+                            entry.pointer
+                        ),
+                    )
+                    .with_hint("Rename one of the columns, or address it by the header cell ID.")
+                    .with_details(json!({ "ambiguous": true, "pointers": pointers })))
+                }
+                crate::tables::ColumnLookup::NotFound => {
+                    let names: Vec<String> = entry
+                        .columns()
+                        .iter()
+                        .filter_map(|cell| cell.text.clone())
+                        .collect();
+                    Err(UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "column {name:?} is not a column of the table at {}",
+                            entry.pointer
+                        ),
+                    )
+                    .with_hint(format!(
+                        "Columns of this table: {}.",
+                        if names.is_empty() {
+                            "(none)".to_owned()
+                        } else {
+                            names.join(", ")
+                        }
+                    )))
+                }
+            },
+            ColumnSelector::Id(id) => entry
+                .columns()
+                .iter()
+                .position(|cell| cell.id.as_deref() == Some(id.as_str()))
+                .ok_or_else(|| {
+                    UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "no header cell {id:?} in the header row of the table at {}",
+                            entry.pointer
+                        ),
+                    )
+                    .with_hint(
+                        "The column ID must belong to a cell of the table's first (header) row — take one from `insum table get`.",
+                    )
+                }),
+        }
+    }
+
+    /// Resolve the row selector against the table: by ID (any row of the
+    /// table, the header included) or by key columns (the DATA rows only —
+    /// the read-side convention). The match must be unique.
+    fn resolve_row(
+        &self,
+        entry: &crate::tables::TableEntry,
+        row: &RowSelector,
+    ) -> Result<usize, UmError> {
+        match row {
+            RowSelector::Id(id) => entry
+                .rows
+                .iter()
+                .position(|row| row.id.as_deref() == Some(id.as_str()))
+                .ok_or_else(|| {
+                    UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!("no row {id:?} in the table at {}", entry.pointer),
+                    )
+                    .with_hint(
+                        "The row ID must belong to a tableRow of this table — take one from `insum table get`.",
+                    )
+                }),
+            RowSelector::Keys(keys) => {
+                // every key column must resolve first (the same strict
+                // discipline as `table get --where`: a duplicated header
+                // name refuses even when the queried name is unique)
+                let mut key_columns = Vec::with_capacity(keys.len());
+                for (column, _) in keys {
+                    match entry.lookup_column(column) {
+                        crate::tables::ColumnLookup::Found(index) => key_columns.push(index),
+                        crate::tables::ColumnLookup::Ambiguous(indices) => {
+                            let pointers: Vec<&str> = indices
+                                .iter()
+                                .map(|&i| entry.columns()[i].pointer.as_str())
+                                .collect();
+                            return Err(UmError::new(
+                                ErrorCode::BlockNotFound,
+                                format!(
+                                    "column {column:?} is ambiguous: {} columns of the table at {} share this name",
+                                    indices.len(),
+                                    entry.pointer
+                                ),
+                            )
+                            .with_details(json!({ "ambiguous": true, "pointers": pointers })));
+                        }
+                        crate::tables::ColumnLookup::NotFound => {
+                            return Err(UmError::new(
+                                ErrorCode::BlockNotFound,
+                                format!(
+                                    "column {column:?} is not a column of the table at {}",
+                                    entry.pointer
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let matches: Vec<usize> = (1..entry.rows.len())
+                    .filter(|row_index| {
+                        keys.iter().zip(&key_columns).all(|((_, text), &column)| {
+                            entry.rows[*row_index]
+                                .cells
+                                .get(column)
+                                .and_then(|cell| cell.text.clone())
+                                .as_deref()
+                                == Some(text.as_str())
+                        })
+                    })
+                    .collect();
+                match matches.len() {
+                    1 => Ok(matches[0]),
+                    0 => Err(UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "no data row of the table at {} matches the key columns",
+                            entry.pointer
+                        ),
+                    )
+                    .with_hint(
+                        "Key columns match the cell text exactly over the DATA rows (the header row is never matched); check the texts with `insum table get`.",
+                    ),
+                    ),
+                    _ => {
+                        let pointers: Vec<String> = matches
+                            .iter()
+                            .map(|&index| entry.rows[index].pointer.clone())
+                            .collect();
+                        Err(UmError::new(
+                            ErrorCode::BlockNotFound,
+                            format!(
+                                "the key columns match {} rows of the table at {} (pointers: {})",
+                                matches.len(),
+                                entry.pointer,
+                                pointers.join(", ")
+                            ),
+                        )
+                        .with_hint("The row address must be unique; make the key columns selective or address the row by its ID.")
+                        .with_details(json!({ "ambiguous": true, "pointers": pointers })))
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_table_cell(
+        &mut self,
+        doc: &mut Value,
+        table_id: &str,
+        row: &RowSelector,
+        column: &ColumnSelector,
+        value: &str,
+    ) -> Result<(), UmError> {
+        let (entry, _) = self.table_view(doc, table_id)?;
+        let column_index = self.resolve_column(&entry, column)?;
+        let row_index = self.resolve_row(&entry, row)?;
+        let Some(row_entry) = entry.rows.get(row_index) else {
+            return Err(UmError::internal("the resolved row left the projection"));
+        };
+        let Some(cell) = row_entry.cells.get(column_index) else {
+            // ragged row: the row holds fewer cells than the header defines
+            // columns — set_table_cell never creates cells
+            return Err(UmError::new(
+                ErrorCode::BlockNotFound,
+                format!(
+                    "the row at {} has no cell at column {} ({} cell(s), the header defines {}); set_table_cell does not create cells",
+                    row_entry.pointer,
+                    column_index,
+                    row_entry.cells.len(),
+                    entry.columns().len()
+                ),
+            )
+            .with_hint(
+                "Use upsert_table_row to rewrite the row — it creates missing cells.",
+            ));
+        };
+        let cell_path = pointer_path(&cell.pointer).ok_or_else(|| {
+            UmError::internal(format!("cell pointer {} does not parse", cell.pointer))
+        })?;
+        let cell_node = node_at_mut(doc, &cell_path);
+        self.write_cell_text(cell_node, value);
+        Ok(())
+    }
+
+    fn upsert_table_row(
+        &mut self,
+        doc: &mut Value,
+        table_id: &str,
+        match_keys: &[(String, String)],
+        row: &[(String, String)],
+        position: RowPosition,
+    ) -> Result<(), UmError> {
+        let (entry, table_path) = self.table_view(doc, table_id)?;
+        if entry.rows.is_empty() {
+            return Err(invalid_operation(format!(
+                "table {table_id:?} has no rows; there is no header row to define the columns"
+            )));
+        }
+        // the maps key columns by NAME: the header names must be unique for
+        // the address to be unambiguous (the same strict rule as
+        // `table get --where`)
+        let duplicates = entry.duplicate_column_names();
+        if !duplicates.is_empty() {
+            return Err(UmError::new(
+                ErrorCode::BlockNotFound,
+                format!(
+                    "the table at {} has duplicate column names ({}); upsert_table_row addresses columns by name",
+                    entry.pointer,
+                    duplicates.join(", ")
+                ),
+            )
+            .with_hint("Rename one of the columns, or address cells with set_table_cell by ID."));
+        }
+        // every mentioned column must exist; remember name → column index
+        let mut row_columns = Vec::with_capacity(row.len());
+        for (column, _) in row {
+            let index = match entry.lookup_column(column) {
+                crate::tables::ColumnLookup::Found(index) => index,
+                crate::tables::ColumnLookup::Ambiguous(_) => {
+                    return Err(UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "column {column:?} is ambiguous in the table at {}",
+                            entry.pointer
+                        ),
+                    )
+                    .with_details(json!({ "ambiguous": true })));
+                }
+                crate::tables::ColumnLookup::NotFound => {
+                    return Err(UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "column {column:?} is not a column of the table at {}",
+                            entry.pointer
+                        ),
+                    ));
+                }
+            };
+            row_columns.push(index);
+        }
+        // match phase: the key columns select at most one DATA row
+        let matched = if match_keys.is_empty() {
+            None
+        } else {
+            let mut key_columns = Vec::with_capacity(match_keys.len());
+            for (column, _) in match_keys {
+                match entry.lookup_column(column) {
+                    crate::tables::ColumnLookup::Found(index) => key_columns.push(index),
+                    crate::tables::ColumnLookup::Ambiguous(_) => {
+                        return Err(UmError::new(
+                            ErrorCode::BlockNotFound,
+                            format!(
+                                "column {column:?} is ambiguous in the table at {}",
+                                entry.pointer
+                            ),
+                        )
+                        .with_details(json!({ "ambiguous": true })));
+                    }
+                    crate::tables::ColumnLookup::NotFound => {
+                        return Err(UmError::new(
+                            ErrorCode::BlockNotFound,
+                            format!(
+                                "column {column:?} is not a column of the table at {}",
+                                entry.pointer
+                            ),
+                        ));
+                    }
+                }
+            }
+            let matches: Vec<usize> = (1..entry.rows.len())
+                .filter(|row_index| {
+                    match_keys
+                        .iter()
+                        .zip(&key_columns)
+                        .all(|((_, text), &column)| {
+                            entry.rows[*row_index]
+                                .cells
+                                .get(column)
+                                .and_then(|cell| cell.text.clone())
+                                .as_deref()
+                                == Some(text.as_str())
+                        })
+                })
+                .collect();
+            match matches.len() {
+                1 => Some(matches[0]),
+                0 => None,
+                _ => {
+                    let pointers: Vec<String> = matches
+                        .iter()
+                        .map(|&index| entry.rows[index].pointer.clone())
+                        .collect();
+                    return Err(UmError::new(
+                        ErrorCode::BlockNotFound,
+                        format!(
+                            "the key columns match {} rows of the table at {} (pointers: {})",
+                            matches.len(),
+                            entry.pointer,
+                            pointers.join(", ")
+                        ),
+                    )
+                    .with_details(json!({ "ambiguous": true, "pointers": pointers })));
+                }
+            }
+        };
+        match matched {
+            Some(row_index) => {
+                let row_entry = entry.rows[row_index].clone();
+                let row_path = pointer_path(&row_entry.pointer).ok_or_else(|| {
+                    UmError::internal(format!("row pointer {} does not parse", row_entry.pointer))
+                })?;
+                let mut row_children_changed = false;
+                for (entry_pair, &column_index) in row.iter().zip(&row_columns) {
+                    // the column name resolved to `column_index` above; the
+                    // write only needs its text
+                    let text = entry_pair.1.clone();
+                    match row_entry.cells.get(column_index) {
+                        Some(cell) => {
+                            let cell_path = pointer_path(&cell.pointer).ok_or_else(|| {
+                                UmError::internal(format!(
+                                    "cell pointer {} does not parse",
+                                    cell.pointer
+                                ))
+                            })?;
+                            let cell_node = node_at_mut(doc, &cell_path);
+                            self.write_cell_text(cell_node, &text);
+                        }
+                        None => {
+                            // the row is short (ragged): create the missing
+                            // cells — the gap positions up to the target
+                            // column get empty cells, the target gets the
+                            // text; all of them are new blocks
+                            let row_node = node_at_mut(doc, &row_path);
+                            let children = row_node
+                                .get_mut("content")
+                                .and_then(Value::as_array_mut)
+                                .ok_or_else(|| {
+                                    UmError::internal("a projected row carries a content array")
+                                })?;
+                            while children.len() < column_index {
+                                children.push(new_table_cell(""));
+                            }
+                            children.push(new_table_cell(&text));
+                            row_children_changed = true;
+                        }
+                    }
+                }
+                if row_children_changed && let Some(id) = row_entry.id.clone() {
+                    self.note_changed(&id);
+                }
+                Ok(())
+            }
+            None => {
+                // insert a fresh row: one cell per header column, the
+                // mentioned columns carry the payload text, the rest stay
+                // empty — the whole row is new (created_ids)
+                let width = entry.columns().len();
+                let mut cells = Vec::with_capacity(width);
+                for column_index in 0..width {
+                    let text = row_columns
+                        .iter()
+                        .position(|&index| index == column_index)
+                        .map(|position| row[position].1.clone())
+                        .unwrap_or_default();
+                    cells.push(new_table_cell(&text));
+                }
+                let new_row = json!({
+                    "type": "tableRow",
+                    "attrs": {},
+                    "content": cells,
+                });
+                // insertion point: right after the header row (top) or
+                // after the last row (bottom) — the projection pointers
+                // carry the true content-array indexes even when the table
+                // holds non-row children
+                let last_row_index = entry
+                    .rows
+                    .last()
+                    .and_then(|row| pointer_path(&row.pointer))
+                    .and_then(|path| path.last().copied())
+                    .ok_or_else(|| UmError::internal("the projected rows vanished"))?;
+                let insert_at = match position {
+                    RowPosition::Top => entry
+                        .rows
+                        .first()
+                        .and_then(|row| pointer_path(&row.pointer))
+                        .and_then(|path| path.last().copied())
+                        .map(|index| index + 1)
+                        .unwrap_or(last_row_index + 1),
+                    RowPosition::Bottom => last_row_index + 1,
+                };
+                let table_node = node_at_mut(doc, &table_path);
+                let children = table_node
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| UmError::internal("the table carries a content array"))?;
+                children.insert(insert_at.min(children.len()), new_row);
+                Ok(())
+            }
+        }
+    }
+
+    /// The text-only cell write (§8.3): the first block keeps its identity
+    /// when it is a paragraph (its inline content is replaced — unknown
+    /// inline nodes of the old text disappear with it), everything after
+    /// the first block is removed, and a cell that does not start with a
+    /// paragraph is rebuilt as one fresh paragraph. The cell node, its
+    /// attrs and its ID survive — the cell lands in `changed_ids`.
+    fn write_cell_text(&mut self, cell_node: &mut Value, value: &str) {
+        let text = value_inline_content(value);
+        let cell_id = node_id_of(cell_node);
+        let empty: Vec<Value> = Vec::new();
+        let children = cell_node
+            .get("content")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty)
+            .clone();
+        let first_is_paragraph = children
+            .first()
+            .and_then(|block| block.get("type"))
+            .and_then(Value::as_str)
+            == Some("paragraph");
+        let removed: Vec<Value> = if first_is_paragraph {
+            children[1..].to_vec()
+        } else {
+            children.clone()
+        };
+        // release the IDs of every removed block (the kept paragraph, when
+        // kept, stays registered)
+        for block in &removed {
+            let mut subtree_ids = Vec::new();
+            collect_ids(block, self.attrs_key, &mut subtree_ids);
+            for id in subtree_ids {
+                release_id(&mut self.live_ids, &id);
+            }
+        }
+        let mut new_children = Vec::with_capacity(1);
+        if first_is_paragraph {
+            let mut first = children[0].clone();
+            first["content"] = Value::Array(text);
+            new_children.push(first);
+        } else {
+            new_children.push(json!({
+                "type": "paragraph",
+                "attrs": {},
+                "content": text,
+            }));
+        }
+        if let Some(object) = cell_node.as_object_mut() {
+            object.insert("content".to_owned(), Value::Array(new_children));
+        }
+        if let Some(id) = cell_id {
+            self.note_changed(&id);
+        }
+    }
+}
+
+/// The inline content of a text-only value: an empty string mirrors the
+/// plugin's own empty-value shape (`content: []`), anything else is one
+/// text node — marks are not expressible in v1.
+fn value_inline_content(value: &str) -> Vec<Value> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "text", "text": value })]
+    }
+}
+
+/// A fresh data cell (`tableCell`) with one paragraph carrying `text`.
+fn new_table_cell(text: &str) -> Value {
+    json!({
+        "type": "tableCell",
+        "attrs": {},
+        "content": [{
+            "type": "paragraph",
+            "attrs": {},
+            "content": value_inline_content(text),
+        }],
+    })
+}
+
+/// The content-index path behind a projection pointer (`/content/a/…` —
+/// the pointers the props/tables projections emit).
+fn pointer_path(pointer: &str) -> Option<Vec<usize>> {
+    let tokens = crate::pointer::split(pointer).ok()?;
+    let mut path = Vec::with_capacity(tokens.len() / 2);
+    let mut tokens = tokens.into_iter();
+    while let Some(token) = tokens.next() {
+        if token != "content" {
+            return None;
+        }
+        let index = tokens.next()?;
+        path.push(index.parse().ok()?);
+    }
+    Some(path)
+}
+
+/// The projection pointer of a content-index path (the inverse of
+/// [`pointer_path`]).
+fn path_to_pointer(path: &[usize]) -> String {
+    path.iter()
+        .map(|index| format!("/content/{index}"))
+        .collect()
+}
+
+fn node_id_of(node: &Value) -> Option<String> {
+    node.get("attrs")
+        .and_then(|attrs| attrs.get(crate::model::ID_ATTR))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Point a failed operation back at its position in the package: the message
@@ -795,12 +1865,14 @@ struct CreatedBlock {
 }
 
 /// The result of applying a package to one document generation: the final
-/// document, the created/deleted ID bookkeeping and the validation verdict.
+/// document, the created/changed/deleted ID bookkeeping and the validation
+/// verdict.
 #[derive(Debug)]
 struct Generation {
     doc: Value,
     operations_applied: usize,
     created: Vec<CreatedBlock>,
+    changed: Vec<CreatedBlock>,
     deleted_ids: Vec<String>,
     warnings: Vec<Value>,
 }
@@ -828,7 +1900,12 @@ fn build_generation(
     collect_ids(&doc, attrs_key, &mut initial_ids);
     let ids_before: BTreeSet<String> = initial_ids.iter().cloned().collect();
 
-    let mut engine = Engine::new(attrs_key, addressable, counts_of(initial_ids));
+    let mut engine = Engine::new(
+        attrs_key,
+        addressable,
+        counts_of(initial_ids),
+        limits.max_depth,
+    );
     engine.apply(&mut doc, &package.operations)?;
     let operations_applied = package.operations.len();
     refuse_title_family_loss(doc_source, &doc)?;
@@ -836,14 +1913,26 @@ fn build_generation(
     // deleted = IDs present before the package and gone after it
     // (delete ops, replaced subtrees, dropped replace_content content);
     // the after-set comes from the engine's incremental counts
-    let ids_after_ops: BTreeSet<String> = engine.into_live_ids().into_keys().collect();
+    let (live_after, changed_raw) = engine.finish();
+    let ids_after_ops: BTreeSet<String> = live_after.into_keys().collect();
     let deleted_ids: Vec<String> = ids_before.difference(&ids_after_ops).cloned().collect();
+
+    // changed (§8.5): existing blocks the operations rewrote in place. A
+    // block the package itself created (created by an earlier operation,
+    // written by a later one) is new, not changed — only IDs of the
+    // before-set qualify; blocks a later operation deleted are reported as
+    // deleted, not changed.
+    let changed_wanted: BTreeSet<String> = changed_raw
+        .into_iter()
+        .filter(|id| ids_before.contains(id))
+        .collect();
 
     // assign IDs to the new addressable blocks, document order; a deleted
     // ID never comes back (§4.4: no intentional reuse)
     let mut used = ids_after_ops;
     used.extend(deleted_ids.iter().cloned());
     let mut created = Vec::new();
+    let mut changed = Vec::new();
     assign_missing_ids(
         &mut doc,
         "",
@@ -852,6 +1941,8 @@ fn build_generation(
         generator,
         &mut used,
         &mut created,
+        &changed_wanted,
+        &mut changed,
     )?;
 
     // full applicable validation of the RESULT (§8.6 step 3, §10): parity
@@ -871,6 +1962,7 @@ fn build_generation(
         doc,
         operations_applied,
         created,
+        changed,
         deleted_ids,
         warnings,
     })
@@ -878,6 +1970,11 @@ fn build_generation(
 
 /// Walk in document order; every addressable block without an ID receives
 /// a generated one and joins the created list with its final pointer.
+/// Nodes whose ID is in `changed_wanted` join the `changed` list with the
+/// same pointer discipline (§8.5: `changed_ids` pointers live in the final
+/// document) — the walk sees every node exactly once, so both lists come
+/// out in document order.
+#[allow(clippy::too_many_arguments)]
 fn assign_missing_ids(
     node: &mut Value,
     pointer: &str,
@@ -886,6 +1983,8 @@ fn assign_missing_ids(
     generator: &IdGenerator,
     used: &mut BTreeSet<String>,
     created: &mut Vec<CreatedBlock>,
+    changed_wanted: &BTreeSet<String>,
+    changed: &mut Vec<CreatedBlock>,
 ) -> Result<(), UmError> {
     if let Some(object) = node.as_object_mut() {
         let node_type = object
@@ -893,12 +1992,12 @@ fn assign_missing_ids(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let has_id = object
+        let existing_id = object
             .get("attrs")
             .and_then(|attrs| attrs.get(attrs_key))
             .and_then(Value::as_str)
-            .is_some();
-        if addressable.contains(&node_type) && !has_id {
+            .map(str::to_owned);
+        if addressable.contains(&node_type) && existing_id.is_none() {
             let id = generator.generate(used)?;
             match object.get_mut("attrs") {
                 Some(Value::Object(_)) => {}
@@ -922,6 +2021,14 @@ fn assign_missing_ids(
                 pointer: pointer.to_owned(),
                 node_type,
             });
+        } else if let Some(id) = existing_id
+            && changed_wanted.contains(&id)
+        {
+            changed.push(CreatedBlock {
+                id: id.clone(),
+                pointer: pointer.to_owned(),
+                node_type,
+            });
         }
     }
     if let Some(children) = node.get_mut("content").and_then(Value::as_array_mut) {
@@ -935,6 +2042,8 @@ fn assign_missing_ids(
                 generator,
                 used,
                 created,
+                changed_wanted,
+                changed,
             )?;
         }
     }
@@ -1561,7 +2670,9 @@ fn envelope_field_shape_error(field: &str) -> UmError {
 // ---------------------------------------------------------------------------
 
 /// Dry-run response: the package validated against the current state, no
-/// file effect, no promised final IDs (§8.5).
+/// file effect, no promised final IDs (§8.5). `would_change_count` counts
+/// the existing blocks the state operations would rewrite in place — their
+/// IDs already exist, but the enumeration belongs to the commit answer.
 fn dry_run_response(
     path: &Path,
     note_id: Option<&str>,
@@ -1576,6 +2687,7 @@ fn dry_run_response(
         "note_id": note_id.map(|id| Value::String(id.to_owned())).unwrap_or(Value::Null),
         "operations_validated": plan.operations_applied,
         "would_create_count": plan.created.len(),
+        "would_change_count": plan.changed.len(),
         "would_delete_ids": plan
             .deleted_ids
             .iter()
@@ -1587,7 +2699,7 @@ fn dry_run_response(
 }
 
 /// Commit response (§8.5): revisions before/after, applied count, the full
-/// created/deleted bookkeeping and the parity warnings.
+/// created/changed/deleted bookkeeping and the parity warnings.
 #[allow(clippy::too_many_arguments)]
 fn commit_response(
     path: &Path,
@@ -1621,6 +2733,17 @@ fn commit_response(
                 })
             })
             .collect::<Vec<_>>(),
+        "changed_ids": plan
+            .changed
+            .iter()
+            .map(|block| {
+                json!({
+                    "id": block.id,
+                    "pointer": block.pointer,
+                    "type": block.node_type,
+                })
+            })
+            .collect::<Vec<_>>(),
         "deleted_ids": plan
             .deleted_ids
             .iter()
@@ -1638,22 +2761,25 @@ fn commit_response(
 /// so the committed "the operation itself covered every operation" clause
 /// would be a lie — the dry-run names the plan instead. A dry-run also
 /// never enumerates created blocks (§8.5: final IDs are not promised, only
-/// `would_create_count` is sent), so its text carries the created COUNT —
-/// a kept/total pair would read as if a created list had been truncated.
+/// `would_create_count`/`would_change_count` are sent), so its text carries
+/// the created/changed COUNTS — kept/total pairs would read as if created
+/// or changed lists had been truncated.
 fn id_list_budget_warning(
     created_returned: usize,
     created_total: usize,
+    changed_returned: usize,
+    changed_total: usize,
     deleted_returned: usize,
     deleted_total: usize,
     dry_run: bool,
 ) -> Value {
     let message = if dry_run {
         format!(
-            "the plan holds {created_total} created blocks (counted, not enumerated) and {deleted_returned}/{deleted_total} deleted ids to fit the output budget; the dry-run applied nothing — re-run without --dry-run to cover every operation, or raise UM_MAX_OUTPUT_BYTES to enumerate the plan"
+            "the plan holds {created_total} created blocks, {changed_total} changed blocks (counted, not enumerated) and {deleted_returned}/{deleted_total} deleted ids to fit the output budget; the dry-run applied nothing — re-run without --dry-run to cover every operation, or raise UM_MAX_OUTPUT_BYTES to enumerate the plan"
         )
     } else {
         format!(
-            "the id lists hold {created_returned}/{created_total} created and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs"
+            "the id lists hold {created_returned}/{created_total} created, {changed_returned}/{changed_total} changed and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs"
         )
     };
     json!({
@@ -1712,6 +2838,17 @@ fn budget_response(
             })
         })
         .collect();
+    let changed_json: Vec<Value> = plan
+        .changed
+        .iter()
+        .map(|block| {
+            json!({
+                "id": block.id,
+                "pointer": block.pointer,
+                "type": block.node_type,
+            })
+        })
+        .collect();
     let deleted_json: Vec<Value> = plan
         .deleted_ids
         .iter()
@@ -1724,6 +2861,14 @@ fn budget_response(
     } else {
         let (kept, dropped) = budget.fit(&created_json);
         response["created_ids"] = Value::Array(kept);
+        dropped
+    };
+    let changed_dropped: usize = if dry_run {
+        // a dry-run carries only the count — same discipline as created
+        0
+    } else {
+        let (kept, dropped) = budget.fit(&changed_json);
+        response["changed_ids"] = Value::Array(kept);
         dropped
     };
     let deleted_dropped = {
@@ -1750,11 +2895,15 @@ fn budget_response(
     let (kept_warnings, warnings_dropped) = budget.fit(&warnings_json);
     response["warnings"] = Value::Array(kept_warnings);
 
-    let truncated = created_dropped > 0 || deleted_dropped > 0 || warnings_dropped > 0;
+    let truncated =
+        created_dropped > 0 || changed_dropped > 0 || deleted_dropped > 0 || warnings_dropped > 0;
     if truncated {
         response["truncated"] = json!(true);
         if created_dropped > 0 {
             response["created_ids_total"] = json!(plan.created.len());
+        }
+        if changed_dropped > 0 {
+            response["changed_ids_total"] = json!(plan.changed.len());
         }
         if deleted_dropped > 0 {
             response["deleted_ids_total"] = json!(plan.deleted_ids.len());
@@ -1762,12 +2911,14 @@ fn budget_response(
         if warnings_dropped > 0 {
             response["warnings_total"] = json!(warnings_json.len());
         }
-        if created_dropped > 0 || deleted_dropped > 0 {
+        if created_dropped > 0 || changed_dropped > 0 || deleted_dropped > 0 {
             crate::budget::push_warning(
                 &mut response,
                 id_list_budget_warning(
                     created_json.len() - created_dropped,
                     created_json.len(),
+                    changed_json.len() - changed_dropped,
+                    changed_json.len(),
                     deleted_json.len() - deleted_dropped,
                     deleted_json.len(),
                     dry_run,
@@ -1813,15 +2964,18 @@ fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
         "operations_applied": 0,
         "created_ids": [],
         "created_ids_total": 0,
+        "changed_ids": [],
+        "changed_ids_total": 0,
         "deleted_ids": [],
         "deleted_ids_total": 0,
         "operations_validated": 0,
         "would_create_count": 0,
+        "would_change_count": 0,
         "would_delete_ids": [],
         "truncated": true,
         "warnings_total": 0,
         "warnings": [
-            id_list_budget_warning(0, 0, 0, 0, false),
+            id_list_budget_warning(0, 0, 0, 0, 0, 0, false),
             warnings_budget_warning(0, 0, false),
         ],
     });
@@ -2475,6 +3629,7 @@ mod tests {
             h.rules.attrs_key(),
             &h.addressable,
             id_counts(&doc, h.rules.attrs_key()),
+            Limits::defaults().max_depth,
         );
         engine
             .apply(
@@ -2666,6 +3821,7 @@ mod tests {
             h.rules.attrs_key(),
             &h.addressable,
             id_counts(&doc, h.rules.attrs_key()),
+            Limits::defaults().max_depth,
         );
 
         // restate the id: fine
@@ -2730,6 +3886,7 @@ mod tests {
             h.rules.attrs_key(),
             &h.addressable,
             id_counts(&doc, h.rules.attrs_key()),
+            Limits::defaults().max_depth,
         );
         let err = engine
             .apply(
@@ -2777,6 +3934,7 @@ mod tests {
             h.rules.attrs_key(),
             &h.addressable,
             id_counts(&doc, h.rules.attrs_key()),
+            Limits::defaults().max_depth,
         );
 
         // a later operation on the deleted ID fails with BLOCK_NOT_FOUND
@@ -2857,6 +4015,7 @@ mod tests {
             h.rules.attrs_key(),
             &h.addressable,
             id_counts(&doc, h.rules.attrs_key()),
+            Limits::defaults().max_depth,
         );
 
         engine
@@ -2959,6 +4118,7 @@ mod tests {
             h.rules.attrs_key(),
             &h.addressable,
             id_counts(&doc, h.rules.attrs_key()),
+            Limits::defaults().max_depth,
         );
 
         // restating a live ID from outside the target's current content
@@ -3531,11 +4691,11 @@ mod tests {
         let message = id_warning_message(&dry);
         assert!(message.contains("the plan holds"), "{message}");
         assert!(
-            message.contains("created blocks (counted, not enumerated)"),
-            "the dry-run counts the created blocks instead of a kept/total pair: {message}"
+            message.contains("changed blocks (counted, not enumerated)"),
+            "the dry-run counts the created/changed blocks instead of a kept/total pair: {message}"
         );
         assert!(
-            !message.contains("created and"),
+            !message.contains(" created and"),
             "the dry-run never enumerates created ids, so no created pair: {message}"
         );
         assert!(message.contains("the dry-run applied nothing"), "{message}");
