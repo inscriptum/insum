@@ -110,7 +110,12 @@ pub(crate) fn pre_replace_verification(
 }
 
 /// A revision guard refusal (§11 `NOTE_REVISION_MISMATCH`): the base the
-/// caller built its plan on is no longer the current state.
+/// caller built its plan on is no longer the current state. The code and
+/// the expected/actual details are the registry contract every write
+/// command shares; the message and hint built here are the shared
+/// write-path texts — a command with its own texts overrides them with
+/// `with_message`/`with_hint` instead of carrying a private copy of the
+/// whole guard (CON-8).
 pub(crate) fn revision_mismatch(expected: &str, actual: &str, what: &str) -> UmError {
     UmError::new(
         ErrorCode::NoteRevisionMismatch,

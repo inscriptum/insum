@@ -14,7 +14,8 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 use crate::commit::{
-    StagedFile, ensure_writable_source, payload_bytes, pre_replace_verification, rewrite_um_entries,
+    StagedFile, ensure_writable_source, payload_bytes, pre_replace_verification, revision_mismatch,
+    rewrite_um_entries,
 };
 use crate::container::{NoteFile, UmContainer, note_rev_for_file_bytes};
 use crate::error::{ErrorCode, UmError};
@@ -479,18 +480,6 @@ fn resolve_for_write(
     Ok(resolved)
 }
 
-/// The migration-flavored revision guard refusal: same registry code and
-/// details as the shared write-path guard (`commit::revision_mismatch`),
-/// with the command-specific message and hint.
-fn revision_mismatch(expected: &str, actual: &str, what: &str) -> UmError {
-    UmError::new(
-        ErrorCode::NoteRevisionMismatch,
-        format!("{what} changed after the migration plan was built"),
-    )
-    .with_hint("Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.")
-    .with_details(json!({ "expected": expected, "actual": actual }))
-}
-
 /// The change report is budgeted like every other command's output (§5.5):
 /// note plans are appended whole while they fit `UM_MAX_OUTPUT_BYTES`, and
 /// an incomplete report says so explicitly (§6.5 — silent truncation is
@@ -570,38 +559,30 @@ fn envelope_overhead(path: &Path) -> usize {
 /// oversized block) — a response must at least name what it did. `commit`
 /// reserves the per-note post-write growth (D-1): the commit adds
 /// `new_note_rev` after this pass, and the budget must hold for the final
-/// bytes.
+/// bytes. The measure/fit rule itself is the shared output-budget
+/// primitive (`crate::budget`, CON-7); only the reserve and the report
+/// shape stay migrate-specific.
 fn budgeted_report(
     plans: &[MigrateNotePlan],
     limits: &Limits,
     path: &Path,
     commit: bool,
 ) -> Report {
-    let budget = limits.output_bytes(None);
-    let mut used = envelope_overhead(path)
-        + if commit {
-            plans.len().saturating_mul(COMMIT_NOTE_RESERVE)
-        } else {
-            0
-        };
-    let mut notes = Vec::new();
-    for plan in plans {
-        let note_json = plan.to_json();
-        let size = serde_json::to_string(&note_json).map_or(256, |s| s.len() + 1);
-        if !notes.is_empty() && used + size > budget {
-            return Report {
-                notes,
-                notes_total: plans.len(),
-                truncated: true,
-            };
-        }
-        used += size + 1;
-        notes.push(note_json);
-    }
+    let reserve = if commit {
+        plans.len().saturating_mul(COMMIT_NOTE_RESERVE)
+    } else {
+        0
+    };
+    let mut budget = crate::budget::OutputBudget::new(
+        limits.output_bytes(None),
+        envelope_overhead(path) + reserve,
+    );
+    let entries: Vec<Value> = plans.iter().map(|plan| plan.to_json()).collect();
+    let (notes, dropped) = budget.fit(&entries);
     Report {
         notes,
         notes_total: plans.len(),
-        truncated: false,
+        truncated: dropped > 0,
     }
 }
 
@@ -614,16 +595,13 @@ fn apply_report_truncation(response: &mut Value, report: &Report, committed: boo
     response["truncated"] = json!(true);
     response["notes_total"] = json!(report.notes_total);
     response["notes_returned"] = json!(report.notes.len());
-    let mut warnings = response
-        .get("warnings")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    warnings.push(json!({
-        "code": "OUTPUT_BUDGET",
-        "message": truncation_warning_message(report.notes.len(), report.notes_total, committed),
-    }));
-    response["warnings"] = Value::Array(warnings);
+    crate::budget::push_warning(
+        response,
+        json!({
+            "code": "OUTPUT_BUDGET",
+            "message": truncation_warning_message(report.notes.len(), report.notes_total, committed),
+        }),
+    );
 }
 
 /// Response of `migrate-ids` on a `.um` container (§7.2).
@@ -928,11 +906,15 @@ fn commit_um(
     let mut reopened = UmContainer::open(path, limits)?;
     let file_rev_now = reopened.file_rev()?;
     if file_rev_now != file_rev_before {
-        return Err(revision_mismatch(
-            &file_rev_before,
-            &file_rev_now,
-            "the file",
-        ));
+        // CON-8: the shared write-path guard carries the code and details;
+        // only the message and hint are the command's own
+        return Err(
+            revision_mismatch(&file_rev_before, &file_rev_now, "the file")
+                .with_message("the file changed after the migration plan was built")
+                .with_hint(
+                    "Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.",
+                ),
+        );
     }
     for (plan, descriptor) in plans.iter().zip(selected.iter()) {
         if plan.changes.is_empty() {
@@ -940,11 +922,14 @@ fn commit_um(
         }
         let parsed = reopened.read_note_with_rev(descriptor, limits)?;
         if parsed.note_rev != plan.note_rev {
-            return Err(revision_mismatch(
-                &plan.note_rev,
-                &parsed.note_rev,
-                &format!("note {:?}", descriptor.id),
-            ));
+            return Err(revision_mismatch(&plan.note_rev, &parsed.note_rev, "the note")
+                .with_message(format!(
+                    "note {:?} changed after the migration plan was built",
+                    descriptor.id
+                ))
+                .with_hint(
+                    "Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.",
+                ));
         }
     }
 
@@ -1200,11 +1185,13 @@ fn commit_note_file(
     // re-read of the file, no envelope fields from another generation)
     let (reopened, raw) = NoteFile::open_with_raw(path, limits, true)?;
     if reopened.note_rev != expected_rev {
-        return Err(revision_mismatch(
-            expected_rev,
-            &reopened.note_rev,
-            "the .note file",
-        ));
+        return Err(
+            revision_mismatch(expected_rev, &reopened.note_rev, "the .note file")
+                .with_message("the .note file changed after the migration plan was built")
+                .with_hint(
+                    "Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.",
+                ),
+        );
     }
 
     let mut doc = reopened.note.doc;

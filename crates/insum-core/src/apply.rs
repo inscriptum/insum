@@ -1603,34 +1603,51 @@ fn commit_response(
     budget_response(response, plan, limits, false)
 }
 
-/// Fit the response into the output budget (§5.5, §6.5): the ID lists are
-/// truncated with explicit totals and an OUTPUT_BUDGET warning — never
-/// silently. The write itself always covered every operation.
+/// The OUTPUT_BUDGET warning of a truncated ID list. One source for the
+/// real warning and for the envelope skeleton the budget measures over —
+/// the two cannot drift apart (D-1, same discipline as migrate's).
+fn id_list_budget_warning(
+    created_returned: usize,
+    created_total: usize,
+    deleted_returned: usize,
+    deleted_total: usize,
+) -> Value {
+    json!({
+        "code": "OUTPUT_BUDGET",
+        "message": format!(
+            "the id lists hold {created_returned}/{created_total} created and {deleted_returned}/{deleted_total} deleted entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs",
+        ),
+    })
+}
+
+/// The OUTPUT_BUDGET warning of a truncated warnings list (COR-4). One
+/// source for the real warning and for the envelope skeleton (D-1).
+fn warnings_budget_warning(warnings_returned: usize, warnings_total: usize) -> Value {
+    json!({
+        "code": "OUTPUT_BUDGET",
+        "message": format!(
+            "the warnings hold {warnings_returned}/{warnings_total} entries to fit the output budget; the operation itself covered every operation — run `insum validate` on the note to enumerate the remaining diagnostics",
+        ),
+    })
+}
+
+/// Fit the response into the output budget (§5.5, §6.5): the ID lists and
+/// the parity warnings are truncated with explicit totals and OUTPUT_BUDGET
+/// warnings — never silently. The write itself always covered every
+/// operation.
 fn budget_response(
     mut response: Value,
     plan: &Generation,
     limits: &Limits,
     dry_run: bool,
 ) -> Value {
-    let budget = limits.output_bytes(None);
-    let mut used = envelope_overhead(
-        Path::new(response["path"].as_str().unwrap_or(".")),
-        response.get("note_id").and_then(Value::as_str),
+    let mut budget = crate::budget::OutputBudget::new(
+        limits.output_bytes(None),
+        envelope_overhead(
+            Path::new(response["path"].as_str().unwrap_or(".")),
+            response.get("note_id").and_then(Value::as_str),
+        ),
     );
-
-    let fit = |entries: &[Value], used: &mut usize| -> (Vec<Value>, usize) {
-        let mut kept = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let size = serde_json::to_string(entry).map_or(128, |s| s.len() + 1);
-            if !kept.is_empty() && *used + size > budget {
-                break;
-            }
-            *used += size;
-            kept.push(entry.clone());
-        }
-        let dropped = entries.len() - kept.len();
-        (kept, dropped)
-    };
 
     let created_json: Vec<Value> = plan
         .created
@@ -1653,7 +1670,7 @@ fn budget_response(
         // a dry-run carries only the count (§8.5: final IDs are not promised)
         0
     } else {
-        let (kept, dropped) = fit(&created_json, &mut used);
+        let (kept, dropped) = budget.fit(&created_json);
         response["created_ids"] = Value::Array(kept);
         dropped
     };
@@ -1663,12 +1680,25 @@ fn budget_response(
         } else {
             "deleted_ids"
         };
-        let (kept, dropped) = fit(&deleted_json, &mut used);
+        let (kept, dropped) = budget.fit(&deleted_json);
         response[list_name] = Value::Array(kept);
         dropped
     };
 
-    let truncated = created_dropped > 0 || deleted_dropped > 0;
+    // COR-4: the parity warnings share the budget — one SCHEMA_ATTR_UNKNOWN
+    // per node can carry hundreds of entries, and a warnings array inserted
+    // whole would overflow UM_MAX_OUTPUT_BYTES without any marker. They fit
+    // into what the ID lists left, under the ID lists' own discipline:
+    // explicit `warnings_total` + an OUTPUT_BUDGET warning (§6.5).
+    let warnings_json = response
+        .get("warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let (kept_warnings, warnings_dropped) = budget.fit(&warnings_json);
+    response["warnings"] = Value::Array(kept_warnings);
+
+    let truncated = created_dropped > 0 || deleted_dropped > 0 || warnings_dropped > 0;
     if truncated {
         response["truncated"] = json!(true);
         if created_dropped > 0 {
@@ -1677,29 +1707,37 @@ fn budget_response(
         if deleted_dropped > 0 {
             response["deleted_ids_total"] = json!(plan.deleted_ids.len());
         }
-        let mut warnings = response
-            .get("warnings")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        warnings.push(json!({
-            "code": "OUTPUT_BUDGET",
-            "message": format!(
-                "the id lists hold {}/{} created and {}/{} deleted entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs",
-                created_json.len() - created_dropped,
-                created_json.len(),
-                deleted_json.len() - deleted_dropped,
-                deleted_json.len(),
-            ),
-        }));
-        response["warnings"] = Value::Array(warnings);
+        if warnings_dropped > 0 {
+            response["warnings_total"] = json!(warnings_json.len());
+        }
+        if created_dropped > 0 || deleted_dropped > 0 {
+            crate::budget::push_warning(
+                &mut response,
+                id_list_budget_warning(
+                    created_json.len() - created_dropped,
+                    created_json.len(),
+                    deleted_json.len() - deleted_dropped,
+                    deleted_json.len(),
+                ),
+            );
+        }
+        if warnings_dropped > 0 {
+            crate::budget::push_warning(
+                &mut response,
+                warnings_budget_warning(
+                    warnings_json.len() - warnings_dropped,
+                    warnings_json.len(),
+                ),
+            );
+        }
     }
     response
 }
 
 /// Response envelope overhead measured over the largest possible skeleton
-/// (committed, truncated, both totals) — the budget must hold for whichever
-/// shape is finally emitted (§6.5, same discipline as migrate's D-1).
+/// (committed, truncated, both ID-list totals, the warnings total and BOTH
+/// OUTPUT_BUDGET texts) — the budget must hold for whichever shape is
+/// finally emitted (§6.5, same discipline as migrate's D-1).
 fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
     let skeleton = json!({
         "api_version": 1,
@@ -1720,10 +1758,11 @@ fn envelope_overhead(path: &Path, note_id: Option<&str>) -> usize {
         "would_create_count": 0,
         "would_delete_ids": [],
         "truncated": true,
-        "warnings": [{
-            "code": "OUTPUT_BUDGET",
-            "message": "the id lists hold 0 of 0 entries to fit the output budget; the operation itself covered every operation — re-read the note with `insum tree` to enumerate the final IDs",
-        }],
+        "warnings_total": 0,
+        "warnings": [
+            id_list_budget_warning(0, 0, 0, 0),
+            warnings_budget_warning(0, 0),
+        ],
     });
     serde_json::to_string(&skeleton).map_or(1024, |s| s.len() + 16)
 }
@@ -2047,6 +2086,43 @@ mod tests {
             let descriptor = container.find_note(note).unwrap().clone();
             let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
             parsed.note.doc
+        }
+
+        /// A plan whose result carries `warnings` parity diagnostics: one
+        /// appended paragraph with `warnings` unknown attribute keys — one
+        /// SCHEMA_ATTR_UNKNOWN per key, the bulk-warning shape of COR-4.
+        fn plan_with_unknown_attr_warnings(&self, warnings: usize) -> Generation {
+            let limits = self.limits();
+            let mut container = UmContainer::open(&self.path, &limits).unwrap();
+            let descriptor = container.find_note(&self.note1).unwrap().clone();
+            let parsed = container.read_note_with_rev(&descriptor, &limits).unwrap();
+            let mut attrs = Map::new();
+            for index in 0..warnings {
+                attrs.insert(format!("zz{index:04}"), json!(index));
+            }
+            let package = Package {
+                note_id: Some(self.note1.clone()),
+                base_note_rev: parsed.note_rev.clone(),
+                if_match: None,
+                operations: vec![Operation::AppendChild {
+                    parent_id: None,
+                    nodes: vec![json!({
+                        "type": "paragraph",
+                        "attrs": Value::Object(attrs),
+                        "content": [{"type": "text", "text": "noisy"}],
+                    })],
+                }],
+            };
+            build_generation(
+                &parsed.note.doc,
+                &package,
+                &self.rules,
+                &self.generator,
+                &self.addressable,
+                &self.pm,
+                &limits,
+            )
+            .unwrap()
         }
     }
 
@@ -2823,6 +2899,151 @@ mod tests {
             fs::read(&path).unwrap(),
             before,
             "the refusal touched nothing"
+        );
+    }
+
+    /// COR-4: the parity warnings are budgeted like every other response
+    /// list. A document whose validation yields one SCHEMA_ATTR_UNKNOWN per
+    /// unknown attribute can carry hundreds of them; a warnings array
+    /// inserted whole would push the response past UM_MAX_OUTPUT_BYTES
+    /// without any marker (§6.5 — silent overflow is forbidden). The
+    /// overflow is explicit: `truncated`, an honest `warnings_total`, and
+    /// an OUTPUT_BUDGET warning that names the kept/total counts — and the
+    /// budget holds for the serialized bytes.
+    #[test]
+    fn warnings_overshoot_the_budget_explicitly() {
+        let harness = Harness::new();
+        // the fixture document carries its own parity warnings (the
+        // noteSummary block) — the baseline every plan below adds to
+        let baseline = harness.plan_with_unknown_attr_warnings(0).warnings.len();
+        let plan = harness.plan_with_unknown_attr_warnings(60);
+        let total = plan.warnings.len();
+        assert_eq!(
+            total,
+            baseline + 60,
+            "the fixture yields one warning per unknown attribute"
+        );
+
+        let mut limits = harness.limits();
+        limits.max_output_bytes = 3000;
+
+        let response = dry_run_response(&harness.path, Some(&harness.note1), &plan, &limits);
+        let bytes = serde_json::to_string(&response).unwrap();
+        assert!(
+            bytes.len() <= limits.max_output_bytes,
+            "the response ({} bytes) fits the budget of {}",
+            bytes.len(),
+            limits.max_output_bytes
+        );
+        assert_eq!(response["truncated"], true);
+        assert_eq!(response["warnings_total"], total, "the total stays honest");
+        let warnings = response["warnings"].as_array().unwrap();
+        let kept = warnings.len() - 1; // the OUTPUT_BUDGET warning is appended after the fit
+        assert!(
+            kept >= 1 && kept < total,
+            "the first warning is kept whole (documented exception) and the rest is cut: {kept} kept"
+        );
+        let budget_warning = warnings.last().unwrap();
+        assert_eq!(budget_warning["code"], "OUTPUT_BUDGET");
+        let message = budget_warning["message"].as_str().unwrap();
+        let expected_counts = format!("the warnings hold {kept}/{total} entries");
+        assert!(
+            message.contains(&expected_counts),
+            "the warning names the honest counts: {message}"
+        );
+        assert!(
+            message.contains("insum validate"),
+            "the warning names the route to the remainder: {message}"
+        );
+
+        // the commit response shares the same discipline: the warnings fit
+        // into what the created/deleted lists left over, the lists stay
+        // whole (they are budgeted first), the bytes stay inside the budget
+        let response = commit_response(
+            &harness.path,
+            Some(&harness.note1),
+            &plan,
+            "old",
+            "new",
+            "old",
+            "new",
+            &limits,
+        );
+        let bytes = serde_json::to_string(&response).unwrap();
+        assert!(
+            bytes.len() <= limits.max_output_bytes,
+            "the committed response ({} bytes) fits the budget of {}",
+            bytes.len(),
+            limits.max_output_bytes
+        );
+        assert_eq!(response["truncated"], true);
+        assert_eq!(response["warnings_total"], total);
+        assert_eq!(
+            response["created_ids"].as_array().unwrap().len(),
+            plan.created.len(),
+            "the created list stays whole (it is budgeted first)"
+        );
+        let warnings = response["warnings"].as_array().unwrap();
+        assert_eq!(warnings.last().unwrap()["code"], "OUTPUT_BUDGET");
+        assert!(
+            warnings.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!(
+                    "the warnings hold {}/{total} entries",
+                    warnings.len() - 1
+                )),
+            "the committed warning names the honest counts"
+        );
+    }
+
+    /// The response shape is stable when nothing is truncated (COR-4): a
+    /// small response gains none of the budget bookkeeping fields — no
+    /// `truncated`, no `*_total` — and carries the warnings and ID lists
+    /// whole, exactly as before the warnings were budgeted.
+    #[test]
+    fn small_responses_keep_their_shape() {
+        let harness = Harness::new();
+        let plan = harness.plan_with_unknown_attr_warnings(2);
+        let limits = harness.limits();
+
+        let response = dry_run_response(&harness.path, Some(&harness.note1), &plan, &limits);
+        assert!(response.get("truncated").is_none(), "dry-run: {response}");
+        assert!(response.get("warnings_total").is_none());
+        assert!(response.get("created_ids_total").is_none());
+        assert!(response.get("deleted_ids_total").is_none());
+        assert_eq!(
+            response["warnings"].as_array().unwrap().len(),
+            plan.warnings.len(),
+            "the warnings are carried whole"
+        );
+        assert_eq!(response["would_create_count"], plan.created.len());
+
+        let response = commit_response(
+            &harness.path,
+            Some(&harness.note1),
+            &plan,
+            "old",
+            "new",
+            "old",
+            "new",
+            &limits,
+        );
+        assert!(response.get("truncated").is_none(), "commit: {response}");
+        assert!(response.get("warnings_total").is_none());
+        assert!(response.get("created_ids_total").is_none());
+        assert!(response.get("deleted_ids_total").is_none());
+        assert_eq!(
+            response["warnings"].as_array().unwrap().len(),
+            plan.warnings.len()
+        );
+        assert_eq!(
+            response["created_ids"].as_array().unwrap().len(),
+            plan.created.len()
+        );
+        assert_eq!(
+            response["deleted_ids"].as_array().unwrap().len(),
+            plan.deleted_ids.len()
         );
     }
 }

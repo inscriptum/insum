@@ -8,6 +8,7 @@
 //! The public behavior contract is summarized in `docs/insum-spec.md`.
 
 pub mod apply;
+pub mod budget;
 pub mod canon;
 pub mod commit;
 pub mod container;
