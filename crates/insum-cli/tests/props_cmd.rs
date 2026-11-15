@@ -236,6 +236,29 @@ fn props_get_hits_exactly() {
     );
 }
 
+/// --get matches ROWS, not flattened entries (review round-1 MINOR-1): a
+/// list-typed row (one name, several notePropertyValue nodes) is one
+/// legitimate property — the response carries ALL of its value entries
+/// instead of a false ambiguity report.
+#[test]
+fn props_get_returns_all_values_of_one_list_row() {
+    let corpus = Corpus::new();
+    let file = corpus.path("props.um");
+    let json = run_json(&["props", &file, "--get", "state"]);
+    let properties = json["properties"].as_array().expect("array");
+    assert_eq!(properties.len(), 2, "one list row, two value entries");
+    assert_eq!(properties[0]["value"], "todo");
+    assert_eq!(properties[1]["value"], "done");
+    // both entries belong to ONE row — the same property_pointer, distinct
+    // value nodes; the duplicate-name error would have pointed at two rows
+    assert_eq!(properties[0]["property_pointer"], "/content/2");
+    assert_eq!(properties[1]["property_pointer"], "/content/2");
+    assert_ne!(
+        properties[0]["value_pointer"],
+        properties[1]["value_pointer"]
+    );
+}
+
 #[test]
 fn props_get_misses_with_property_not_found() {
     let corpus = Corpus::new();
@@ -501,8 +524,9 @@ fn ls_directory_listing_gains_note_details_with_the_flags() {
 
 #[test]
 fn ls_without_the_flags_keeps_the_plain_listing_shape() {
-    // structural regression: no flag, no new keys — the byte-for-byte
-    // comparison against master runs in the workspace smoke (git worktree)
+    // structural regression: no flag, no new keys; the exact bytes are
+    // pinned by ls_without_flags_matches_the_golden_bytes (and were
+    // independently compared against a master worktree build)
     let corpus = Corpus::new();
     let file = corpus.path("props.um");
 
@@ -584,6 +608,128 @@ fn ls_without_the_flags_keeps_the_plain_listing_shape() {
             "path"
         ]
     );
+}
+
+/// Byte-level regression gate for `ls` WITHOUT the flags (the review
+/// round-1 MINOR-3): the committed golden files pin the exact stdout bytes
+/// of three listing shapes over deterministic fixtures (fixed ZIP
+/// timestamps, sequential ULIDs). Only two fields are normalized before
+/// the comparison — `path` (a per-run temp directory, OS-specific) and
+/// `mtime` (the wall clock of the fixture write); every other byte of the
+/// response — keys, values, ordering, formatting — must match, so a change
+/// to the plain listing under the flags-off path breaks this test in CI.
+///
+/// Regenerate the goldens with `INSUM_UPDATE_GOLDEN=1 cargo test --test
+/// props_cmd` and commit the diff (it should be exactly the intentional
+/// listing change). Windows-safe: the output is one JSON document with `/`
+/// paths, and the comparison strips `\r` from the golden bytes, so an
+/// autocrlf checkout cannot fail the gate.
+#[test]
+fn ls_without_flags_matches_the_golden_bytes() {
+    let dir = TempDir::new().expect("tempdir");
+    fixtures::minimal_container(&dir.path().join("minimal.um")).expect("minimal fixture");
+    fixtures::write_legacy_note(
+        &dir.path().join("legacy.note"),
+        &fixtures::plain_doc(&[fixtures::paragraph(&[fixtures::text("Legacy note body")])]),
+    )
+    .expect("legacy fixture");
+    let minimal = dir.path().join("minimal.um");
+    let legacy = dir.path().join("legacy.note");
+    let root = dir.path().to_path_buf();
+    let cases: [(&str, Vec<String>); 3] = [
+        (
+            "ls_notebook_file.golden",
+            vec!["ls".to_owned(), minimal.to_string_lossy().into_owned()],
+        ),
+        (
+            "ls_directory.golden",
+            vec!["ls".to_owned(), root.to_string_lossy().into_owned()],
+        ),
+        (
+            "ls_note_file.golden",
+            vec!["ls".to_owned(), legacy.to_string_lossy().into_owned()],
+        ),
+    ];
+    for (golden_name, args) in &cases {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = insum().args(&args).output().expect("insum runs");
+        assert!(
+            output.status.success(),
+            "ls {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = normalize_listing(&output.stdout);
+        let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("goldens")
+            .join(golden_name);
+        if std::env::var_os("INSUM_UPDATE_GOLDEN").is_some() {
+            if let Some(parent) = golden_path.parent() {
+                fs::create_dir_all(parent).expect("goldens directory");
+            }
+            fs::write(&golden_path, &actual).expect("golden write");
+            continue;
+        }
+        let expected: Vec<u8> = fs::read(&golden_path)
+            .unwrap_or_else(|err| panic!("golden {golden_name} reads: {err}"))
+            .into_iter()
+            .filter(|byte| *byte != b'\r')
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&actual),
+            String::from_utf8_lossy(&expected),
+            "ls without the flags drifted from the committed golden ({golden_name}); if the change is intentional, regenerate with INSUM_UPDATE_GOLDEN=1 and commit"
+        );
+    }
+}
+
+/// The only run-dependent fields of a listing are the user path (a temp
+/// directory here) and the file mtime; both are replaced with markers and
+/// the document is re-serialized compactly — the same rendering the CLI
+/// uses, so the re-serialization is byte-faithful.
+fn normalize_listing(stdout: &[u8]) -> Vec<u8> {
+    let mut value: Value = serde_json::from_slice(stdout).expect("one JSON document");
+    normalize_paths_and_mtime(&mut value);
+    let mut text = serde_json::to_string(&value).expect("re-serialize");
+    text.push('\n');
+    text.into_bytes()
+}
+
+fn normalize_paths_and_mtime(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(is_run_specific_path)
+            {
+                map.insert("path".to_owned(), Value::String("<PATH>".to_owned()));
+            }
+            if map.contains_key("mtime") {
+                map.insert("mtime".to_owned(), Value::String("<MTIME>".to_owned()));
+            }
+            for child in map.values_mut() {
+                normalize_paths_and_mtime(child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(normalize_paths_and_mtime),
+        _ => {}
+    }
+}
+
+/// Only ABSOLUTE paths are run-specific (the temp directory: a leading `/`
+/// on unix, a `C:\`-style drive prefix on windows). Manifest payload paths
+/// like `notes/<id>.json` are relative and deterministic — they stay
+/// byte-pinned in the golden.
+fn is_run_specific_path(text: &str) -> bool {
+    if text.starts_with('/') {
+        return true;
+    }
+    let mut chars = text.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic()
+    )
 }
 
 #[test]
@@ -676,15 +822,13 @@ fn read_only_commands_leave_the_source_bytes_unchanged() {
     assert_eq!(before, after, "props/ls never write");
 }
 
+/// Cross-platform SHA-256 via the `sha2` dev-dependency: tests never spawn
+/// external binaries — `shasum` is a Perl script that Windows runners do
+/// not resolve (review round-1 MAJOR-1; platform lesson V-04).
 fn sha256(path: &Path) -> String {
-    let output = std::process::Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .expect("shasum runs");
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .expect("hash")
-        .to_owned()
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).expect("source file reads");
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
 }

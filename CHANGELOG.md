@@ -12,7 +12,9 @@ Format — Keep a Changelog; versioning — SemVer.
   `{name, value, name_id, value_id}` with node pointers and `note_rev` in
   the envelope); a page without properties or a missed `--get` name is an
   explicit `PROPERTY_NOT_FOUND` (exit 3) whose hint explains that this is
-  a normal state, and a duplicated name is an ambiguity error.
+  a normal state, one row holding the name returns all its value entries
+  (a list-typed row yields several), and only a name held by several rows
+  is an ambiguity error.
 - `insum ls --with-properties --with-rev` — opt-in per-note property
   summaries and revisions (note descriptors in a file listing,
   `note_details` in a directory listing); without the flags the listing

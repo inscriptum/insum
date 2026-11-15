@@ -79,7 +79,7 @@ pub fn run(
     }
     let properties = match get {
         None => entries,
-        Some(name) => vec![select_by_name(&entries, name)?],
+        Some(name) => select_by_name(&collected, name)?,
     };
 
     Ok(json!({
@@ -94,36 +94,35 @@ pub fn run(
     }))
 }
 
-/// Flatten the rows: one entry per `notePropertyValue` node (a row without
+/// Flatten one row: one entry per `notePropertyValue` node (a row without
 /// value nodes emits one entry with all value fields null). The `name`
 /// fields repeat across the values of one row.
-fn entry_values(collected: &insum_core::NoteProperties) -> Vec<Value> {
-    let mut entries = Vec::new();
-    for row in &collected.rows {
-        let name = row.name.as_ref();
-        let (name_text, name_id, name_pointer) = match name {
-            Some(name) => (
-                name.text.clone(),
-                name.id.clone(),
-                Some(name.pointer.clone()),
-            ),
-            None => (None, None, None),
-        };
-        if row.values.is_empty() {
-            entries.push(json!({
-                "name": name_text,
-                "name_id": name_id,
-                "name_pointer": name_pointer,
-                "value": Value::Null,
-                "value_id": Value::Null,
-                "value_pointer": Value::Null,
-                "property_id": row.id,
-                "property_pointer": row.pointer,
-            }));
-            continue;
-        }
-        for value in &row.values {
-            entries.push(json!({
+fn row_entries(row: &insum_core::PropertyRow) -> Vec<Value> {
+    let name = row.name.as_ref();
+    let (name_text, name_id, name_pointer) = match name {
+        Some(name) => (
+            name.text.clone(),
+            name.id.clone(),
+            Some(name.pointer.clone()),
+        ),
+        None => (None, None, None),
+    };
+    if row.values.is_empty() {
+        return vec![json!({
+            "name": name_text,
+            "name_id": name_id,
+            "name_pointer": name_pointer,
+            "value": Value::Null,
+            "value_id": Value::Null,
+            "value_pointer": Value::Null,
+            "property_id": row.id,
+            "property_pointer": row.pointer,
+        })];
+    }
+    row.values
+        .iter()
+        .map(|value| {
+            json!({
                 "name": name_text,
                 "name_id": name_id,
                 "name_pointer": name_pointer,
@@ -132,30 +131,39 @@ fn entry_values(collected: &insum_core::NoteProperties) -> Vec<Value> {
                 "value_pointer": value.pointer,
                 "property_id": row.id,
                 "property_pointer": row.pointer,
-            }));
-        }
-    }
-    entries
+            })
+        })
+        .collect()
 }
 
-/// `--get`: exact name match. A missed name and an ambiguous (duplicated)
-/// name are both PROPERTY_NOT_FOUND — the duplicate case is signalled
+/// Flatten the rows in document order.
+fn entry_values(collected: &insum_core::NoteProperties) -> Vec<Value> {
+    collected.rows.iter().flat_map(row_entries).collect()
+}
+
+/// `--get`: exact name match against ROWS (`noteProperty` nodes), not the
+/// flattened entries — a list-typed row (one name, several values) is one
+/// legitimate property, so a single matching row is NOT ambiguous: the
+/// response returns ALL value entries of that row (a row without values
+/// returns its single null-value entry). Ambiguity means the name appears
+/// in several DIFFERENT rows; that case is PROPERTY_NOT_FOUND signalled
 /// structurally (details), mirroring the note-title resolver's ambiguity
 /// convention (no silent first match). A note without any row is rejected
 /// before this point.
-fn select_by_name(entries: &[Value], name: &str) -> Result<Value, UmError> {
-    let matches: Vec<&Value> = entries
+fn select_by_name(
+    collected: &insum_core::NoteProperties,
+    name: &str,
+) -> Result<Vec<Value>, UmError> {
+    let matches: Vec<&insum_core::PropertyRow> = collected
+        .rows
         .iter()
-        .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+        .filter(|row| row.name.as_ref().and_then(|name| name.text.as_deref()) == Some(name))
         .collect();
     match matches.len() {
         0 => Err(property_absent(name)),
-        1 => Ok(matches[0].clone()),
+        1 => Ok(row_entries(matches[0])),
         _ => {
-            let pointers: Vec<&str> = matches
-                .iter()
-                .filter_map(|entry| entry.get("property_pointer").and_then(Value::as_str))
-                .collect();
+            let pointers: Vec<&str> = matches.iter().map(|row| row.pointer.as_str()).collect();
             Err(UmError::new(
                 ErrorCode::PropertyNotFound,
                 format!(

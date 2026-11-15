@@ -383,9 +383,12 @@ in manifest order); `--note <id|title>` resolves like everywhere else; a
   value reads as an empty string).
 - A page without `noteProperty` rows is `PROPERTY_NOT_FOUND` (exit 3) with
   a hint that this is a normal state (plain pages and title-v2 pages have
-  none) — never a silent empty answer. A missed `--get <name>` is the same
-  code; a name matching several rows is an ambiguity error listing the row
-  pointers (no silent first match).
+  none) — never a silent empty answer. `--get <name>` matches rows, not
+  entries: a name held by exactly one row returns ALL of that row's value
+  entries (a list-typed row yields several, deterministically in document
+  order), so a list property is never mistaken for a duplicate; a name
+  held by several rows is an ambiguity error listing the distinct row
+  pointers (no silent first match), and a missed name is the same code.
 - Document family versions (`schemaVersion` 2/3/4 in the manifest) are
   application semantics outside the schema artifact: `props` reads the
   nodes that are physically present, whatever the family version.

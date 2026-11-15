@@ -73,8 +73,10 @@ enum Command {
         /// document of a .note file.
         #[arg(long)]
         note: Option<String>,
-        /// Return only the property with this exact name; a miss is
-        /// PROPERTY_NOT_FOUND, a duplicated name is an ambiguity error.
+        /// Return only the property with this exact name; a name held by
+        /// one row returns all its value entries (a list-typed row yields
+        /// several), a miss is PROPERTY_NOT_FOUND, a name held by several
+        /// rows is an ambiguity error.
         #[arg(long)]
         get: Option<String>,
         /// Output format; only `json` is supported.
