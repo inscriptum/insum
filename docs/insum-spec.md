@@ -30,6 +30,7 @@ until then this document is the reference for consumers (agents and scripts).
 | `insum validate [--strict] [--hidden] [--schema <file>] <paths>...` | Validation with an explicit level: `structural` or `schema` |
 | `insum history <file> [--note <id\|title>] [--limit n] [--format json\|annotated] [--max-bytes n]` | Change history of the file from git: revisions newest-first, each with a per-note structural diff against its parent |
 | `insum migrate-ids <file> [--note <id>]... [--dry-run] [--schema <file>]` | Assign guaranteed block IDs and stamp the `features.block_ids` marker (the only writer of the marker) — see the stage-C section below |
+| `insum apply <file> --ops <file\|-> [--dry-run] [--if-match <prefix>] [--schema <file>]` | Addressed write of blocks by ID with a revision CAS — see the stage-D section below |
 
 `--note <value>` resolves the value as the note id (ULID) first, then as an
 exact note title; a title matching several notes fails with their ids listed
@@ -134,7 +135,8 @@ Configured via environment variables with safe defaults, enforced on actual
 data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 `UM_MAX_TOTAL_BYTES` (256 MiB), `UM_MAX_DEPTH` (128),
 `UM_MAX_OUTPUT_BYTES` (64 KiB), `UM_MAX_SEARCH_MATCHES` (1 000),
-`UM_MAX_OPS_BYTES`, `UM_MAX_APPLY_OPS`, `UM_MAX_COMMIT_RETRIES`,
+`UM_MAX_OPS_BYTES` (4 MiB), `UM_MAX_APPLY_OPS` (1 000),
+`UM_MAX_COMMIT_RETRIES` (3),
 `UM_MAX_SCHEMA_BYTES` (1 MiB — schema artifact files).
 
 ## History (git-backed)
@@ -176,7 +178,7 @@ warning, and a single revision that cannot fit is a `LIMIT_EXCEEDED`
 error. The budget applies to the compact JSON document; `--pretty` renders
 larger (a documented systemic property shared by every command).
 
-## Stage C — `migrate-ids` (the one write command today)
+## Stage C — `migrate-ids` (the marker's only writer)
 
 `insum migrate-ids <file> [--note <id>]... [--dry-run] [--schema <file>]`
 assigns guaranteed block IDs to a note's addressable blocks (per the schema
@@ -201,15 +203,20 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   refuses too (`SCHEMA_MISMATCH`).
 - **`--dry-run`** plans and validates the would-be result but never touches
   the file bytes or mtime; preview IDs may differ from the commit's (the
-  commit generates its own). A dry-run refuses exactly where the commit
-  would (plan == commit).
+  commit generates its own). A dry-run refuses wherever the commit's plan
+  phase refuses (plan == commit), except the commit-time lock and
+  dirty-lease guard (`WRITE_LOCKED`) and the revision rechecks inside the
+  lock — a green dry-run validates the plan, it does not reserve the lock.
 - **Transaction.** The commit takes a sidecar lock (a live editor lease
   refuses with `WRITE_LOCKED`), rechecks the file and per-note revisions
   inside the lock (`NOTE_REVISION_MISMATCH` on a change), rewrites the
   container (untouched ZIP entries are copied byte-identical, unknown
   manifest fields survive), validates the result over the staged bytes and
   replaces the file atomically (permissions preserved, symlink sources
-  refused). A source symlink or non-regular file is refused before any
+  refused). The atomic replace protects cooperative writers (the sidecar
+  lock); the window between the final pre-replace verification and the
+  rename is not closed for non-cooperative processes on POSIX. A source
+  symlink or non-regular file is refused before any
   work, in dry-run and commit alike. The lock and lease sidecars are named
   after the target (§9.2 — the plugin counts on the same names, so there
   is no fallback name): a target whose name leaves no room for the sidecar
@@ -258,6 +265,108 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   limitation, §4.6 п.2 of the spec) — re-run `migrate-ids` to re-verify
   and re-stamp.
 
+## Stage D — `apply` (addressed writes by ID)
+
+`insum apply <file> --ops <file|-> [--dry-run] [--if-match <prefix>] [--schema <file>]`
+applies a package of block operations to ONE note with a revision CAS. The
+package is JSON read from a file or stdin (`-`):
+
+```json
+{
+  "api_version": 1,
+  "note_id": "<ULID>",
+  "base_note_rev": "sha256:<64-hex>",
+  "operations": [
+    {"op": "replace", "id": "a1b2c3d4e5",
+     "node": {"type": "paragraph", "attrs": {}, "content": []}},
+    {"op": "insert_after", "id": "a1b2c3d4e5", "nodes": [{"type": "paragraph", "attrs": {}, "content": []}]},
+    {"op": "append_child", "parent_id": null, "nodes": [{"type": "heading", "attrs": {"level": 2}, "content": []}]},
+    {"op": "set_attrs", "id": "a1b2c3d4e5", "set": {"level": 3}, "unset": []},
+    {"op": "replace_content", "id": "a1b2c3d4e5", "content": [{"type": "text", "text": "new"}]},
+    {"op": "delete", "id": "a1b2c3d4e5"}
+  ]
+}
+```
+
+- **One note per package.** For a `.um` container `note_id` is required; for
+  a `.note` file it must be absent or null. `base_note_rev` MUST come from
+  `tree`, `read`, `block get` or `search` for that note; a mismatch fails
+  with `NOTE_REVISION_MISMATCH` (exit 7) before anything is written.
+  `--if-match` optionally re-checks a `sha256:` prefix (at least 16 hex
+  characters) against the current revision; when both are given they must
+  agree (`USAGE` otherwise).
+- **IDs are managed by the CLI (§8.2).** Input nodes must not carry
+  `attrs.id`: a passed ID that belongs to another block of the note is
+  `ID_CONFLICT` (exit 4), any other passed ID is `BLOCK_ID_IMMUTABLE`
+  (exit 2) — the one exception is a `replace` root, which may restate
+  the target's ID verbatim. A `replace` root carrying any other ID
+  reports `BLOCK_ID_IMMUTABLE` (exit 2), even if the ID belongs to
+  another block — the root check precedes the conflict scan; descendant
+  nodes keep the ordinary rules (`ID_CONFLICT` for a stolen ID).
+  `replace` keeps the target's ID while the new root type stays
+  addressable; a non-addressable new root drops it — the ID leaves the
+  note and is reported in `deleted_ids`. Descendants of `replace` /
+  `replace_content` may restate IDs that belonged to the replaced
+  subtree (they are preserved); new addressable blocks receive
+  generator IDs at commit. `set_attrs` must not touch the ID attribute.
+  `set_text` and `move` do not exist in v1 (`INVALID_OPERATION`).
+- **Semantics (§8.3–8.4).** Operations apply sequentially to a working
+  copy; each resolves its IDs in the current state. `insert_after` groups
+  on one anchor keep the operation order (no reversal); a deleted block
+  fails every later operation on its ID (`BLOCK_NOT_FOUND`, exit 3) — no
+  address forwarding, ever.
+- **Schema gate.** The write runs only under a verified runtime or explicit
+  artifact (the bundled fallback refuses with `SCHEMA_UNAVAILABLE`, a
+  failed hash with `SCHEMA_MISMATCH`) and only on a note that carries the
+  `features.block_ids` marker (`BLOCK_IDS_NOT_ENABLED` — run `migrate-ids`
+  first). The RESULT document must satisfy the applicable schema:
+  content-expression violations are `CONTENT_NOT_ALLOWED`, node/mark types
+  the artifact does not declare are `UNSUPPORTED_NODE_TYPE`, malformed
+  node JSON is `INVALID_NODE` — the full diagnostic list travels in
+  `error.details.diagnostics`. Limits: the package may hold at most
+  `UM_MAX_APPLY_OPS` operations and `UM_MAX_OPS_BYTES` bytes, and its
+  JSON nesting may not exceed `UM_MAX_DEPTH` (`LIMIT_EXCEEDED`);
+  package envelope violations — non-UTF-8 bytes, unparseable JSON —
+  are `USAGE` (exit 2).
+- **`--dry-run`** validates the package against the current state and
+  reports `operations_validated`, `would_create_count`,
+  `would_delete_ids` and parity warnings — applied stays `false`, no
+  final IDs are promised, and the file bytes, mtime and directory stay
+  untouched (no temp files). A dry-run refuses wherever the commit's plan
+  phase refuses (plan == commit), except the commit-time lock and
+  dirty-lease guard (`WRITE_LOCKED`) and the in-lock rechecks (a changed
+  file under the lock re-applies or fails `WRITE_CONFLICT`) — a green
+  dry-run validates the package, it does not reserve the lock.
+- **Transaction (§8.6–8.7, §9).** The commit takes the same sidecar lock
+  and dirty-lease guard as `migrate-ids` (a live editor lease refuses with
+  `WRITE_LOCKED`). If the file changed after the plan but the TARGET note
+  revision is unchanged, the package is re-applied onto the fresh
+  generation (other notes' concurrent changes survive the rewrite); a
+  changed target revision is `NOTE_REVISION_MISMATCH`; after
+  `UM_MAX_COMMIT_RETRIES` (default 3) re-applications the commit gives up
+  with `WRITE_CONFLICT` — never a silent overwrite. Any error leaves the
+  file untouched (all-or-nothing). The commit uses the same hidden staged
+  temp file as `migrate-ids` (stage C): after a killed process such
+  orphans may remain next to the target — deleting them by hand is safe,
+  `apply` always creates a fresh temp file and never reuses an existing
+  one. The staged bytes are validated once before the rename, but not
+  re-verified byte-for-byte between that check and the rename: a
+  non-cooperative same-UID process could tamper with the temp in that
+  window — the response's `new_file_rev` is the digest of the bytes as
+  written. Untouched ZIP entries keep their names and compressed bytes;
+  unknown manifest and envelope fields survive.
+- **Response.** On success: `applied: true`, `old/new note_rev`,
+  `old/new file_rev`, `operations_applied`, `created_ids` (every new
+  addressable block with its final `{id, pointer, type}`, nested included)
+  and `deleted_ids` (every ID that left the note). The ID lists respect
+  `UM_MAX_OUTPUT_BYTES`: an oversized list is truncated explicitly
+  (`truncated: true`, totals, an `OUTPUT_BUDGET` warning) — the write
+  itself always covered every operation. The parity warnings share the
+  same budget: they fill whatever the ID lists left, and a truncated
+  warnings array is marked explicitly too (`truncated: true`,
+  `warnings_total`, an `OUTPUT_BUDGET` warning) — the remainder is
+  re-derivable with `insum validate`. `--pretty` only reformats.
+
 ## Notes on data fidelity
 
 - Unknown node or mark types are preserved verbatim in outputs derived from
@@ -271,5 +380,6 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   cells, and anything unrenderable in a cell is marked explicitly.
 - No read command (`ls`, `search`, `tree`, `block get`, `read`, `validate`,
   `schema`, `history`) modifies input files, creates temp files, executes
-  document content, or performs network access. `migrate-ids` is the one
-  write command and is covered by the stage-C section above.
+  document content, or performs network access. The write commands
+  (`migrate-ids`, `apply`) are covered by the stage-C and stage-D sections
+  above.

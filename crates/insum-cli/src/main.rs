@@ -155,6 +155,22 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Addressed write of blocks by ID with a revision CAS (stage D; §8).
+    Apply {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Operations package: JSON file path, or `-` to read stdin.
+        #[arg(long, value_name = "FILE")]
+        ops: String,
+        /// Validate the package against the current state without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Require the current note_rev to start with this prefix (at least
+        /// 16 hex characters after `sha256:`); must agree with the package
+        /// `base_note_rev` when both are given.
+        #[arg(long, value_name = "PREFIX")]
+        if_match: Option<String>,
+    },
     /// Readable change history of a file from git (read-only).
     History {
         /// A .um container or a .note file.
@@ -214,10 +230,11 @@ fn main() {
         Some(Command::Validate { .. })
             | Some(Command::Schema { .. })
             | Some(Command::MigrateIds { .. })
+            | Some(Command::Apply { .. })
     ) && cli.schema.is_some()
     {
         let err = UmError::usage(
-            "--schema is supported by `insum schema`, `insum validate` and `insum migrate-ids` only",
+            "--schema is supported by `insum schema`, `insum validate`, `insum migrate-ids` and `insum apply` only",
         );
         fail(&err, cli.pretty);
     }
@@ -358,6 +375,37 @@ fn main() {
                 )),
             }
         }
+        Some(Command::Apply {
+            file,
+            ops,
+            dry_run,
+            if_match,
+        }) => commands::apply::read_ops(ops, &limits).and_then(|package| {
+            match file.extension().and_then(|e| e.to_str()) {
+                Some(ext) if ext.eq_ignore_ascii_case("um") => commands::apply::run_um(
+                    file,
+                    &package,
+                    if_match.as_deref(),
+                    cli.schema.as_deref(),
+                    *dry_run,
+                    &limits,
+                )
+                .map(Output::Json),
+                Some(ext) if ext.eq_ignore_ascii_case("note") => commands::apply::run_note(
+                    file,
+                    &package,
+                    if_match.as_deref(),
+                    cli.schema.as_deref(),
+                    *dry_run,
+                    &limits,
+                )
+                .map(Output::Json),
+                _ => Err(UmError::new(
+                    insum_core::ErrorCode::PathNotFound,
+                    format!("no .um or .note document at {}", file.display()),
+                )),
+            }
+        }),
         Some(Command::History {
             file,
             note,

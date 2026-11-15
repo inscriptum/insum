@@ -181,6 +181,14 @@ impl UmError {
         }
     }
 
+    /// Replace the message while keeping code, hint and details — the way a
+    /// command puts its own texts on a shared guard without giving up the
+    /// shared construction (CON-8: one guard, many voices).
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self

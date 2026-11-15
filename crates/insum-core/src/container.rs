@@ -250,7 +250,7 @@ pub struct ParsedNote {
 /// Parse JSON with the depth limit enforced on the raw text before parsing
 /// (so hostile nesting fails as `LIMIT_EXCEEDED`, not as a parse error) and
 /// with serde_json's own recursion limit disabled afterwards.
-fn parse_json_limited(
+pub(crate) fn parse_json_limited(
     text: &str,
     max_depth: usize,
     parse_error: ErrorCode,
@@ -395,7 +395,7 @@ fn read_bounded(path: &Path, limits: &Limits) -> Result<Vec<u8>, UmError> {
     Ok(buffer)
 }
 
-fn hex(digest: &[u8]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
@@ -680,6 +680,20 @@ impl NoteFile {
         let raw = read_bounded(path, limits)?;
         let note_file = Self::from_raw(path, &raw, limits, with_revs)?;
         Ok((note_file, raw))
+    }
+
+    /// The bounded raw bytes of a `.note` file together with the whole-file
+    /// revision, without parsing. For the commit CAS gate the parse is not
+    /// only redundant but skippable: bytes differ ⇒ the hash differs ⇒ the
+    /// gate refuses, so the only remaining parse is the single one that
+    /// rebuilds the envelope (PRF-4).
+    pub(crate) fn read_raw_with_rev(
+        path: &Path,
+        limits: &Limits,
+    ) -> Result<(Vec<u8>, String), UmError> {
+        let raw = read_bounded(path, limits)?;
+        let rev = format_rev(sha256_hex(&raw));
+        Ok((raw, rev))
     }
 
     /// Parse the bounded bytes [`NoteFile::open`] read.

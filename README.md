@@ -9,7 +9,9 @@ and atomic block-level writes.
 Command groups:
 
 - **Read** — `ls`, `search`, `tree`, `block get`, `read`, `validate`, `schema`, `history`
-- **Write** — `migrate-ids` (shipped); `apply` (block-level writes, planned)
+- **Write** — `migrate-ids` (shipped); `apply` (shipped — block-level
+  writes by ID with a revision CAS; see [docs/insum-spec.md](docs/insum-spec.md),
+  stage D)
 
 ## Requirements
 
@@ -20,7 +22,7 @@ Command groups:
 
 ## Status
 
-Work in progress. The first read-only release is planned as `0.1.0`; see
+Work in progress. The first release is planned as `0.1.0`; see
 [CHANGELOG.md](CHANGELOG.md) for what already works and
 [docs/insum-spec.md](docs/insum-spec.md) for the CLI behavior contract.
 

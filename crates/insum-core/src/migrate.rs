@@ -9,11 +9,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Map, Value, json};
-use zip::write::SimpleFileOptions;
 
+use crate::commit::{
+    StagedFile, ensure_writable_source, payload_bytes, pre_replace_verification, revision_mismatch,
+    rewrite_um_entries,
+};
 use crate::container::{NoteFile, UmContainer, note_rev_for_file_bytes};
 use crate::error::{ErrorCode, UmError};
 use crate::limits::Limits;
@@ -23,7 +26,9 @@ use crate::pointer;
 use crate::schema::SchemaSource;
 
 /// ID grammar from the artifact's `id_rules` (§4.4, §4.7 — never hardcoded
-/// in Rust).
+/// in Rust). `Clone` lets `apply` share one parsed set of rules between the
+/// engine and the ID generator.
+#[derive(Clone)]
 pub struct IdRules {
     pattern: regex::Regex,
     recommended_length: usize,
@@ -84,6 +89,11 @@ impl IdRules {
             recommended_length,
             attrs_key,
         })
+    }
+
+    /// The attr key the artifact stores block IDs under (§4.4 — `attrs.id`).
+    pub fn attrs_key(&self) -> &str {
+        &self.attrs_key
     }
 }
 
@@ -470,15 +480,6 @@ fn resolve_for_write(
     Ok(resolved)
 }
 
-fn revision_mismatch(expected: &str, actual: &str, what: &str) -> UmError {
-    UmError::new(
-        ErrorCode::NoteRevisionMismatch,
-        format!("{what} changed after the migration plan was built"),
-    )
-    .with_hint("Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.")
-    .with_details(json!({ "expected": expected, "actual": actual }))
-}
-
 /// The change report is budgeted like every other command's output (§5.5):
 /// note plans are appended whole while they fit `UM_MAX_OUTPUT_BYTES`, and
 /// an incomplete report says so explicitly (§6.5 — silent truncation is
@@ -558,38 +559,39 @@ fn envelope_overhead(path: &Path) -> usize {
 /// oversized block) — a response must at least name what it did. `commit`
 /// reserves the per-note post-write growth (D-1): the commit adds
 /// `new_note_rev` after this pass, and the budget must hold for the final
-/// bytes.
+/// bytes. The measure/fit rule itself is the shared output-budget
+/// primitive (`crate::budget`, CON-7); only the reserve and the report
+/// shape stay migrate-specific.
 fn budgeted_report(
     plans: &[MigrateNotePlan],
     limits: &Limits,
     path: &Path,
     commit: bool,
 ) -> Report {
-    let budget = limits.output_bytes(None);
-    let mut used = envelope_overhead(path)
-        + if commit {
-            plans.len().saturating_mul(COMMIT_NOTE_RESERVE)
-        } else {
-            0
-        };
-    let mut notes = Vec::new();
-    for plan in plans {
-        let note_json = plan.to_json();
-        let size = serde_json::to_string(&note_json).map_or(256, |s| s.len() + 1);
-        if !notes.is_empty() && used + size > budget {
-            return Report {
-                notes,
-                notes_total: plans.len(),
-                truncated: true,
-            };
-        }
-        used += size + 1;
-        notes.push(note_json);
-    }
+    let reserve = if commit {
+        plans.len().saturating_mul(COMMIT_NOTE_RESERVE)
+    } else {
+        0
+    };
+    // WHY: the pre-consolidation fit counter charged len+2 per note plan
+    // (serialized bytes, comma, plus one conservative byte); the shared
+    // `budget::fit` charges len+1. Charging one byte per plan here keeps the
+    // truncation threshold never looser than before: a report that keeps
+    // every plan decides on the same bytes as the old counter (the reserve
+    // is fully spent), while a truncated report charges the full
+    // plans.len() reserve against fewer kept entries — mid-list the
+    // boundary can sit slightly earlier, but it never loosens.
+    let legacy_fit_reserve = plans.len();
+    let mut budget = crate::budget::OutputBudget::new(
+        limits.output_bytes(None),
+        envelope_overhead(path) + reserve + legacy_fit_reserve,
+    );
+    let entries: Vec<Value> = plans.iter().map(|plan| plan.to_json()).collect();
+    let (notes, dropped) = budget.fit(&entries);
     Report {
         notes,
         notes_total: plans.len(),
-        truncated: false,
+        truncated: dropped > 0,
     }
 }
 
@@ -602,244 +604,13 @@ fn apply_report_truncation(response: &mut Value, report: &Report, committed: boo
     response["truncated"] = json!(true);
     response["notes_total"] = json!(report.notes_total);
     response["notes_returned"] = json!(report.notes.len());
-    let mut warnings = response
-        .get("warnings")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    warnings.push(json!({
-        "code": "OUTPUT_BUDGET",
-        "message": truncation_warning_message(report.notes.len(), report.notes_total, committed),
-    }));
-    response["warnings"] = Value::Array(warnings);
-}
-
-/// §9.3 MUST: the write path refuses a symlink source and any non-regular
-/// source — the link is never followed to its target and never silently
-/// replaced by a regular file. Runs before any other work, so dry-run and
-/// commit refuse alike (plan == commit).
-fn ensure_writable_source(path: &Path) -> Result<(), UmError> {
-    let meta = std::fs::symlink_metadata(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            crate::container::torn_error(
-                "absent",
-                path,
-                "the file is absent (possibly being rewritten)".to_owned(),
-            )
-        } else {
-            UmError::new(
-                ErrorCode::IoError,
-                format!("cannot stat {}: {err}", path.display()),
-            )
-        }
-    })?;
-    if meta.file_type().is_symlink() {
-        return Err(UmError::new(
-            ErrorCode::IoError,
-            format!(
-                "{} is a symlink; the write path refuses to follow or replace it",
-                path.display()
-            ),
-        )
-        .with_hint(
-            "Run migrate-ids on the regular file the link points to — replacing the link would move the note path onto a regular file.",
-        ));
-    }
-    if !meta.is_file() {
-        return Err(UmError::new(
-            ErrorCode::IoError,
-            format!(
-                "{} is not a regular file; the write path refuses it",
-                path.display()
-            ),
-        )
-        .with_hint("migrate-ids writes regular .um/.note files only."));
-    }
-    Ok(())
-}
-
-/// §9.3 MUST: immediately before the rename — re-verify that the source is
-/// still a regular file (never a symlink) and that its revision is
-/// unchanged, and take the permissions the replacement must keep (§9.3:
-/// preserve the permissions of the source).
-fn pre_replace_verification(path: &Path, expected_rev: &str, what: &str) -> Result<u32, UmError> {
-    let meta = std::fs::symlink_metadata(path).map_err(|err| {
-        // the same disappearing-source window must classify the same way no
-        // matter which check of this phase hits it first (D-7): an absent
-        // source is the torn-write class — exactly what ensure_writable_source
-        // and the readers report — never a plain IO_ERROR
-        if err.kind() == std::io::ErrorKind::NotFound {
-            crate::container::torn_error(
-                "absent",
-                path,
-                "the file is absent (possibly being rewritten)".to_owned(),
-            )
-        } else {
-            UmError::new(ErrorCode::IoError, format!("cannot stat {path:?}: {err}"))
-        }
-    })?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(UmError::new(
-            ErrorCode::IoError,
-            format!(
-                "{} stopped being a regular file before the replace; the write refuses",
-                path.display()
-            ),
-        )
-        .with_hint("Remove the symlink or fix the directory layout, then re-run migrate-ids."));
-    }
-    let rev = crate::container::file_sha256(path)?;
-    if rev != expected_rev {
-        return Err(revision_mismatch(expected_rev, &rev, what));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(meta.permissions().mode())
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(0)
-    }
-}
-
-/// A hidden, exclusively created temp file next to the target (§12: temp
-/// artifacts are hidden and live beside the original). The name carries a
-/// random suffix and the file is created with `create_new` — a planted
-/// symlink or a pre-existing file is never followed or reused (M-4/M-5);
-/// on unix it is created 0600. A target whose name cannot carry the
-/// name-based suffix (file-name component caps) is staged under the
-/// name-independent hidden prefix `.insum-migrate-tmp-<hex>` in the same
-/// directory (D-6) — the same guarantees, none of the length. The file is
-/// unlinked on drop — on every error path and on panic unwinding (m-2) —
-/// unless it became the target through a successful rename.
-struct StagedFile {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl StagedFile {
-    fn create(target: &Path) -> Result<(Self, std::fs::File), UmError> {
-        let parent = target.parent().unwrap_or(Path::new("."));
-        let name = target
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "insum".to_owned());
-        // D-6: the name-based component (".", the target name,
-        // ".migrate-tmp-" and 16 hex digits) is 30 bytes longer than the
-        // target's own name, and file-name components are length-capped — a
-        // long target failed the create with ENAMETOOLONG while the dry-run
-        // was green. Such a name (and any create failure that is not a
-        // collision) falls back to the name-independent hidden prefix in the
-        // SAME directory, with the same guarantees: create_new, 0600, never
-        // following a planted name.
-        const COMPONENT_CAP: usize = 255;
-        const FALLBACK_PREFIX: &str = ".insum-migrate-tmp";
-        let named_prefix = format!(".{name}.migrate-tmp");
-        // 17 = "-" + 16 hex digits of the random suffix
-        let mut prefix = if named_prefix.len() + 17 > COMPONENT_CAP {
-            FALLBACK_PREFIX.to_owned()
-        } else {
-            named_prefix
-        };
-        let mut using_fallback = prefix == FALLBACK_PREFIX;
-        use rand::Rng;
-        for _ in 0..64 {
-            let suffix: u64 = rand::rng().random();
-            let candidate = parent.join(format!("{prefix}-{suffix:016x}"));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600); // private until the rename (§12)
-            }
-            match options.open(&candidate) {
-                Ok(file) => {
-                    return Ok((
-                        Self {
-                            path: candidate,
-                            armed: true,
-                        },
-                        file,
-                    ));
-                }
-                // the name exists (or a planted symlink collides): pick
-                // another random suffix, never follow what is there
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    if !using_fallback {
-                        // the name-based component can exceed a file-name
-                        // limit even when the target itself fits (D-6) —
-                        // retry once with the name-independent prefix
-                        using_fallback = true;
-                        prefix = FALLBACK_PREFIX.to_owned();
-                        continue;
-                    }
-                    return Err(UmError::new(
-                        ErrorCode::IoError,
-                        format!(
-                            "cannot create the temp file next to {}: {err}",
-                            target.display()
-                        ),
-                    ));
-                }
-            }
-        }
-        Err(UmError::new(
-            ErrorCode::IoError,
-            "cannot create a unique temp file next to the target".to_owned(),
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Preserve the source permissions (§9.3, unix mode), atomically rename
-    /// the staged file over the target, then fsync the parent directory
-    /// (best-effort, where the OS supports it — §9.3).
-    fn commit_to(mut self, target: &Path, mode: u32) -> Result<(), UmError> {
-        // Permissions are a unix concept (§9.3); on other platforms the mode
-        // argument is intentionally not applied.
-        #[cfg(not(unix))]
-        let _ = mode;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(mode & 0o7777))
-                .map_err(|err| {
-                    UmError::new(
-                        ErrorCode::IoError,
-                        format!("cannot preserve the file permissions: {err}"),
-                    )
-                })?;
-        }
-        std::fs::rename(&self.path, target).map_err(|err| {
-            UmError::new(
-                ErrorCode::IoError,
-                format!("cannot replace the file atomically: {err}"),
-            )
-        })?;
-        self.armed = false;
-        #[cfg(unix)]
-        {
-            if let Some(parent) = target.parent()
-                && let Ok(dir) = std::fs::File::open(parent)
-            {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for StagedFile {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+    crate::budget::push_warning(
+        response,
+        json!({
+            "code": "OUTPUT_BUDGET",
+            "message": truncation_warning_message(report.notes.len(), report.notes_total, committed),
+        }),
+    );
 }
 
 /// Response of `migrate-ids` on a `.um` container (§7.2).
@@ -1144,11 +915,15 @@ fn commit_um(
     let mut reopened = UmContainer::open(path, limits)?;
     let file_rev_now = reopened.file_rev()?;
     if file_rev_now != file_rev_before {
-        return Err(revision_mismatch(
-            &file_rev_before,
-            &file_rev_now,
-            "the file",
-        ));
+        // CON-8: the shared write-path guard carries the code and details;
+        // only the message and hint are the command's own
+        return Err(
+            revision_mismatch(&file_rev_before, &file_rev_now, "the file")
+                .with_message("the file changed after the migration plan was built")
+                .with_hint(
+                    "Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.",
+                ),
+        );
     }
     for (plan, descriptor) in plans.iter().zip(selected.iter()) {
         if plan.changes.is_empty() {
@@ -1156,19 +931,23 @@ fn commit_um(
         }
         let parsed = reopened.read_note_with_rev(descriptor, limits)?;
         if parsed.note_rev != plan.note_rev {
-            return Err(revision_mismatch(
-                &plan.note_rev,
-                &parsed.note_rev,
-                &format!("note {:?}", descriptor.id),
-            ));
+            return Err(revision_mismatch(&plan.note_rev, &parsed.note_rev, "the note")
+                .with_message(format!(
+                    "note {:?} changed after the migration plan was built",
+                    descriptor.id
+                ))
+                .with_hint(
+                    "Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.",
+                ));
         }
     }
 
     // the result is streamed into a hidden, exclusively created temp file
     // next to the target (§12): one write pass, no second staging copy in a
-    // shared temp directory (M-4/M-5/m-17)
+    // shared temp directory (M-4/M-5/m-17); the whole-file revision falls
+    // out of the same pass as the tee-hash (PRF-3)
     let (staged, file) = StagedFile::create(path)?;
-    rewrite_um(
+    let new_file_rev = rewrite_um(
         &mut reopened,
         selected,
         plans,
@@ -1195,7 +974,6 @@ fn commit_um(
     // §9.3 MUST: re-check the source immediately before the replace (still
     // a regular file, still the rechecked revision) and take its permissions
     let mode = pre_replace_verification(path, &file_rev_before, "the file")?;
-    let new_file_rev = crate::container::file_sha256(staged.path())?;
     staged.commit_to(path, mode)?;
 
     // `new_note_rev` lands by POSITION, not by note-id lookup (D-3): the
@@ -1416,11 +1194,13 @@ fn commit_note_file(
     // re-read of the file, no envelope fields from another generation)
     let (reopened, raw) = NoteFile::open_with_raw(path, limits, true)?;
     if reopened.note_rev != expected_rev {
-        return Err(revision_mismatch(
-            expected_rev,
-            &reopened.note_rev,
-            "the .note file",
-        ));
+        return Err(
+            revision_mismatch(expected_rev, &reopened.note_rev, "the .note file")
+                .with_message("the .note file changed after the migration plan was built")
+                .with_hint(
+                    "Re-run `insum migrate-ids` — the plan is rebuilt from the current revision.",
+                ),
+        );
     }
 
     let mut doc = reopened.note.doc;
@@ -1530,6 +1310,8 @@ struct SchemaMeta {
 /// (M-1: a non-cooperative writer cannot mix generations into the commit).
 /// The result is streamed into the staged file next to the target (m-17: no
 /// whole-container buffer, no extra staging copy) and fsynced there (§9.3).
+/// Returns the whole-file revision taken from the tee-hash of the streamed
+/// bytes (PRF-3).
 #[allow(clippy::too_many_arguments)]
 fn rewrite_um(
     container: &mut UmContainer,
@@ -1539,7 +1321,7 @@ fn rewrite_um(
     attrs_key: &str,
     limits: &Limits,
     into: std::fs::File,
-) -> Result<(), UmError> {
+) -> Result<String, UmError> {
     // payloads to replace, by archive entry name
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
     for (descriptor, plan) in selected.iter().zip(plans.iter()) {
@@ -1549,8 +1331,7 @@ fn rewrite_um(
         let payload = container.read_note(descriptor, limits)?;
         let mut doc = payload.doc;
         apply_ids(&mut doc, &plan.changes, attrs_key)?;
-        let bytes = serde_json::to_vec(&doc)
-            .map_err(|err| UmError::internal(format!("note payload does not serialize: {err}")))?;
+        let bytes = payload_bytes(&doc)?;
         replacements.insert(descriptor.path.clone(), bytes);
     }
 
@@ -1560,62 +1341,8 @@ fn rewrite_um(
         .map_err(|err| UmError::internal(format!("manifest does not serialize: {err}")))?;
     replacements.insert("manifest.json".to_owned(), manifest_bytes);
 
-    // rebuild: walk the source archive in order through the held handle
-    let archive = container.zip_archive();
-    let mut writer = zip::ZipWriter::new(into);
-    for index in 0..archive.len() {
-        let (name, last_modified) = {
-            let raw = archive.by_index_raw(index).map_err(|err| {
-                UmError::new(
-                    ErrorCode::ArchiveEntryNameInvalid,
-                    format!("cannot read entry {index}: {err}"),
-                )
-            })?;
-            let name = raw
-                .name()
-                .map_err(|err| {
-                    UmError::new(
-                        ErrorCode::ArchiveEntryNameInvalid,
-                        format!("cannot decode entry {index} name: {err}"),
-                    )
-                })?
-                .into_owned();
-            (name, raw.last_modified().unwrap_or_default())
-        };
-        let name_str: &str = name.as_ref();
-        if let Some(bytes) = replacements.get(name_str) {
-            // replace the entry: same name, same declared mtime, fresh deflate
-            let options = SimpleFileOptions::default().last_modified_time(last_modified);
-            writer
-                .start_file(name_str, options)
-                .map_err(|err| UmError::internal(format!("cannot start entry {name:?}: {err}")))?;
-            writer
-                .write_all(bytes)
-                .map_err(|err| UmError::internal(format!("cannot write entry {name:?}: {err}")))?;
-        } else {
-            // untouched entry: raw copy keeps the compressed bytes verbatim
-            let raw = archive.by_index_raw(index).map_err(|err| {
-                UmError::new(
-                    ErrorCode::ArchiveEntryNameInvalid,
-                    format!("cannot read entry {index}: {err}"),
-                )
-            })?;
-            writer
-                .raw_copy_file(raw)
-                .map_err(|err| UmError::internal(format!("cannot copy entry {name:?}: {err}")))?;
-        }
-    }
-    let file = writer
-        .finish()
-        .map_err(|err| UmError::internal(format!("cannot finish the new container: {err}")))?;
-    // §9.3: fsync the temp file before it can become the target; any error
-    // here leaves the staged file to the Drop guard for cleanup (m-2)
-    file.sync_all().map_err(|err| {
-        UmError::new(
-            ErrorCode::IoError,
-            format!("cannot sync the staged file: {err}"),
-        )
-    })
+    // rebuild: shared raw-copy pass (untouched entries byte-identical)
+    rewrite_um_entries(container, &replacements, into)
 }
 
 /// Set `features.block_ids = 1` and schema metadata on the selected
