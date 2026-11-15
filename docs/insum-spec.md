@@ -178,7 +178,7 @@ warning, and a single revision that cannot fit is a `LIMIT_EXCEEDED`
 error. The budget applies to the compact JSON document; `--pretty` renders
 larger (a documented systemic property shared by every command).
 
-## Stage C — `migrate-ids` (the one write command today)
+## Stage C — `migrate-ids` (the marker's only writer)
 
 `insum migrate-ids <file> [--note <id>]... [--dry-run] [--schema <file>]`
 assigns guaranteed block IDs to a note's addressable blocks (per the schema
@@ -299,14 +299,17 @@ package is JSON read from a file or stdin (`-`):
   `attrs.id`: a passed ID that belongs to another block of the note is
   `ID_CONFLICT` (exit 4), any other passed ID is `BLOCK_ID_IMMUTABLE`
   (exit 2) — the one exception is a `replace` root, which may restate
-  the target's ID verbatim (never a different one). `replace` keeps the
-  target's ID while the new root type stays addressable; a
-  non-addressable new root drops it — the ID leaves the note and is
-  reported in `deleted_ids`. Descendants of `replace` / `replace_content`
-  may restate IDs that belonged to the replaced subtree (they are
-  preserved); new addressable blocks receive generator IDs at commit.
-  `set_attrs` must not touch the ID attribute. `set_text` and
-  `move` do not exist in v1 (`INVALID_OPERATION`).
+  the target's ID verbatim. A `replace` root carrying any other ID
+  reports `BLOCK_ID_IMMUTABLE` (exit 2), even if the ID belongs to
+  another block — the root check precedes the conflict scan; descendant
+  nodes keep the ordinary rules (`ID_CONFLICT` for a stolen ID).
+  `replace` keeps the target's ID while the new root type stays
+  addressable; a non-addressable new root drops it — the ID leaves the
+  note and is reported in `deleted_ids`. Descendants of `replace` /
+  `replace_content` may restate IDs that belonged to the replaced
+  subtree (they are preserved); new addressable blocks receive
+  generator IDs at commit. `set_attrs` must not touch the ID attribute.
+  `set_text` and `move` do not exist in v1 (`INVALID_OPERATION`).
 - **Semantics (§8.3–8.4).** Operations apply sequentially to a working
   copy; each resolves its IDs in the current state. `insert_after` groups
   on one anchor keep the operation order (no reversal); a deleted block
@@ -321,8 +324,10 @@ package is JSON read from a file or stdin (`-`):
   the artifact does not declare are `UNSUPPORTED_NODE_TYPE`, malformed
   node JSON is `INVALID_NODE` — the full diagnostic list travels in
   `error.details.diagnostics`. Limits: the package may hold at most
-  `UM_MAX_APPLY_OPS` operations and `UM_MAX_OPS_BYTES` bytes
-  (`LIMIT_EXCEEDED`).
+  `UM_MAX_APPLY_OPS` operations and `UM_MAX_OPS_BYTES` bytes, and its
+  JSON nesting may not exceed `UM_MAX_DEPTH` (`LIMIT_EXCEEDED`);
+  package envelope violations — non-UTF-8 bytes, unparseable JSON —
+  are `USAGE` (exit 2).
 - **`--dry-run`** validates the package against the current state and
   reports `operations_validated`, `would_create_count`,
   `would_delete_ids` and parity warnings — applied stays `false`, no
@@ -344,7 +349,11 @@ package is JSON read from a file or stdin (`-`):
   temp file as `migrate-ids` (stage C): after a killed process such
   orphans may remain next to the target — deleting them by hand is safe,
   `apply` always creates a fresh temp file and never reuses an existing
-  one. Untouched ZIP entries keep their names and compressed bytes;
+  one. The staged bytes are validated once before the rename, but not
+  re-verified byte-for-byte between that check and the rename: a
+  non-cooperative same-UID process could tamper with the temp in that
+  window — the response's `new_file_rev` is the digest of the bytes as
+  written. Untouched ZIP entries keep their names and compressed bytes;
   unknown manifest and envelope fields survive.
 - **Response.** On success: `applied: true`, `old/new note_rev`,
   `old/new file_rev`, `operations_applied`, `created_ids` (every new
@@ -352,7 +361,11 @@ package is JSON read from a file or stdin (`-`):
   and `deleted_ids` (every ID that left the note). The ID lists respect
   `UM_MAX_OUTPUT_BYTES`: an oversized list is truncated explicitly
   (`truncated: true`, totals, an `OUTPUT_BUDGET` warning) — the write
-  itself always covered every operation. `--pretty` only reformats.
+  itself always covered every operation. The parity warnings share the
+  same budget: they fill whatever the ID lists left, and a truncated
+  warnings array is marked explicitly too (`truncated: true`,
+  `warnings_total`, an `OUTPUT_BUDGET` warning) — the remainder is
+  re-derivable with `insum validate`. `--pretty` only reformats.
 
 ## Notes on data fidelity
 

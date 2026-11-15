@@ -17,7 +17,8 @@ Format — Keep a Changelog; versioning — SemVer.
   `set_text` and `move` are not in v1. IDs are CLI-managed: input nodes
   must not carry `attrs.id` — a stolen ID is `ID_CONFLICT`, any other
   input ID is `BLOCK_ID_IMMUTABLE` (a `replace` root may restate the
-  target's ID verbatim); `replace` keeps the target's ID while the new
+  target's ID verbatim; any other root ID is `BLOCK_ID_IMMUTABLE`, even
+  a stolen one); `replace` keeps the target's ID while the new
   root type stays addressable — a non-addressable root reports the ID in
   `deleted_ids` — and its subtree may restate its own descendant IDs; new
   addressable blocks receive generator IDs. Sequential semantics (§8.4):
@@ -51,7 +52,8 @@ Format — Keep a Changelog; versioning — SemVer.
   `INVALID_NODE`) with
   the full diagnostic list in `error.details.diagnostics`. Package
   envelope violations are `USAGE`; limits: `UM_MAX_APPLY_OPS`,
-  `UM_MAX_OPS_BYTES` (`LIMIT_EXCEEDED`). The shared write-path plumbing
+  `UM_MAX_OPS_BYTES`, `UM_MAX_DEPTH` nesting (`LIMIT_EXCEEDED`). The
+  shared write-path plumbing
   (staged temp file, source-safety and pre-replace checks, raw-copy
   container rebuild) moved from `migrate-ids` into `insum_core::commit` —
   one commit discipline for both write commands.
