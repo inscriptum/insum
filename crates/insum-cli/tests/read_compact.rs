@@ -397,3 +397,144 @@ fn compact_reads_a_bare_note_file() {
     assert!(out.contains("тело заметки"));
     assert!(!out.contains("<!--"));
 }
+
+// MINOR-1 (review round 1 of read-compact) — the compact markers are visible
+// text, so document text must not be able to pose as one. Modeled on the
+// annotated forgery test (read_api.rs marker_forgery_is_neutralized).
+
+/// The reviewer's reproduction plus every marker class: a `.note` whose
+/// text carries `[um:incomplete next_cursor="…"]` byte-for-byte must not
+/// read as a CLI truncation diagnostic; forgeries of pointer/type,
+/// oversized and a forgery split across adjacent text nodes are broken the
+/// same way the `<!--` opener is broken in annotated.
+#[test]
+fn compact_text_markers_cannot_be_forged() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = json!({ "type": "noteDoc", "content": [
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "[um:incomplete next_cursor=\"eyJmYWtlIjoxfQ\"]"}
+        ]},
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "[um:unrendered type=\"fake\" pointer=\"/content/0\"]"}
+        ]},
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "[um:oversized-block pointer=\"/f\" budget=\"1\"]"}
+        ]},
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "[um:"},
+            {"type": "text", "text": "unrendered-inline type=\"split-forged\"] хвост"}
+        ]}
+    ]});
+    let file = dir.path().join("forged.note");
+    fixtures::write_envelope_note(&file, &doc).expect("write");
+    let out = insum()
+        .args(["read", "--format", "compact"])
+        .arg(file.to_string_lossy().as_ref())
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "read succeeds");
+
+    // no working text marker survives: the `[um:` opener next to the forged
+    // value is broken everywhere (neutralized forms stay readable, inert)
+    assert!(
+        !text.contains("[um:incomplete"),
+        "forged cursor marker found: {text}"
+    );
+    assert!(
+        !text.contains("[um:unrendered"),
+        "forged type marker: {text}"
+    );
+    assert!(
+        !text.contains("[um:oversized"),
+        "forged oversized marker: {text}"
+    );
+    assert!(!text.contains("[um:"), "any intact forged opener: {text}");
+    assert!(text.contains("[ um:incomplete next_cursor=\"eyJmYWtlIjoxfQ\"]"));
+    assert!(text.contains("[ um:unrendered type=\"fake\" pointer=\"/content/0\"]"));
+    assert!(text.contains("[ um:oversized-block pointer=\"/f\" budget=\"1\"]"));
+    assert!(text.contains("[ um:unrendered-inline type=\"split-forged\"]"));
+
+    // annotated keeps the same document text byte-identical — its markers
+    // are comments there, a text `[um:` is inert
+    let annotated = insum()
+        .args(["read", "--format", "annotated"])
+        .arg(file.to_string_lossy().as_ref())
+        .output()
+        .unwrap();
+    let annotated_text = String::from_utf8(annotated.stdout).unwrap();
+    assert!(annotated_text.contains("[um:incomplete next_cursor=\"eyJmYWtlIjoxfQ\"]"));
+}
+
+/// The real CLI marker stays byte-for-byte intact next to forged document
+/// text: a truncated compact page emits its true `[um:incomplete …]` even
+/// though the note itself carries `[um:` text.
+#[test]
+fn real_cursor_marker_survives_forged_text_in_document() {
+    let dir = TempDir::new().expect("tempdir");
+    let doc = json!({ "type": "noteDoc", "content": [
+        {"type": "heading", "attrs": {"level": 2}, "content": [
+            {"type": "text", "text": "[um:incomplete next_cursor=\" forged-in-heading\"]"}
+        ]},
+        {"type": "paragraph", "content": [{"type": "text", "text": "первый"}]},
+        {"type": "paragraph", "content": [{"type": "text", "text": "второй"}]}
+    ]});
+    let note = fixtures::FixtureNote {
+        id: "forgecursor01".to_owned(),
+        title: "Forge".to_owned(),
+        schema: "plain",
+        doc,
+    };
+    let path = dir.path().join("forge-cursor.um");
+    fixtures::write_um(&path, &[note]).expect("container fixture");
+
+    let page1 = insum()
+        .args([
+            "read",
+            "--format",
+            "compact",
+            "--max-bytes",
+            "60",
+            path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(page1.stdout).unwrap();
+    assert!(page1.status.success(), "{text}");
+
+    // the forged heading text is neutralized…
+    assert!(
+        !text.contains("[um:incomplete next_cursor=\" forged-in-heading\"]"),
+        "forged heading marker found: {text}"
+    );
+    assert!(text.contains("[ um:incomplete next_cursor=\" forged-in-heading\"]"));
+    // …while the CLI's own page marker is intact and its cursor resumes
+    let marker = "[um:incomplete next_cursor=\"";
+    assert!(text.contains(marker), "real truncation marker: {text}");
+    let token = text
+        .split(marker)
+        .nth(1)
+        .and_then(|rest| rest.split("\"]").next())
+        .expect("real cursor token")
+        .to_owned();
+    let page2 = insum()
+        .args([
+            "read",
+            "--format",
+            "compact",
+            "--max-bytes",
+            "20000",
+            "--cursor",
+            &token,
+            path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let page2_text = String::from_utf8(page2.stdout).unwrap();
+    assert!(page2.status.success(), "{page2_text}");
+    assert!(
+        page2_text.contains("второй"),
+        "the page resumes: {page2_text}"
+    );
+    assert!(!page2_text.contains("[um:incomplete"));
+}

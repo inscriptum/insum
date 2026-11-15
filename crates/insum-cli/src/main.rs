@@ -115,7 +115,7 @@ enum Command {
         /// Note id for .um.
         #[arg(long)]
         note: Option<String>,
-        /// `json` (default), `annotated` (projection with anchors) or `compact` (anchor-free projection).
+        /// `json` (default), `annotated` (projection with anchors) or `compact` (anchor-free projection; document text cannot forge the `[um:` markers — it is neutralized to `[ um:`).
         #[arg(long, default_value = "json")]
         format: String,
         /// Add the annotated anchor comments to the compact projection.

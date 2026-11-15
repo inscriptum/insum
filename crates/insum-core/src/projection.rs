@@ -154,7 +154,7 @@ impl Projection {
                 out.push_str(&format!(
                     "{} {}\n",
                     "#".repeat(level),
-                    neutralize_marker_syntax(inline.as_deref().unwrap_or(""))
+                    self.neutralize_marker_syntax(inline.as_deref().unwrap_or(""))
                 ));
             }
             "paragraph" => {
@@ -165,15 +165,15 @@ impl Projection {
             "noteTitle" => {
                 out.push_str(&format!(
                     "# {}\n",
-                    neutralize_marker_syntax(inline.as_deref().unwrap_or(""))
+                    self.neutralize_marker_syntax(inline.as_deref().unwrap_or(""))
                 ));
             }
             "noteSummary" => {
-                out.push_str(&neutralize_marker_syntax(inline.as_deref().unwrap_or("")));
+                out.push_str(&self.neutralize_marker_syntax(inline.as_deref().unwrap_or("")));
                 out.push('\n');
             }
             "noteProperty" => {
-                let name = neutralize_marker_syntax(
+                let name = self.neutralize_marker_syntax(
                     &children
                         .iter()
                         .find(|child| child.node_type == "notePropertyName")
@@ -183,7 +183,12 @@ impl Projection {
                 let value: Vec<String> = children
                     .iter()
                     .filter(|child| child.node_type == "notePropertyValue")
-                    .filter_map(|child| child.text.clone().map(|t| neutralize_marker_syntax(&t)))
+                    .filter_map(|child| {
+                        child
+                            .text
+                            .clone()
+                            .map(|t| self.neutralize_marker_syntax(&t))
+                    })
                     .collect();
                 out.push_str(&format!("{name}: {}\n", value.join(" ")));
             }
@@ -232,7 +237,7 @@ impl Projection {
                 out.push('\n');
                 for child in children {
                     if let Some(text) = &child.text {
-                        out.push_str(&neutralize_marker_syntax(text));
+                        out.push_str(&self.neutralize_marker_syntax(text));
                         out.push('\n');
                     }
                 }
@@ -241,7 +246,7 @@ impl Projection {
             "mermaid" => {
                 out.push_str("```mermaid\n");
                 if let Some(code) = block.attrs.get("code").and_then(Value::as_str) {
-                    out.push_str(&neutralize_marker_syntax(code));
+                    out.push_str(&self.neutralize_marker_syntax(code));
                     out.push('\n');
                 }
                 out.push_str("```\n");
@@ -432,7 +437,7 @@ impl Projection {
                             // flush the document run BEFORE the CLI marker: the
                             // neutralization applies to the composed run, the
                             // marker template stays intact
-                            out.push_str(&neutralize_marker_syntax(&doc_run));
+                            out.push_str(&self.neutralize_marker_syntax(&doc_run));
                             doc_run.clear();
                             out.push_str(&self.service_marker(&format!(
                                 "um:unrendered-inline type=\"{}\"",
@@ -443,7 +448,7 @@ impl Projection {
                 }
             }
         }
-        out.push_str(&neutralize_marker_syntax(&doc_run));
+        out.push_str(&self.neutralize_marker_syntax(&doc_run));
         unknown_marks.sort();
         unknown_marks.dedup();
         if !unknown_marks.is_empty() {
@@ -487,7 +492,7 @@ impl Projection {
                 child.pointer
             )),
             _ => {
-                let text = neutralize_marker_syntax(&child.text.clone().unwrap_or_default());
+                let text = self.neutralize_marker_syntax(&child.text.clone().unwrap_or_default());
                 format!(
                     "{}{}",
                     self.service_marker(&format!(
@@ -562,7 +567,7 @@ impl Projection {
                     // parity with the top-level renderer: anything unrenderable
                     // gets an explicit marker — empty text is still a loss marker
                     let text =
-                        neutralize_marker_syntax(&item_child.text.clone().unwrap_or_default());
+                        self.neutralize_marker_syntax(&item_child.text.clone().unwrap_or_default());
                     parts.push(format!(
                         "{}{}{text}",
                         marker,
@@ -637,14 +642,31 @@ impl Projection {
     }
 }
 
-/// Neutralize the comment-opener sequence in document-sourced text: it must
-/// not forge CLI markers or anchors in the projection (review W-02/V-06).
-/// `<!--` becomes `<! --` — readable, visibly altered, and impossible to
-/// reassemble into `<!--` without editing.
-fn neutralize_marker_syntax(text: &str) -> String {
-    // CR removal first (Z-03): a CR-stripping consumer cannot reassemble
-    // delimiters from text that had its CR removed before neutralization
-    text.replace('\r', "").replace("<!--", "<! --")
+impl Projection {
+    /// Neutralize the sequences document-sourced text could use to forge
+    /// CLI markers in the projection (review W-02/V-06):
+    ///
+    /// - `<!--` becomes `<! --` — readable, visibly altered, and impossible
+    ///   to reassemble into `<!--` without editing; the same treatment
+    ///   applies in both modes (the comment shapes of the annotated mode).
+    /// - the compact mode emits markers as visible text, so its opener
+    ///   `[um:` is broken the same way — `[ um:` — wherever it appears in
+    ///   document text (MINOR-1, review round 1 of read-compact). The
+    ///   composed document run is neutralized AS A WHOLE on flush, so a
+    ///   forgery split across adjacent text nodes cannot bypass it; the
+    ///   CLI's own markers never pass through the neutralizer.
+    fn neutralize_marker_syntax(&self, text: &str) -> String {
+        // CR removal first (Z-03): a CR-stripping consumer cannot reassemble
+        // delimiters from text that had its CR removed before neutralization
+        let neutralized = text.replace('\r', "").replace("<!--", "<! --");
+        if self.anchors {
+            // annotated markers are HTML comments — document text `[um:` is
+            // inert there and must stay byte-identical
+            neutralized
+        } else {
+            neutralized.replace("[um:", "[ um:")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -860,5 +882,76 @@ mod tests {
             compact.service_marker("um:incomplete next_cursor=\"t\""),
             "[um:incomplete next_cursor=\"t\"]"
         );
+    }
+
+    /// MINOR-1 (review round 1 of read-compact): the compact markers are
+    /// visible text, so document text starting a `[um:` opener must not
+    /// survive byte-for-byte — it is broken the same way `<!--` is.
+    #[test]
+    fn compact_text_markers_cannot_be_forged_by_document_text() {
+        let doc = json!({ "type": "noteDoc", "content": [
+            paragraph(&[text("[um:incomplete next_cursor=\"eyJmYWtlIjoxfQ\"]")]),
+            paragraph(&[text("[um:unrendered type=\"fake\" pointer=\"/content/0\"]")]),
+            paragraph(&[text("[um:oversized-block pointer=\"/f\" budget=\"1\"]")]),
+            // a forgery split across adjacent text nodes is neutralized as
+            // the composed whole (the same boundary rule as `<!--`)
+            paragraph(&[text("[um:"), text("unrendered-inline type=\"split\"]")]),
+            paragraph(&[text("в тексте [um:unrendered-marks=\"x\"] в середине")]),
+        ]});
+        let compact = render(&doc, false);
+        assert!(!compact.contains("[um:incomplete"), "{compact}");
+        assert!(!compact.contains("[um:unrendered"), "{compact}");
+        assert!(!compact.contains("[um:oversized"), "{compact}");
+        assert!(!compact.contains("[um:"), "{compact}");
+        // neutralized forms stay readable and carry the inert value
+        assert!(compact.contains("[ um:incomplete next_cursor=\"eyJmYWtlIjoxfQ\"]"));
+        assert!(compact.contains("[ um:unrendered type=\"fake\""));
+        assert!(compact.contains("[ um:oversized-block"));
+        assert!(compact.contains("[ um:unrendered-inline type=\"split\"]"));
+        assert!(compact.contains("[ um:unrendered-marks=\"x\"]"));
+
+        // annotated keeps document `[um:` text byte-identical: its own
+        // markers are comments, a text `[um:` is inert there
+        let annotated = render(&doc, true);
+        assert!(annotated.contains("[um:incomplete next_cursor=\"eyJmYWtlIjoxfQ\"]"));
+    }
+
+    #[test]
+    fn real_compact_markers_survive_forgeries_in_document_text() {
+        // the CLI-emitted marker is composed directly and never passes
+        // through the neutralizer — with forged text in the same document
+        // it stays byte-for-byte intact
+        let doc = json!({ "type": "noteDoc", "content": [
+            json!({"type": "customWidget", "attrs": {}}),
+            paragraph(&[text("[um:unrendered type=\"fake\"]")]),
+            paragraph(&[text("[um:incomplete next_cursor=\"fake\"]")]),
+        ]});
+        let compact = render(&doc, false);
+        // the real CLI marker for the unknown node is untouched
+        assert!(compact.contains("[um:unrendered type=\"customWidget\" pointer=\"/content/0\"]"));
+        // the forged lookalikes in document text are broken
+        assert!(compact.contains("[ um:unrendered type=\"fake\"]"));
+        assert!(compact.contains("[ um:incomplete next_cursor=\"fake\"]"));
+        assert_eq!(compact.matches("[um:").count(), 1);
+    }
+
+    #[test]
+    fn compact_marker_forgery_in_code_mermaid_and_cells_is_neutralized() {
+        let doc = json!({ "type": "noteDoc", "content": [
+            json!({"type": "hljsCodeBlock", "attrs": {"class": "language-text"}, "content": [
+                json!({"type": "hljsCodeBlockRow", "attrs": {"class": "l"}, "content": [text("[um:incomplete next_cursor=\"in-fence\"]")]}),
+            ]}),
+            json!({"type": "mermaid", "attrs": {"code": "A[um:unrendered type=\"fake\"]-->B"}}),
+            json!({"type": "table", "content": [
+                json!({"type": "tableRow", "content": [
+                    json!({"type": "tableHeader", "attrs": {"colspan": 1, "rowspan": 1}, "content": [paragraph(&[text("[um:unrendered-inline type=\"fake\"]")])]}),
+                ]}),
+            ]}),
+        ]});
+        let compact = render(&doc, false);
+        assert!(!compact.contains("[um:"), "{compact}");
+        assert!(compact.contains("[ um:incomplete next_cursor=\"in-fence\"]"));
+        assert!(compact.contains("A[ um:unrendered type=\"fake\"]-->B"));
+        assert!(compact.contains("[ um:unrendered-inline type=\"fake\"]"));
     }
 }

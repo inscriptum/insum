@@ -383,9 +383,18 @@ package is JSON read from a file or stdin (`-`):
   projection losses stay explicit (§3.5) as visible text markers with the
   same `um:` payload: `[um:incomplete next_cursor="..."]`,
   `[um:oversized-block pointer="..." budget="..."]`, `[um:unrendered ...]`,
-  `[um:unrendered-inline type="..."]`, `[um:unrendered-marks="..."]`. Like
-  `annotated`, it is a read-only view with no parser and is never fed to
-  `apply`; exact reading is JSON.
+  `[um:unrendered-inline type="..."]`, `[um:unrendered-marks="..."]`. Because
+  these markers are visible text, document text carrying their opener is
+  neutralized the same way the `<!--` opener is: a `[um:` sequence in
+  document-sourced text becomes `[ um:` (readable, visibly altered,
+  impossible to reassemble without editing) — in headings, paragraphs,
+  code blocks, mermaid and table cells alike; a forgery split across
+  adjacent text nodes is neutralized as the composed run. The CLI's own
+  markers are composed directly and never pass through the neutralizer.
+  In `annotated` (and `compact --with-anchors`) the text-marker opener is
+  inert — document `[um:` text stays byte-identical there. Like `annotated`,
+  compact is a read-only view with no parser and is never fed to `apply`;
+  exact reading is JSON.
 - No read command (`ls`, `search`, `tree`, `block get`, `read`, `validate`,
   `schema`, `history`) modifies input files, creates temp files, executes
   document content, or performs network access. The write commands
