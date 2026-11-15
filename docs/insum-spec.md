@@ -26,7 +26,7 @@ until then this document is the reference for consumers (agents and scripts).
 | `insum block get <file> [--note <id>] (--pointer <p>\|--id <id>)` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it). `--id` resolves whenever the ID is present in the note; without the `features.block_ids` marker the response carries a `BLOCK_IDS_NOT_GUARANTEED` warning, an absent ID is `BLOCK_NOT_FOUND` |
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |
 | `insum table get <file> [--note <id>] (--index <n>\|--id <id>\|--after-heading <text>) [--where COL=VALUE] [--format json\|markdown] [--max-bytes n]` | Structured read of one table: headers/rows with cell ids and pointers, values by column name; `markdown` is a GFM projection with escaped pipes. Ragged rows, duplicate header names, colspan/rowspan and nested tables surface as warnings — the response contract is documented in `insum table get --help` |
-| `insum read <file> [--note <id>] [--format json\|annotated]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors |
+| `insum read <file> [--note <id>] [--format json\|annotated\|compact] [--with-anchors]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors; `compact` is the same projection without a single service comment (`--with-anchors` grows them back — the output is byte-identical to `annotated`) |
 | `insum schema [--type <node>] [--schema <file>]` | Show the applicable schema artifact (source, path, hash, validation capability); `--type` shows one node descriptor with its example |
 | `insum validate [--strict] [--hidden] [--schema <file>] <paths>...` | Validation with an explicit level: `structural` or `schema` |
 | `insum history <file> [--note <id\|title>] [--limit n] [--format json\|annotated] [--max-bytes n]` | Change history of the file from git: revisions newest-first, each with a per-note structural diff against its parent |
@@ -379,6 +379,23 @@ package is JSON read from a file or stdin (`-`):
   `<!--` is neutralized to `<! --` so it cannot forge CLI anchors or markers;
   inside tables, row/cell/paragraph anchors are emitted inline within the
   cells, and anything unrenderable in a cell is marked explicitly.
+- Compact projection (`read --format compact`): the same rendering pipeline
+  with anchors off — the page carries no HTML comment at all. Truncation and
+  projection losses stay explicit (§3.5) as visible text markers with the
+  same `um:` payload: `[um:incomplete next_cursor="..."]`,
+  `[um:oversized-block pointer="..." budget="..."]`, `[um:unrendered ...]`,
+  `[um:unrendered-inline type="..."]`, `[um:unrendered-marks="..."]`. Because
+  these markers are visible text, document text carrying their opener is
+  neutralized the same way the `<!--` opener is: a `[um:` sequence in
+  document-sourced text becomes `[ um:` (readable, visibly altered,
+  impossible to reassemble without editing) — in headings, paragraphs,
+  code blocks, mermaid and table cells alike; a forgery split across
+  adjacent text nodes is neutralized as the composed run. The CLI's own
+  markers are composed directly and never pass through the neutralizer.
+  In `annotated` (and `compact --with-anchors`) the text-marker opener is
+  inert — document `[um:` text stays byte-identical there. Like `annotated`,
+  compact is a read-only view with no parser and is never fed to `apply`;
+  exact reading is JSON.
 - No read command (`ls`, `search`, `tree`, `block get`, `read`, `validate`,
   `schema`, `history`) modifies input files, creates temp files, executes
   document content, or performs network access. The write commands

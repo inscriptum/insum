@@ -16,6 +16,13 @@ Format — Keep a Changelog; versioning — SemVer.
   duplicate header names, colspan/rowspan and nested tables are reported
   as explicit warnings, never silently reinterpreted; the read never
   modifies the file.
+- `insum read --format compact [--with-anchors]` — a clean markdown
+  projection of a note for agent context: the annotated pipeline with the
+  pointer comments off (GFM tables with pipe escaping, lists, code,
+  mermaid), so agents no longer strip `um:pointer` lines by hand or fall
+  back to the `um-read` shim. Truncation and projection losses remain
+  explicit as visible text markers; `--with-anchors` returns the annotated
+  shape byte-for-byte, and `annotated`/`json` are unchanged.
 - `insum apply <file> --ops <file|-> [--dry-run] [--if-match <prefix>]`
   (stage D, §8): addressed write of blocks by ID with a revision CAS.
   One package mutates one note; `base_note_rev` (from `tree` / `read` /
