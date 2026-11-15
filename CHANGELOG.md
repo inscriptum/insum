@@ -16,11 +16,14 @@ Format — Keep a Changelog; versioning — SemVer.
   (`parent_id: null` — the document root), `set_attrs`, `replace_content`;
   `set_text` and `move` are not in v1. IDs are CLI-managed: input nodes
   must not carry `attrs.id` — a stolen ID is `ID_CONFLICT`, any other
-  input ID is `BLOCK_ID_IMMUTABLE`; `replace` keeps the target's ID and
-  its subtree may restate its own descendant IDs; new addressable blocks
-  receive generator IDs. Sequential semantics (§8.4): IDs resolve against
-  the current working copy, `insert_after` groups on one anchor keep the
-  operation order, a deleted block fails every later operation on its ID.
+  input ID is `BLOCK_ID_IMMUTABLE` (a `replace` root may restate the
+  target's ID verbatim); `replace` keeps the target's ID while the new
+  root type stays addressable — a non-addressable root reports the ID in
+  `deleted_ids` — and its subtree may restate its own descendant IDs; new
+  addressable blocks receive generator IDs. Sequential semantics (§8.4):
+  IDs resolve against the current working copy, `insert_after` groups on
+  one anchor keep the operation order, a deleted block fails every later
+  operation on its ID.
   Dry-run validates the package against the current state (`operations_validated`,
   `would_create_count`, `would_delete_ids`, parity warnings) and never
   touches bytes, mtime or the directory (plan == commit). Commit: the
@@ -36,13 +39,16 @@ Format — Keep a Changelog; versioning — SemVer.
   explicit artifact; bundled fallback refuses with `SCHEMA_UNAVAILABLE`,
   `SCHEMA_MISMATCH` on a failed hash) and the note must carry the
   `features.block_ids` marker (`BLOCK_IDS_NOT_ENABLED` — run
-  `migrate-ids` first). Success response: `old/new note_rev`,
-  `old/new file_rev`, `operations_applied`, `created_ids` (every new
+  `migrate-ids` first); a package that removes a title-family note's
+  leading `noteTitle` refuses as `CONTENT_NOT_ALLOWED`. Success response:
+  `old/new note_rev`, `old/new file_rev`, `operations_applied`,
+  `created_ids` (every new
   addressable block with its final `{id, pointer, type}`),
-  `deleted_ids`, parity warnings; the ID lists respect
-  `UM_MAX_OUTPUT_BYTES` with explicit truncation (`truncated`, totals,
-  `OUTPUT_BUDGET`). Validation refusals map onto the registry
-  (`CONTENT_NOT_ALLOWED`, `UNSUPPORTED_NODE_TYPE`, `INVALID_NODE`) with
+  `deleted_ids`, parity warnings; the ID lists and the parity warnings
+  share `UM_MAX_OUTPUT_BYTES` with explicit truncation (`truncated`,
+  totals, `warnings_total`, `OUTPUT_BUDGET`). Validation refusals map
+  onto the registry (`CONTENT_NOT_ALLOWED`, `UNSUPPORTED_NODE_TYPE`,
+  `INVALID_NODE`) with
   the full diagnostic list in `error.details.diagnostics`. Package
   envelope violations are `USAGE`; limits: `UM_MAX_APPLY_OPS`,
   `UM_MAX_OPS_BYTES` (`LIMIT_EXCEEDED`). The shared write-path plumbing

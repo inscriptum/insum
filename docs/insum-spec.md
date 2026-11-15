@@ -135,7 +135,8 @@ Configured via environment variables with safe defaults, enforced on actual
 data: `UM_MAX_ENTRY_BYTES` (32 MiB), `UM_MAX_ARCHIVE_ENTRIES` (10 000),
 `UM_MAX_TOTAL_BYTES` (256 MiB), `UM_MAX_DEPTH` (128),
 `UM_MAX_OUTPUT_BYTES` (64 KiB), `UM_MAX_SEARCH_MATCHES` (1 000),
-`UM_MAX_OPS_BYTES`, `UM_MAX_APPLY_OPS`, `UM_MAX_COMMIT_RETRIES`,
+`UM_MAX_OPS_BYTES` (4 MiB), `UM_MAX_APPLY_OPS` (1 000),
+`UM_MAX_COMMIT_RETRIES` (3),
 `UM_MAX_SCHEMA_BYTES` (1 MiB — schema artifact files).
 
 ## History (git-backed)
@@ -202,15 +203,20 @@ the `.um` manifest, or the envelope's `features` for a `.note` (a legacy
   refuses too (`SCHEMA_MISMATCH`).
 - **`--dry-run`** plans and validates the would-be result but never touches
   the file bytes or mtime; preview IDs may differ from the commit's (the
-  commit generates its own). A dry-run refuses exactly where the commit
-  would (plan == commit).
+  commit generates its own). A dry-run refuses wherever the commit's plan
+  phase refuses (plan == commit), except the commit-time lock and
+  dirty-lease guard (`WRITE_LOCKED`) and the revision rechecks inside the
+  lock — a green dry-run validates the plan, it does not reserve the lock.
 - **Transaction.** The commit takes a sidecar lock (a live editor lease
   refuses with `WRITE_LOCKED`), rechecks the file and per-note revisions
   inside the lock (`NOTE_REVISION_MISMATCH` on a change), rewrites the
   container (untouched ZIP entries are copied byte-identical, unknown
   manifest fields survive), validates the result over the staged bytes and
   replaces the file atomically (permissions preserved, symlink sources
-  refused). A source symlink or non-regular file is refused before any
+  refused). The atomic replace protects cooperative writers (the sidecar
+  lock); the window between the final pre-replace verification and the
+  rename is not closed for non-cooperative processes on POSIX. A source
+  symlink or non-regular file is refused before any
   work, in dry-run and commit alike. The lock and lease sidecars are named
   after the target (§9.2 — the plugin counts on the same names, so there
   is no fallback name): a target whose name leaves no room for the sidecar
@@ -292,10 +298,14 @@ package is JSON read from a file or stdin (`-`):
 - **IDs are managed by the CLI (§8.2).** Input nodes must not carry
   `attrs.id`: a passed ID that belongs to another block of the note is
   `ID_CONFLICT` (exit 4), any other passed ID is `BLOCK_ID_IMMUTABLE`
-  (exit 2). `replace` keeps the target's ID; descendants of `replace` /
-  `replace_content` may restate IDs that belonged to the replaced subtree
-  (they are preserved); new addressable blocks receive generator IDs at
-  commit. `set_attrs` must not touch the ID attribute. `set_text` and
+  (exit 2) — the one exception is a `replace` root, which may restate
+  the target's ID verbatim (never a different one). `replace` keeps the
+  target's ID while the new root type stays addressable; a
+  non-addressable new root drops it — the ID leaves the note and is
+  reported in `deleted_ids`. Descendants of `replace` / `replace_content`
+  may restate IDs that belonged to the replaced subtree (they are
+  preserved); new addressable blocks receive generator IDs at commit.
+  `set_attrs` must not touch the ID attribute. `set_text` and
   `move` do not exist in v1 (`INVALID_OPERATION`).
 - **Semantics (§8.3–8.4).** Operations apply sequentially to a working
   copy; each resolves its IDs in the current state. `insert_after` groups
@@ -317,8 +327,11 @@ package is JSON read from a file or stdin (`-`):
   reports `operations_validated`, `would_create_count`,
   `would_delete_ids` and parity warnings — applied stays `false`, no
   final IDs are promised, and the file bytes, mtime and directory stay
-  untouched (no temp files). A dry-run refuses exactly where the commit
-  would (plan == commit).
+  untouched (no temp files). A dry-run refuses wherever the commit's plan
+  phase refuses (plan == commit), except the commit-time lock and
+  dirty-lease guard (`WRITE_LOCKED`) and the in-lock rechecks (a changed
+  file under the lock re-applies or fails `WRITE_CONFLICT`) — a green
+  dry-run validates the package, it does not reserve the lock.
 - **Transaction (§8.6–8.7, §9).** The commit takes the same sidecar lock
   and dirty-lease guard as `migrate-ids` (a live editor lease refuses with
   `WRITE_LOCKED`). If the file changed after the plan but the TARGET note
@@ -327,8 +340,12 @@ package is JSON read from a file or stdin (`-`):
   changed target revision is `NOTE_REVISION_MISMATCH`; after
   `UM_MAX_COMMIT_RETRIES` (default 3) re-applications the commit gives up
   with `WRITE_CONFLICT` — never a silent overwrite. Any error leaves the
-  file untouched (all-or-nothing). Untouched ZIP entries keep their names
-  and compressed bytes; unknown manifest and envelope fields survive.
+  file untouched (all-or-nothing). The commit uses the same hidden staged
+  temp file as `migrate-ids` (stage C): after a killed process such
+  orphans may remain next to the target — deleting them by hand is safe,
+  `apply` always creates a fresh temp file and never reuses an existing
+  one. Untouched ZIP entries keep their names and compressed bytes;
+  unknown manifest and envelope fields survive.
 - **Response.** On success: `applied: true`, `old/new note_rev`,
   `old/new file_rev`, `operations_applied`, `created_ids` (every new
   addressable block with its final `{id, pointer, type}`, nested included)
