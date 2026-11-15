@@ -80,6 +80,11 @@ enum Command {
         #[command(subcommand)]
         action: BlockAction,
     },
+    /// Structured read of one table.
+    Table {
+        #[command(subcommand)]
+        action: TableAction,
+    },
     /// Full-text search over inline content.
     Search {
         /// Literal search instead of a Rust `regex` pattern.
@@ -212,6 +217,63 @@ enum BlockAction {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum TableAction {
+    /// Structured read of one table of a note (read-only; the response
+    /// contract is this help text).
+    ///
+    /// Address the table with exactly one of: --index N (0-based, document
+    /// order), --id <block-id>, --after-heading <text> (the exact text of
+    /// the nearest preceding heading; several tables under same-text
+    /// headings are an error).
+    ///
+    /// JSON response fields (fixed set; emitted in lexicographic order):
+    /// `api_version`, `path`, `note_id`, `note_rev`, `table` with `pointer`,
+    /// `id`, `index`, `table_count`, `heading`, `columns` (each `name`,
+    /// `id`, `pointer`; the header row is the table's first row), `rows`
+    /// (each `id`, `pointer`, `cells` with `id`, `pointer`, `text`, and
+    /// `values` — column name to cell text, `null` when names are
+    /// duplicated or withheld), `rows_source`, `rows_matched`, plus
+    /// `warnings`, `complete`, `truncated`.
+    ///
+    /// `--where COL=VALUE` keeps only the rows whose cell in column COL
+    /// equals VALUE byte-for-byte: a miss is an empty row list, an unknown
+    /// column is an error, any duplicated column name refuses the filter.
+    /// `--format markdown` prints a GFM table (first row is the header,
+    /// pipes escaped as `\|`, newlines become `<br>`, no anchors);
+    /// diagnostics ride as `<!-- um:warning code=... -->` comments after
+    /// the table. The output budget (`--max-bytes`, default
+    /// UM_MAX_OUTPUT_BYTES) truncates whole rows with `truncated: true`,
+    /// `complete: false` and an OUTPUT_BUDGET warning — never silently.
+    Get {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Note id — required for .um, forbidden for .note.
+        #[arg(long)]
+        note: Option<String>,
+        /// Document-order index of the table, 0-based.
+        #[arg(long, value_name = "N")]
+        index: Option<usize>,
+        /// Block ID of the table node — resolves when the ID is present in
+        /// the note; without the features.block_ids marker the answer
+        /// carries a warning.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+        /// Exact text of the nearest heading preceding the table.
+        #[arg(long, value_name = "TEXT")]
+        after_heading: Option<String>,
+        /// Keep only rows whose cell in COL equals VALUE exactly.
+        #[arg(long, value_name = "COL=VALUE")]
+        r#where: Option<String>,
+        /// `json` (default) or `markdown` (GFM projection).
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Output budget in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
+}
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -283,6 +345,31 @@ fn main() {
             &limits,
         )
         .map(Output::Json),
+        Some(Command::Table {
+            action:
+                TableAction::Get {
+                    file,
+                    note,
+                    index,
+                    id,
+                    after_heading,
+                    r#where,
+                    format,
+                    max_bytes,
+                },
+        }) => commands::table::run(
+            &commands::table::TableGet {
+                path: file,
+                note: note.as_deref(),
+                index: *index,
+                id: id.as_deref(),
+                after_heading: after_heading.as_deref(),
+                where_filter: r#where.as_deref(),
+                format,
+                max_bytes: *max_bytes,
+            },
+            &limits,
+        ),
         Some(Command::Search {
             fixed_strings,
             ignore_case,

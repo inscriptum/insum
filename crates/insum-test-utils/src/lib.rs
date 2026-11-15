@@ -121,6 +121,48 @@ pub fn code_block(language: &str, code: &str) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// table builders (the on-disk table node shapes)
+// ---------------------------------------------------------------------------
+
+/// A `table` block with the given rows.
+pub fn table(rows: &[Value]) -> Value {
+    json!({ "type": "table", "content": rows })
+}
+
+/// A `tableRow` with an optional block id and the given cells.
+pub fn table_row(id: Option<&str>, cells: &[Value]) -> Value {
+    let mut row = json!({ "type": "tableRow", "content": cells });
+    if let Some(id) = id {
+        row["attrs"] = json!({ "id": id });
+    }
+    row
+}
+
+/// A cell (`tableCell` or `tableHeader`) with one paragraph of text.
+/// colspan/rowspan are always stored (the on-disk shape) and default to 1.
+pub fn table_cell(kind: &str, id: Option<&str>, value: &str, colspan: u64, rowspan: u64) -> Value {
+    let mut attrs = json!({ "colspan": colspan, "rowspan": rowspan });
+    if let Some(id) = id {
+        attrs["id"] = json!(id);
+    }
+    json!({
+        "type": kind,
+        "attrs": attrs,
+        "content": [paragraph(&[text(value)])]
+    })
+}
+
+/// A `tableHeader` cell with one paragraph.
+pub fn table_header(id: Option<&str>, value: &str) -> Value {
+    table_cell("tableHeader", id, value, 1, 1)
+}
+
+/// A `tableCell` with one paragraph.
+pub fn table_cell_text(id: Option<&str>, value: &str) -> Value {
+    table_cell("tableCell", id, value, 1, 1)
+}
+
 /// A title-page document: mandatory `noteTitle` + `noteSummary` + content
 /// blocks (`schema: "title"`, `schemaVersion: 2`).
 pub fn title_doc(title: &str, summary: &str, blocks: &[Value]) -> Value {

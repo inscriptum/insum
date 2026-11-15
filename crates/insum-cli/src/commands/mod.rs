@@ -8,5 +8,6 @@ pub mod migrate_ids;
 pub mod read;
 pub mod schema;
 pub mod search;
+pub mod table;
 pub mod tree;
 pub mod validate;
