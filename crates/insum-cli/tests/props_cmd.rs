@@ -799,10 +799,13 @@ fn golden_normalization_catches_a_one_value_drift() {
     );
 }
 
-/// EOL pin (review TST-2): a golden converted by an autocrlf checkout
-/// (LF → CRLF) normalizes to the same bytes as the LF original — the CR
-/// filter is not a vacuum: the raw copies really differ before the
-/// normalization.
+/// EOL pin (review TST-2): normalization is CRLF-insensitive — a golden
+/// converted by an autocrlf checkout (LF → CRLF) normalizes to the same
+/// bytes as the LF original, so an autocrlf checkout of the goldens
+/// cannot break the gate; the CR strips are defense in depth, not the
+/// load-bearing guard (that is the `*.golden -text` .gitattributes rule:
+/// parse/serialize never carries a raw `\r` through). The raw copies
+/// below really differ — the check stays non-vacuous.
 #[test]
 fn golden_normalization_neutralizes_crlf_line_endings() {
     let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))

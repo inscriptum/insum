@@ -52,15 +52,17 @@ enum Command {
         /// Include hidden files.
         #[arg(long)]
         hidden: bool,
-        /// Add a per-note property summary (name/value pairs) to note
-        /// descriptors (file listing) or a note_details array (directory
-        /// listing); reads and decompresses every note payload — much
+        /// Add a per-note property summary (name/value pairs). File
+        /// listing: on the note descriptors; directory listing: a
+        /// note_details array for notebooks, on the entry for `.note`
+        /// files. Reads and decompresses every note payload — much
         /// slower than the default listing, which never opens payloads.
         #[arg(long)]
         with_properties: bool,
-        /// Add `note_rev` to note descriptors (file listing) or a
-        /// note_details array (directory listing), payload + manifest
-        /// descriptor per the revision rule; also reads every payload.
+        /// Add `note_rev` (payload + manifest descriptor per the
+        /// revision rule). File listing: on the note descriptors;
+        /// directory listing: a note_details array for notebooks, on the
+        /// entry for `.note` files. Also reads every payload.
         #[arg(long)]
         with_rev: bool,
         /// Directory or file; defaults to `.`.
