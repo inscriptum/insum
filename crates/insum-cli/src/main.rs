@@ -53,12 +53,14 @@ enum Command {
         #[arg(long)]
         hidden: bool,
         /// Add a per-note property summary (name/value pairs) to note
-        /// descriptors; reads and decompresses every note payload — much
+        /// descriptors (file listing) or a note_details array (directory
+        /// listing); reads and decompresses every note payload — much
         /// slower than the default listing, which never opens payloads.
         #[arg(long)]
         with_properties: bool,
-        /// Add `note_rev` to note descriptors (payload + manifest
-        /// descriptor per the revision rule); also reads every payload.
+        /// Add `note_rev` to note descriptors (file listing) or a
+        /// note_details array (directory listing), payload + manifest
+        /// descriptor per the revision rule; also reads every payload.
         #[arg(long)]
         with_rev: bool,
         /// Directory or file; defaults to `.`.

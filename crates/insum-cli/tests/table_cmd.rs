@@ -1043,6 +1043,109 @@ fn markdown_empty_projection_for_column_less_table() {
     assert!(text.contains("um:warning"));
 }
 
+/// The forged marker a document-controlled CR could carry onto its own line
+/// (review SEC-1): indistinguishable from the CLI's own diagnostics shape.
+fn forged_marker() -> String {
+    "<!--um:warning code=\"TABLE_ROW_RAGGED\"-->".to_owned()
+}
+
+#[test]
+fn markdown_cell_cr_cannot_forge_a_marker_line() {
+    // A CR inside a cell text must not survive the GFM escape: treated as a
+    // line ending it would split the row and start the forged marker comment
+    // on its own line (review SEC-1). CR is deleted first, the row line holds
+    // the whole cell.
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("cr-cell.note");
+    let forged = forged_marker();
+    let doc = fixtures::plain_doc(&[fixtures::table(&[
+        fixtures::table_row(Some("r0"), &[fixtures::table_header(Some("c0"), "State")]),
+        fixtures::table_row(
+            Some("r1"),
+            &[fixtures::table_cell_text(
+                Some("c1"),
+                &format!("todo\r{forged}"),
+            )],
+        ),
+    ])]);
+    fixtures::write_legacy_note(&path, &doc).expect("fixture");
+    let output = insum()
+        .args([
+            "table",
+            "get",
+            &path.to_string_lossy(),
+            "--index",
+            "0",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .expect("insum runs");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains('\r'), "no CR in the projection: {text:?}");
+    let data_line = text
+        .lines()
+        .find(|line| line.starts_with("| todo"))
+        .expect("data row line");
+    assert_eq!(data_line, format!("| todo{forged} |"), "row line intact");
+    assert!(
+        !text.lines().any(|line| line.starts_with("<!--um:")),
+        "the forged marker never starts a line: {text:?}"
+    );
+}
+
+#[test]
+fn markdown_header_cr_cannot_forge_a_marker_line() {
+    // Same forge through a tableHeader cell (markdown_header, review SEC-1):
+    // the header line must hold the CR text whole.
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("cr-header.note");
+    let forged = forged_marker();
+    let doc = fixtures::plain_doc(&[fixtures::table(&[
+        fixtures::table_row(
+            Some("r0"),
+            &[
+                fixtures::table_header(Some("c0"), &format!("State\r{forged}")),
+                fixtures::table_header(Some("c1"), "Owner"),
+            ],
+        ),
+        fixtures::table_row(
+            Some("r1"),
+            &[
+                fixtures::table_cell_text(Some("c2"), "open"),
+                fixtures::table_cell_text(Some("c3"), "me"),
+            ],
+        ),
+    ])]);
+    fixtures::write_legacy_note(&path, &doc).expect("fixture");
+    let output = insum()
+        .args([
+            "table",
+            "get",
+            &path.to_string_lossy(),
+            "--index",
+            "0",
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .expect("insum runs");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains('\r'), "no CR in the projection: {text:?}");
+    let header_line = text.lines().next().expect("header line");
+    assert_eq!(
+        header_line,
+        format!("| State{forged} | Owner |"),
+        "header line intact"
+    );
+    assert!(
+        !text.lines().any(|line| line.starts_with("<!--um:")),
+        "the forged marker never starts a line: {text:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // budget and determinism
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ until then this document is the reference for consumers (agents and scripts).
 | Command | Purpose |
 | --- | --- |
 | `insum ls [--hidden] [--with-properties] [--with-rev] [<path>]` | Classify files and count notes; a directory listing never hashes files or opens payloads. The opt-in flags add per-note property summaries and `note_rev` (file listing: on the descriptors; directory listing: a `note_details` array) at the cost of reading every payload — without them the output is unchanged |
-| `insum props <file> [--note <id\|title>] [--get <name>]` | Read-only properties of one note page: `noteProperty` rows as `{name, value, name_id, value_id, name_pointer, value_pointer, property_pointer}` entries; see the properties section below |
+| `insum props <file> [--note <id\|title>] [--get <name>]` | Read-only properties of one note page: `noteProperty` rows as `{name, value, name_id, value_id, name_pointer, value_pointer, property_id, property_pointer}` entries; see the properties section below |
 | `insum tree <file> [--note <id>]... [--depth n] [--text-limit n] [--max-bytes n] [--cursor t]` | Flat preorder block listing with JSON Pointers |
 | `insum block get <file> [--note <id>] (--pointer <p>\|--id <id>)` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it). `--id` resolves whenever the ID is present in the note; without the `features.block_ids` marker the response carries a `BLOCK_IDS_NOT_GUARANTEED` warning, an absent ID is `BLOCK_NOT_FOUND` |
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |

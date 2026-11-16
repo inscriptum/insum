@@ -46,10 +46,9 @@ pub fn run(
     if format == "json" && cursor_token.is_some() {
         // --cursor was silently ignored on json output — reject instead
         return Err(
-            UmError::usage("--cursor applies to --format annotated only in this release")
-                .with_hint(
-                    "json reads the whole note; use `insum tree` for block-wise JSON pagination.",
-                ),
+            UmError::usage("--cursor applies to --format annotated or compact only").with_hint(
+                "json reads the whole note; use `insum tree` for block-wise JSON pagination.",
+            ),
         );
     }
 

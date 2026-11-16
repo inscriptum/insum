@@ -600,10 +600,15 @@ fn gather_object(
 
 /// GFM projection of one table: the first row is the header, short rows are
 /// padded, long rows keep their extra cells (the ragged diagnostics name the
-/// anomaly — no content is dropped here). Pipes are escaped and newlines
-/// become `<br>`, byte-for-byte parity with the annotated cell renderer.
+/// anomaly — no content is dropped here). CR is removed first (deletion-first,
+/// review SEC-1: a document-controlled `\r` must not survive the escape and
+/// split the GFM row line, carrying a forged marker onto its own line), then
+/// newlines become `<br>` and pipes are escaped — byte-for-byte parity with
+/// the annotated cell renderer, CR text included.
 pub fn escape_cell_text(text: &str) -> String {
-    text.replace('\n', "<br>").replace('|', "\\|")
+    text.replace('\r', "")
+        .replace('\n', "<br>")
+        .replace('|', "\\|")
 }
 
 /// Header and separator lines of the GFM projection, from the table's

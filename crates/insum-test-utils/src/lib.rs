@@ -37,8 +37,10 @@ use zip::write::SimpleFileOptions;
 ///   hash on unix hosts is unchanged and the committed goldens stay valid.
 ///
 /// `large_file(false)` is the crate default, pinned for the same reason.
-/// The deflate stream is platform-independent by construction: flate2 is
-/// resolved to the pure-Rust zlib-rs backend on all targets (Cargo.lock).
+/// The deflate stream is platform-independent in practice, guarded by the
+/// golden byte gate / pinned file_rev rather than by construction: flate2
+/// is resolved to the pure-Rust zlib-rs backend on all targets
+/// (Cargo.lock), but its deflate paths are arch-conditional.
 fn fixture_zip_options() -> SimpleFileOptions {
     SimpleFileOptions::default()
         .last_modified_time(zip::DateTime::default()) // 1980-01-01
@@ -491,6 +493,35 @@ mod tests {
                 entry.last_modified(),
                 Some(zip::DateTime::default()),
                 "entry {name}"
+            );
+        }
+    }
+
+    /// The host-derived central-directory fields of every entry are the
+    /// values [`fixture_zip_options`] pins — the system byte of
+    /// `version made by` is Unix (not the `cfg!(windows)`-dependent Dos
+    /// default) and the external attributes are `(S_IFREG | 0o644) << 16`
+    /// (`0x81a40000`, zip 9.2 `normalize()` re-adds `S_IFREG`). This is the
+    /// cross-host half of fixture determinism: the timestamp pin above is
+    /// checked on the same host that wrote the fixture, these two bytes are
+    /// where hosts used to diverge (review TST-3).
+    #[test]
+    fn zip_entry_system_and_attributes_are_pinned() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pinned.um");
+        minimal_container(&path).unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        for name in ["manifest.json", &format!("notes/{}.json", ulid_seq(1))] {
+            let entry = archive.by_name(name).unwrap();
+            assert_eq!(
+                entry.system(),
+                zip::System::Unix,
+                "entry {name}: version-made-by system byte"
+            );
+            assert_eq!(
+                entry.external_attributes(),
+                0x81a4_0000,
+                "entry {name}: external attributes"
             );
         }
     }

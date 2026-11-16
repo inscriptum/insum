@@ -671,6 +671,20 @@ fn ls_without_flags_matches_the_golden_bytes() {
             "ls {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // Raw-byte pin (review TST-1): the CLI prints exactly one compact
+        // JSON document plus a newline, so the raw stdout must equal the
+        // compact re-serialization byte-for-byte — the normalization below
+        // cannot hide a raw formatting drift (pretty printing, key order).
+        let parsed: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+        let compact = format!(
+            "{}\n",
+            serde_json::to_string(&parsed).expect("re-serialize")
+        );
+        assert_eq!(
+            output.stdout,
+            compact.as_bytes(),
+            "ls {args:?} stdout is not compact JSON + newline"
+        );
         let actual = normalize_listing(&output.stdout);
         let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -752,6 +766,71 @@ fn is_run_specific_path(text: &str) -> bool {
         (chars.next(), chars.next()),
         (Some(drive), Some(':')) if drive.is_ascii_alphabetic()
     )
+}
+
+/// The gate has teeth (review TST-2): the normalization must not collapse
+/// distinct listings. The committed golden re-normalizes to itself, and a
+/// copy with one value changed yields different bytes — the inverted
+/// comparison below is exactly the drift the gate's equality would catch.
+#[test]
+fn golden_normalization_catches_a_one_value_drift() {
+    let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("goldens")
+        .join("ls_notebook_file.golden");
+    let golden: Vec<u8> = fs::read(&golden_path)
+        .unwrap_or_else(|err| panic!("golden reads: {err}"))
+        .into_iter()
+        .filter(|byte| *byte != b'\r')
+        .collect();
+    assert_eq!(
+        normalize_listing(&golden),
+        golden,
+        "the committed golden is normalize-stable"
+    );
+    let mut drifted: Value = serde_json::from_slice(&golden).expect("one JSON document");
+    let bytes = drifted["bytes"].as_u64().expect("bytes field");
+    drifted["bytes"] = Value::from(bytes + 1);
+    let drifted_bytes = normalize_listing(&serde_json::to_vec(&drifted).expect("serialize"));
+    assert_ne!(
+        normalize_listing(&golden),
+        drifted_bytes,
+        "one changed value must change the normalized bytes"
+    );
+}
+
+/// EOL pin (review TST-2): a golden converted by an autocrlf checkout
+/// (LF → CRLF) normalizes to the same bytes as the LF original — the CR
+/// filter is not a vacuum: the raw copies really differ before the
+/// normalization.
+#[test]
+fn golden_normalization_neutralizes_crlf_line_endings() {
+    let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("goldens")
+        .join("ls_notebook_file.golden");
+    let golden: Vec<u8> =
+        fs::read(&golden_path).unwrap_or_else(|err| panic!("golden reads: {err}"));
+    assert!(
+        !golden.contains(&b'\r'),
+        "the committed golden carries no CR bytes"
+    );
+    let crlf: Vec<u8> = golden
+        .iter()
+        .flat_map(|byte| {
+            if *byte == b'\n' {
+                vec![b'\r', b'\n']
+            } else {
+                vec![*byte]
+            }
+        })
+        .collect();
+    assert_ne!(golden, crlf, "the CRLF copy differs from the LF original");
+    assert_eq!(
+        normalize_listing(&golden),
+        normalize_listing(&crlf),
+        "CRLF and LF goldens normalize to the same bytes"
+    );
 }
 
 #[test]
@@ -836,6 +915,8 @@ fn ls_and_props_render_paths_with_forward_slashes() {
     );
     assert_eq!(path, rendered(&file));
     let json = run_json(&["ls", "--with-rev", &file]);
+    assert_eq!(json["path"].as_str().expect("path"), rendered(&file));
+    let json = run_json(&["ls", &file]);
     assert_eq!(json["path"].as_str().expect("path"), rendered(&file));
 }
 
