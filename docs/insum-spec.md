@@ -21,11 +21,13 @@ until then this document is the reference for consumers (agents and scripts).
 
 | Command | Purpose |
 | --- | --- |
-| `insum ls [--hidden] [<path>]` | Classify files and count notes; a directory listing never hashes files or opens payloads |
+| `insum ls [--hidden] [--with-properties] [--with-rev] [<path>]` | Classify files and count notes; a directory listing never hashes files or opens payloads. The opt-in flags add per-note property summaries and `note_rev` (file listing: on the note descriptors; directory listing: a `note_details` array for notebooks, on the entry for `.note` files) at the cost of reading every payload — without them the output is unchanged |
+| `insum props <file> [--note <id\|title>] [--get <name>]` | Read-only properties of one note page: `noteProperty` rows as `{name, value, name_id, value_id, name_pointer, value_pointer, property_id, property_pointer}` entries; see the properties section below |
 | `insum tree <file> [--note <id>]... [--depth n] [--text-limit n] [--max-bytes n] [--cursor t]` | Flat preorder block listing with JSON Pointers |
 | `insum block get <file> [--note <id>] (--pointer <p>\|--id <id>)` | Full subtree of one block (wire form without `attrs.id`; `--raw` keeps it). `--id` resolves whenever the ID is present in the note; without the `features.block_ids` marker the response carries a `BLOCK_IDS_NOT_GUARANTEED` warning, an absent ID is `BLOCK_NOT_FOUND` |
 | `insum search [-F] [-i] [--limit n] [--context 0..5] <query> [<paths>...]` | Full-text search over inline text; best-effort across files |
-| `insum read <file> [--note <id>] [--format json\|annotated]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors |
+| `insum table get <file> [--note <id>] (--index <n>\|--id <id>\|--after-heading <text>) [--where COL=VALUE] [--format json\|markdown] [--max-bytes n]` | Structured read of one table: headers/rows with cell ids and pointers, values by column name; `markdown` is a GFM projection with escaped pipes. Ragged rows, duplicate header names, colspan/rowspan and nested tables surface as warnings — the response contract is documented in `insum table get --help` |
+| `insum read <file> [--note <id>] [--format json\|annotated\|compact] [--with-anchors]` | Whole-note reading; `annotated` emits `<!-- um:pointer -->` anchors; `compact` is the same projection without a single service comment (`--with-anchors` grows them back — the output is byte-identical to `annotated`) |
 | `insum schema [--type <node>] [--schema <file>]` | Show the applicable schema artifact (source, path, hash, validation capability); `--type` shows one node descriptor with its example |
 | `insum validate [--strict] [--hidden] [--schema <file>] <paths>...` | Validation with an explicit level: `structural` or `schema` |
 | `insum history <file> [--note <id\|title>] [--limit n] [--format json\|annotated] [--max-bytes n]` | Change history of the file from git: revisions newest-first, each with a per-note structural diff against its parent |
@@ -310,6 +312,46 @@ package is JSON read from a file or stdin (`-`):
   subtree (they are preserved); new addressable blocks receive
   generator IDs at commit. `set_attrs` must not touch the ID attribute.
   `set_text` and `move` do not exist in v1 (`INVALID_OPERATION`).
+- **State operations.** Three package operations address mutable state
+  without rebuilding blocks by hand:
+  `{"op": "set_property", "name": …, "value": …}` upserts a `noteProperty`
+  row of the note's TITLE page by exact name — an existing row keeps the
+  row node, its attrs and its name node, the first value node keeps its
+  ID and gets the new text (extra value nodes of a list row leave the
+  note via `deleted_ids`), a missing name creates the row next to the
+  other property rows; a name held by several rows refuses
+  (`BLOCK_NOT_FOUND`, `details.ambiguous`), a plain page without a
+  leading `noteTitle` refuses (`INVALID_OPERATION`).
+  `{"op": "set_table_cell", "id": <table>, "row": {"id": …} | {"where":
+  {col: text}}, "column": {"id": …} | {"name": …}, "value": …}` writes
+  one cell: the cell keeps its ID (`changed_ids`), its first paragraph
+  keeps its ID and gets the text-only value, blocks after the first are
+  removed; the row and column must address exactly one position
+  (`BLOCK_NOT_FOUND`, ambiguous detail on several matches — the same
+  strictness as `table get --where`), a ragged row with no cell at the
+  column refuses (`BLOCK_NOT_FOUND` — cells are never created here),
+  spanning cells (`colspan`/`rowspan` > 1) refuse the operation
+  (`INVALID_OPERATION`).
+  `{"op": "upsert_table_row", "id": <table>, "match": {col: text},
+  "row": {col: text, …}, "position": "top"|"bottom"}` inserts a row when
+  no data row matches the key columns (default bottom = after the last
+  row, `top` = right after the header row) and rewrites the mentioned
+  cells of the matched row otherwise (unmentioned cells stay). When a
+  mentioned column has no cell in the matched row, the row is padded
+  ONCE to the header width with empty cells and the payload is written
+  by column indexes — the row ends up exactly the header width, the
+  payload lands on its own column whatever order the payload keys come
+  in; `match` is optional: a package without it always inserts. The
+  whole table's header names must be unique and every mentioned column
+  must exist. A fresh row carries one `tableCell` per header column
+  (unmentioned columns empty) — the row, its cells and their paragraphs
+  are all new (`created_ids`).
+  Values of all three operations are text-only in v1: unknown inline
+  nodes of a replaced value/cell disappear with the replacement, and the
+  table's `attrs.data` (`rowsCount`/`colsCount`) is left untouched — the
+  editor recomputes that metadata. The row/column lookups reuse the
+  `insum table get` projection, the property scan reuses `insum props`
+  — addressing by name agrees with the read side.
 - **Semantics (§8.3–8.4).** Operations apply sequentially to a working
   copy; each resolves its IDs in the current state. `insert_after` groups
   on one anchor keep the operation order (no reversal); a deleted block
@@ -330,8 +372,9 @@ package is JSON read from a file or stdin (`-`):
   are `USAGE` (exit 2).
 - **`--dry-run`** validates the package against the current state and
   reports `operations_validated`, `would_create_count`,
-  `would_delete_ids` and parity warnings — applied stays `false`, no
-  final IDs are promised, and the file bytes, mtime and directory stay
+  `would_change_count`, `would_delete_ids` and parity warnings — applied
+  stays `false`, no final IDs are promised for new blocks, and the file
+  bytes, mtime and directory stay
   untouched (no temp files). A dry-run refuses wherever the commit's plan
   phase refuses (plan == commit), except the commit-time lock and
   dirty-lease guard (`WRITE_LOCKED`) and the in-lock rechecks (a changed
@@ -357,8 +400,13 @@ package is JSON read from a file or stdin (`-`):
   unknown manifest and envelope fields survive.
 - **Response.** On success: `applied: true`, `old/new note_rev`,
   `old/new file_rev`, `operations_applied`, `created_ids` (every new
-  addressable block with its final `{id, pointer, type}`, nested included)
-  and `deleted_ids` (every ID that left the note). The ID lists respect
+  addressable block with its final `{id, pointer, type}`, nested
+  included), `changed_ids` (every EXISTING block the operations rewrote
+  in place — a property's value node plus the property row when its
+  value list changes structurally, a written table cell, an
+  upsert-written cell and a row that gained cells; `{id, pointer, type}`
+  with the pointer in the final document, in document order) and
+  `deleted_ids` (every ID that left the note). The ID lists respect
   `UM_MAX_OUTPUT_BYTES`: an oversized list is truncated explicitly
   (`truncated: true`, totals, an `OUTPUT_BUDGET` warning) — the write
   itself always covered every operation. The parity warnings share the
@@ -366,6 +414,42 @@ package is JSON read from a file or stdin (`-`):
   warnings array is marked explicitly too (`truncated: true`,
   `warnings_total`, an `OUTPUT_BUDGET` warning) — the remainder is
   re-derivable with `insum validate`. `--pretty` only reformats.
+
+## Note properties (`props`, read-only)
+
+`insum props <file>` reads the `noteProperty` rows of one page. Without
+`--note` the target is the title note of a `.um` container (the first note
+in manifest order); `--note <id|title>` resolves like everywhere else; a
+`.note` file is always its single document (`--note` is a usage error).
+
+- Each row (one `notePropertyName` + zero or more `notePropertyValue`
+  nodes) flattens into one entry per value node with the pair text, the
+  node ids and JSON Pointers of both nodes plus the row's own id and
+  address (`property_id`, `property_pointer`).
+  Values are read as-is: the concatenated inline text, marks ignored, no
+  type interpolation (a "list" row repeats the name per value, an empty
+  value reads as an empty string).
+- A page without `noteProperty` rows is `PROPERTY_NOT_FOUND` (exit 3) with
+  a hint that this is a normal state (plain pages and title-v2 pages have
+  none) — never a silent empty answer. `--get <name>` matches rows, not
+  entries: a name held by exactly one row returns ALL of that row's value
+  entries (a list-typed row yields several, deterministically in document
+  order), so a list property is never mistaken for a duplicate; a name
+  held by several rows is an ambiguity error listing the distinct row
+  pointers (no silent first match), and a missed name is the same code.
+- Document family versions (`schemaVersion` 2/3/4 in the manifest) are
+  application semantics outside the schema artifact: `props` reads the
+  nodes that are physically present, whatever the family version.
+- The response is one JSON envelope: `api_version`, `path`, `note_id`,
+  `note_title`, `note_rev`, `properties`, `complete: true`, `warnings`.
+
+`insum ls --with-properties --with-rev` reuses the same extraction for a
+bulk scan: file listings add `note_rev` / `properties` (and
+`properties_incomplete: true` when some text was withheld) to each note
+descriptor; directory listings add a `note_details` array (`id`,
+`note_rev`, `properties`) to notebook entries and the same fields to `.note`
+entries. Both flags read and decompress every payload — much slower than
+the default listing, which stays byte-identical without them.
 
 ## Notes on data fidelity
 
@@ -378,8 +462,25 @@ package is JSON read from a file or stdin (`-`):
   `<!--` is neutralized to `<! --` so it cannot forge CLI anchors or markers;
   inside tables, row/cell/paragraph anchors are emitted inline within the
   cells, and anything unrenderable in a cell is marked explicitly.
+- Compact projection (`read --format compact`): the same rendering pipeline
+  with anchors off — the page carries no HTML comment at all. Truncation and
+  projection losses stay explicit (§3.5) as visible text markers with the
+  same `um:` payload: `[um:incomplete next_cursor="..."]`,
+  `[um:oversized-block pointer="..." budget="..."]`, `[um:unrendered ...]`,
+  `[um:unrendered-inline type="..."]`, `[um:unrendered-marks="..."]`. Because
+  these markers are visible text, document text carrying their opener is
+  neutralized the same way the `<!--` opener is: a `[um:` sequence in
+  document-sourced text becomes `[ um:` (readable, visibly altered,
+  impossible to reassemble without editing) — in headings, paragraphs,
+  code blocks, mermaid and table cells alike; a forgery split across
+  adjacent text nodes is neutralized as the composed run. The CLI's own
+  markers are composed directly and never pass through the neutralizer.
+  In `annotated` (and `compact --with-anchors`) the text-marker opener is
+  inert — document `[um:` text stays byte-identical there. Like `annotated`,
+  compact is a read-only view with no parser and is never fed to `apply`;
+  exact reading is JSON.
 - No read command (`ls`, `search`, `tree`, `block get`, `read`, `validate`,
-  `schema`, `history`) modifies input files, creates temp files, executes
-  document content, or performs network access. The write commands
+  `schema`, `history`, `props`) modifies input files, creates temp files,
+  executes document content, or performs network access. The write commands
   (`migrate-ids`, `apply`) are covered by the stage-C and stage-D sections
   above.

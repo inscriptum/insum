@@ -495,15 +495,8 @@ impl SourceReader {
 /// class 3). Double quotes and newlines are also neutralized (review
 /// Y-01/Y-02): a quote cannot terminate an attribute to inject a new one,
 /// and a newline cannot split the header into a separate forged line.
-pub fn escape_comment_value(value: &str) -> String {
-    value
-        // deletions first: no later step can reassemble what was removed
-        .replace('\r', "")
-        // structural escapes: backslash before quote (Z-05), then delimiters
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace("<!--", "<! --")
-        .replace("-->", "-- >")
-        .replace("--!>", "-- !>")
-        .replace('\n', " ")
-}
+///
+/// Canonical implementation lives in `insum_core::projection` — the read
+/// projection is the main producer of comment templates; this re-export
+/// keeps the CLI call sites unchanged.
+pub use insum_core::projection::escape_comment_value;

@@ -7,6 +7,44 @@ Format — Keep a Changelog; versioning — SemVer.
 
 ### Added
 
+- `insum apply` state operations — `set_property`, `set_table_cell` and
+  `upsert_table_row` — plus a new `changed_ids` field in the commit
+  response. An agent can now flip a page's `Status` property, write one
+  kanban cell or move a kanban row (insert on top / bottom by key
+  columns, missing cells created) inside one CAS package instead of
+  replacing the whole page with um-build set-page. Addressing by name
+  follows the read side (`insum props`, `insum table get`): duplicate
+  names refuse, ragged rows refuse cell writes, spanning tables refuse
+  the table operations; values are text-only in v1.
+- `insum table get <file> --note <id> (--index <n> | --id <block-id> |
+  --after-heading <text>) [--where COL=VALUE] [--format json|markdown]`:
+  structured read-only access to one table of a note — kanbans and
+  state-tables no longer need markdown parsing or raw ProseMirror JSON.
+  JSON gives headers, rows and per-row cell ids/pointers (values by column
+  name); markdown gives a GFM table with escaped pipes. Ragged rows,
+  duplicate header names, colspan/rowspan and nested tables are reported
+  as explicit warnings, never silently reinterpreted; the read never
+  modifies the file.
+- `insum read --format compact [--with-anchors]` — a clean markdown
+  projection of a note for agent context: the annotated pipeline with the
+  pointer comments off (GFM tables with pipe escaping, lists, code,
+  mermaid), so agents no longer strip `um:pointer` lines by hand or fall
+  back to the `um-read` shim. Truncation and projection losses remain
+  explicit as visible text markers; `--with-anchors` returns the annotated
+  shape byte-for-byte, and `annotated`/`json` are unchanged.
+- `insum props <file> [--note <id|title>] [--get <name>]` — read-only
+  properties of one note page (`noteProperty` rows as
+  `{name, value, name_id, value_id}` with node pointers and `note_rev` in
+  the envelope); a page without properties or a missed `--get` name is an
+  explicit `PROPERTY_NOT_FOUND` (exit 3) whose hint explains that this is
+  a normal state, one row holding the name returns all its value entries
+  (a list-typed row yields several), and only a name held by several rows
+  is an ambiguity error.
+- `insum ls --with-properties --with-rev` — opt-in per-note property
+  summaries and revisions (note descriptors in a file listing,
+  `note_details` in a directory listing); without the flags the listing
+  output stays byte-identical.
+
 - `insum apply <file> --ops <file|-> [--dry-run] [--if-match <prefix>]`
   (stage D, §8): addressed write of blocks by ID with a revision CAS.
   One package mutates one note; `base_note_rev` (from `tree` / `read` /

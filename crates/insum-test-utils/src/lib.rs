@@ -18,11 +18,35 @@ use serde_json::{Value, json};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-/// Fixed ZIP entry metadata so fixture bytes are reproducible: the timestamp
-/// is pinned explicitly — with the `time` feature enabled, `default()` would
-/// stamp the current wall clock and break byte-determinism.
+/// Fixed ZIP entry metadata so fixture bytes are reproducible ON EVERY
+/// HOST: the timestamp is pinned explicitly (with the `time` feature
+/// enabled, `default()` would stamp the current wall clock), and the two
+/// fields the zip crate derives from the host OS are pinned to constants —
+///
+/// - `system` ("version made by" high byte): with `system: None` the
+///   crate picks `cfg!(windows) ? System::Dos : System::Unix`
+///   (zip 9.2.1 src/types.rs), so the same generator calls produced a
+///   different central-directory byte on Windows — the platform-dependent
+///   fixture bytes behind the windows-latest golden-gate failure;
+/// - `unix_permissions(0o644)`: without it the crate defaults to
+///   `0o644 | S_IFREG` for the external attributes; the pin guards the
+///   fixture contract against a future crate-default drift. Verified
+///   no-op in bytes: the crate's `normalize()` re-adds `S_IFREG` when the
+///   caller set permission bits only (zip 9.2.1 src/write/options.rs), so
+///   the effective external attributes stay `0x81a40000` — the fixture
+///   hash on unix hosts is unchanged and the committed goldens stay valid.
+///
+/// `large_file(false)` is the crate default, pinned for the same reason.
+/// The deflate stream is platform-independent in practice, guarded by the
+/// golden byte gate / pinned file_rev rather than by construction: flate2
+/// is resolved to the pure-Rust zlib-rs backend on all targets
+/// (Cargo.lock), but its deflate paths are arch-conditional.
 fn fixture_zip_options() -> SimpleFileOptions {
-    SimpleFileOptions::default().last_modified_time(zip::DateTime::default()) // 1980-01-01
+    SimpleFileOptions::default()
+        .last_modified_time(zip::DateTime::default()) // 1980-01-01
+        .system(zip::System::Unix)
+        .unix_permissions(0o644)
+        .large_file(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +145,48 @@ pub fn code_block(language: &str, code: &str) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// table builders (the on-disk table node shapes)
+// ---------------------------------------------------------------------------
+
+/// A `table` block with the given rows.
+pub fn table(rows: &[Value]) -> Value {
+    json!({ "type": "table", "content": rows })
+}
+
+/// A `tableRow` with an optional block id and the given cells.
+pub fn table_row(id: Option<&str>, cells: &[Value]) -> Value {
+    let mut row = json!({ "type": "tableRow", "content": cells });
+    if let Some(id) = id {
+        row["attrs"] = json!({ "id": id });
+    }
+    row
+}
+
+/// A cell (`tableCell` or `tableHeader`) with one paragraph of text.
+/// colspan/rowspan are always stored (the on-disk shape) and default to 1.
+pub fn table_cell(kind: &str, id: Option<&str>, value: &str, colspan: u64, rowspan: u64) -> Value {
+    let mut attrs = json!({ "colspan": colspan, "rowspan": rowspan });
+    if let Some(id) = id {
+        attrs["id"] = json!(id);
+    }
+    json!({
+        "type": kind,
+        "attrs": attrs,
+        "content": [paragraph(&[text(value)])]
+    })
+}
+
+/// A `tableHeader` cell with one paragraph.
+pub fn table_header(id: Option<&str>, value: &str) -> Value {
+    table_cell("tableHeader", id, value, 1, 1)
+}
+
+/// A `tableCell` with one paragraph.
+pub fn table_cell_text(id: Option<&str>, value: &str) -> Value {
+    table_cell("tableCell", id, value, 1, 1)
+}
+
 /// A title-page document: mandatory `noteTitle` + `noteSummary` + content
 /// blocks (`schema: "title"`, `schemaVersion: 2`).
 pub fn title_doc(title: &str, summary: &str, blocks: &[Value]) -> Value {
@@ -140,6 +206,55 @@ pub fn title_doc(title: &str, summary: &str, blocks: &[Value]) -> Value {
 /// (`schema: "plain"`); the title of the page is its first line.
 pub fn plain_doc(blocks: &[Value]) -> Value {
     json!({ "type": "noteDoc", "content": blocks })
+}
+
+/// Counter behind the synthetic property node ids (grammar-conformant
+/// `^[a-z0-9]{8,12}$`, deterministic per fixture-construction sequence).
+fn next_property_id() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+    format!("p{:010}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A `noteProperty` row (title-family v3): one `notePropertyName` node plus
+/// one `notePropertyValue` node per value, all carrying synthetic
+/// `attrs.id`. `type` is "text" for exactly one value, "list" otherwise —
+/// the plugin's own convention (umSchemas.createNoteProperty).
+pub fn note_property(name: &str, values: &[&str]) -> Value {
+    let row_id = next_property_id();
+    let name_id = next_property_id();
+    let property_type = if values.len() == 1 { "text" } else { "list" };
+    let mut content = vec![json!({
+        "type": "notePropertyName",
+        "attrs": { "id": name_id },
+        "content": if name.is_empty() { vec![] } else { vec![text(name)] },
+    })];
+    for value in values {
+        content.push(json!({
+            "type": "notePropertyValue",
+            "attrs": { "id": next_property_id() },
+            "content": [text(value)],
+        }));
+    }
+    json!({
+        "type": "noteProperty",
+        "attrs": { "id": row_id, "type": property_type },
+        "content": content,
+    })
+}
+
+/// A title-page document of the v3 family: mandatory `noteTitle` +
+/// `noteProperty` rows + content blocks (`schema: "title"`,
+/// `schemaVersion: 3`).
+pub fn title_doc_v3(title: &str, properties: &[Value], blocks: &[Value]) -> Value {
+    let mut content = vec![json!({
+        "type": "noteTitle",
+        "attrs": { "id": next_property_id() },
+        "content": [text(title)],
+    })];
+    content.extend(properties.iter().cloned());
+    content.extend(blocks.iter().cloned());
+    json!({ "type": "noteDoc", "content": content })
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +290,16 @@ impl FixtureNote {
             title: title.to_owned(),
             schema: "plain",
             doc: plain_doc(blocks),
+        }
+    }
+
+    /// A v3 title page: noteTitle + noteProperty rows (no noteSummary).
+    pub fn title_page_v3(id: &str, title: &str, properties: &[Value], blocks: &[Value]) -> Self {
+        Self {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            schema: "title",
+            doc: title_doc_v3(title, properties, blocks),
         }
     }
 }
@@ -368,6 +493,35 @@ mod tests {
                 entry.last_modified(),
                 Some(zip::DateTime::default()),
                 "entry {name}"
+            );
+        }
+    }
+
+    /// The host-derived central-directory fields of every entry are the
+    /// values [`fixture_zip_options`] pins — the system byte of
+    /// `version made by` is Unix (not the `cfg!(windows)`-dependent Dos
+    /// default) and the external attributes are `(S_IFREG | 0o644) << 16`
+    /// (`0x81a40000`, zip 9.2 `normalize()` re-adds `S_IFREG`). This is the
+    /// cross-host half of fixture determinism: the timestamp pin above is
+    /// checked on the same host that wrote the fixture, these two bytes are
+    /// where hosts used to diverge (review TST-3).
+    #[test]
+    fn zip_entry_system_and_attributes_are_pinned() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pinned.um");
+        minimal_container(&path).unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        for name in ["manifest.json", &format!("notes/{}.json", ulid_seq(1))] {
+            let entry = archive.by_name(name).unwrap();
+            assert_eq!(
+                entry.system(),
+                zip::System::Unix,
+                "entry {name}: version-made-by system byte"
+            );
+            assert_eq!(
+                entry.external_attributes(),
+                0x81a4_0000,
+                "entry {name}: external attributes"
             );
         }
     }

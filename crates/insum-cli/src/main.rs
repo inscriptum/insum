@@ -52,8 +52,40 @@ enum Command {
         /// Include hidden files.
         #[arg(long)]
         hidden: bool,
+        /// Add a per-note property summary (name/value pairs). File
+        /// listing: on the note descriptors; directory listing: a
+        /// note_details array for notebooks, on the entry for `.note`
+        /// files. Reads and decompresses every note payload — much
+        /// slower than the default listing, which never opens payloads.
+        #[arg(long)]
+        with_properties: bool,
+        /// Add `note_rev` (payload + manifest descriptor per the
+        /// revision rule). File listing: on the note descriptors;
+        /// directory listing: a note_details array for notebooks, on the
+        /// entry for `.note` files. Also reads every payload.
+        #[arg(long)]
+        with_rev: bool,
         /// Directory or file; defaults to `.`.
         path: Option<String>,
+    },
+    /// Read-only properties of one note page (`noteProperty` rows).
+    Props {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Note by id (ULID) or exact title; default: the title note of a
+        /// .um container (the first note in manifest order) or the single
+        /// document of a .note file.
+        #[arg(long)]
+        note: Option<String>,
+        /// Return only the property with this exact name; a name held by
+        /// one row returns all its value entries (a list-typed row yields
+        /// several), a miss is PROPERTY_NOT_FOUND, a name held by several
+        /// rows is an ambiguity error.
+        #[arg(long)]
+        get: Option<String>,
+        /// Output format; only `json` is supported.
+        #[arg(long, default_value = "json")]
+        format: String,
     },
     /// Compact block structure with JSON Pointers.
     Tree {
@@ -79,6 +111,11 @@ enum Command {
     Block {
         #[command(subcommand)]
         action: BlockAction,
+    },
+    /// Structured read of one table.
+    Table {
+        #[command(subcommand)]
+        action: TableAction,
     },
     /// Full-text search over inline content.
     Search {
@@ -108,20 +145,23 @@ enum Command {
         /// Files or directories to search; defaults to `.`.
         paths: Vec<PathBuf>,
     },
-    /// Read whole notes: JSON envelope or annotated projection.
+    /// Read whole notes: JSON envelope or markdown projection (annotated / compact).
     Read {
         /// A .um container or a .note file.
         file: PathBuf,
         /// Note id for .um.
         #[arg(long)]
         note: Option<String>,
-        /// `json` (default) or `annotated`.
+        /// `json` (default), `annotated` (projection with anchors) or `compact` (anchor-free projection; document text cannot forge the `[um:` markers — it is neutralized to `[ um:`).
         #[arg(long, default_value = "json")]
         format: String,
+        /// Add the annotated anchor comments to the compact projection.
+        #[arg(long)]
+        with_anchors: bool,
         /// Output budget in bytes.
         #[arg(long)]
         max_bytes: Option<usize>,
-        /// Resume an annotated projection from a cursor.
+        /// Resume an annotated or compact projection from a cursor.
         #[arg(long)]
         cursor: Option<String>,
     },
@@ -156,6 +196,18 @@ enum Command {
         dry_run: bool,
     },
     /// Addressed write of blocks by ID with a revision CAS (stage D; §8).
+    ///
+    /// Operations: replace, delete, insert_before, insert_after,
+    /// append_child, set_attrs, replace_content — plus the state
+    /// operations: set_property (upsert a noteProperty row of the title
+    /// page by name, text-only value), set_table_cell (write one cell by
+    /// table ID + row/column address) and upsert_table_row (insert or
+    /// update a row by key columns; `match` is optional — without it the
+    /// operation always inserts, `position` is "top" or "bottom", default
+    /// "bottom"). IDs are managed by the CLI: new addressable blocks
+    /// receive IDs at commit (`created_ids`), existing blocks the
+    /// operations rewrite in place keep theirs and are reported in
+    /// `changed_ids`.
     Apply {
         /// A .um container or a .note file.
         file: PathBuf,
@@ -212,6 +264,63 @@ enum BlockAction {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum TableAction {
+    /// Structured read of one table of a note (read-only; the response
+    /// contract is this help text).
+    ///
+    /// Address the table with exactly one of: --index N (0-based, document
+    /// order), --id <block-id>, --after-heading <text> (the exact text of
+    /// the nearest preceding heading; several tables under same-text
+    /// headings are an error).
+    ///
+    /// JSON response fields (fixed set; emitted in lexicographic order):
+    /// `api_version`, `path`, `note_id`, `note_rev`, `table` with `pointer`,
+    /// `id`, `index`, `table_count`, `heading`, `columns` (each `name`,
+    /// `id`, `pointer`; the header row is the table's first row), `rows`
+    /// (each `id`, `pointer`, `cells` with `id`, `pointer`, `text`, and
+    /// `values` — column name to cell text, `null` when names are
+    /// duplicated or withheld), `rows_source`, `rows_matched`, plus
+    /// `warnings`, `complete`, `truncated`.
+    ///
+    /// `--where COL=VALUE` keeps only the rows whose cell in column COL
+    /// equals VALUE byte-for-byte: a miss is an empty row list, an unknown
+    /// column is an error, any duplicated column name refuses the filter.
+    /// `--format markdown` prints a GFM table (first row is the header,
+    /// pipes escaped as `\|`, newlines become `<br>`, no anchors);
+    /// diagnostics ride as `<!-- um:warning code=... -->` comments after
+    /// the table. The output budget (`--max-bytes`, default
+    /// UM_MAX_OUTPUT_BYTES) truncates whole rows with `truncated: true`,
+    /// `complete: false` and an OUTPUT_BUDGET warning — never silently.
+    Get {
+        /// A .um container or a .note file.
+        file: PathBuf,
+        /// Note id — required for .um, forbidden for .note.
+        #[arg(long)]
+        note: Option<String>,
+        /// Document-order index of the table, 0-based.
+        #[arg(long, value_name = "N")]
+        index: Option<usize>,
+        /// Block ID of the table node — resolves when the ID is present in
+        /// the note; without the features.block_ids marker the answer
+        /// carries a warning.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+        /// Exact text of the nearest heading preceding the table.
+        #[arg(long, value_name = "TEXT")]
+        after_heading: Option<String>,
+        /// Keep only rows whose cell in COL equals VALUE exactly.
+        #[arg(long, value_name = "COL=VALUE")]
+        r#where: Option<String>,
+        /// `json` (default) or `markdown` (GFM projection).
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Output budget in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
+}
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -245,9 +354,20 @@ fn main() {
             let _ = Cli::command().print_help();
             std::process::exit(0);
         }
-        Some(Command::Ls { path, hidden }) => {
-            commands::ls::run(path.clone(), *hidden, &limits).map(Output::Json)
-        }
+        Some(Command::Ls {
+            path,
+            hidden,
+            with_properties,
+            with_rev,
+        }) => commands::ls::run(path.clone(), *hidden, *with_properties, *with_rev, &limits)
+            .map(Output::Json),
+        Some(Command::Props {
+            file,
+            note,
+            get,
+            format,
+        }) => commands::props::run(file, note.as_deref(), get.as_deref(), format, &limits)
+            .map(Output::Json),
         Some(Command::Tree {
             file,
             note,
@@ -283,6 +403,31 @@ fn main() {
             &limits,
         )
         .map(Output::Json),
+        Some(Command::Table {
+            action:
+                TableAction::Get {
+                    file,
+                    note,
+                    index,
+                    id,
+                    after_heading,
+                    r#where,
+                    format,
+                    max_bytes,
+                },
+        }) => commands::table::run(
+            &commands::table::TableGet {
+                path: file,
+                note: note.as_deref(),
+                index: *index,
+                id: id.as_deref(),
+                after_heading: after_heading.as_deref(),
+                where_filter: r#where.as_deref(),
+                format,
+                max_bytes: *max_bytes,
+            },
+            &limits,
+        ),
         Some(Command::Search {
             fixed_strings,
             ignore_case,
@@ -312,12 +457,14 @@ fn main() {
             file,
             note,
             format,
+            with_anchors,
             max_bytes,
             cursor,
         }) => commands::read::run(
             file,
             note.as_deref(),
             format,
+            *with_anchors,
             *max_bytes,
             cursor.as_deref(),
             &limits,
